@@ -8,7 +8,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::execution::{
-    BufferDescriptor, TunedBinding, TuningGraphDescriptor, Dtype, ExecutionManifest, ExecutionWorker, GraphDescriptor, GraphKind,
+    BufferDescriptor, TunedBinding, TuningGraphDescriptor, TuningChoice, Dtype, ExecutionManifest, ExecutionWorker, GraphDescriptor, GraphKind,
     InputBinding, OwnedUpload, SamplingMode,
 };
 use crate::lifetime::OwnerLease;
@@ -233,11 +233,19 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
     let mut tuning_graphs = Vec::new();
     for graph in value.get_item("tuning_graphs")?.try_iter()? {
         let graph = graph?;
+        let mut choices = Vec::new();
+        if let Ok(items) = graph.get_item("choices") {
+            for item in items.try_iter()? {
+                let item = item?;
+                choices.push(TuningChoice { value: field!(item, "value", Vec<u8>), label: field!(item, "label", String) });
+            }
+        }
         tuning_graphs.push(TuningGraphDescriptor {
             name: field!(graph, "name", String),
             handle: field!(graph, "handle", usize),
             outputs: field!(graph, "outputs", Vec<String>),
             status_buffer: field!(graph, "status_buffer", String),
+            choices,
         });
     }
     Ok(ExecutionManifest {

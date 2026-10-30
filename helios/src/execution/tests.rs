@@ -146,11 +146,22 @@ fn collective_overview_uses_graph_geometry_and_individual_bindings() {
         ("target-choice".into(), 4u32.to_ne_bytes().to_vec()),
         ("mixed-choice".into(), ((1u32 << 16) | 64).to_ne_bytes().to_vec()),
     ]];
+    value.tuning_graphs.push(TuningGraphDescriptor {
+        name: "choose".into(), handle: 0, outputs: vec!["target-choice".into(), "mixed-choice".into()],
+        status_buffer: "status".into(), choices: vec![
+            TuningChoice { value: 4u32.to_ne_bytes().to_vec(), label: "Prepared full (4 CTAs)".into() },
+            TuningChoice { value: ((1u32 << 16) | 64).to_ne_bytes().to_vec(), label: "Prepared RSAG (64 CTAs)".into() },
+        ],
+    });
     let text = super::transport::collective_choices_overview(&value, &choices);
     assert!(text.contains("Mixed/unknown: 1 group\n"));
-    assert!(text.contains("arbitrary-decode-name · Decode b=4 t=1 rows=4 drafts=0 prefill=0 · Full (4 CTAs)\n"));
-    assert!(text.contains("arbitrary-target-name · Speculative b=4 t=6 rows=16 drafts=5 prefill=0 · Full (4 CTAs)\n"));
-    assert!(text.contains("arbitrary-mixed-name · Mixed b=4 t=1 rows=131 drafts=0 prefill=128 · Payload RSAG (64 CTAs)\n"));
+    assert!(text.contains("arbitrary-decode-name · Decode b=4 t=1 rows=4 drafts=0 prefill=0 · Prepared full (4 CTAs)\n"));
+    assert!(text.contains("arbitrary-target-name · Speculative b=4 t=6 rows=16 drafts=5 prefill=0 · Prepared full (4 CTAs)\n"));
+    assert!(text.contains("arbitrary-mixed-name · Mixed b=4 t=1 rows=131 drafts=0 prefill=128 · Prepared RSAG (64 CTAs)\n"));
+    value.tuning_graphs[0].choices.clear();
+    let text = super::transport::collective_choices_overview(&value, &choices);
+    assert!(text.contains("raw=[04, 00, 00, 00]"));
+    assert!(!text.contains("Prepared"));
 }
 
 pub(super) fn manifest() -> ExecutionManifest {
@@ -1220,7 +1231,7 @@ pub(super) fn tuning_manifest() -> ExecutionManifest {
             shape: vec![1], strides: vec![1] });
     }
     value.tuning_graphs.push(TuningGraphDescriptor { name: "select".into(), handle: 0x90000,
-        outputs: vec!["choice".into()], status_buffer: "tuning_status".into() });
+        outputs: vec!["choice".into()], status_buffer: "tuning_status".into(), choices: Vec::new() });
     value.graphs[0].tuned_bindings.push(TunedBinding { buffer: "choice".into(), tuning_graph: "select".into() });
     value
 }
@@ -1251,4 +1262,25 @@ fn tuning_order_is_manifest_order_and_deduplicates_consumers() {
     assert_eq!(value.referenced_tuning_graphs(), vec![0]);
     value.graphs.iter_mut().for_each(|graph| graph.tuned_bindings.clear());
     assert!(value.referenced_tuning_graphs().is_empty());
+}
+
+#[test]
+fn tuning_diagnostic_labels_validate_exact_bytes_and_bounds() {
+    let mut valid = tuning_manifest();
+    valid.tuning_graphs[0].choices = vec![TuningChoice { value: vec![7; 8], label: "Prepared profile".into() }];
+    valid.validate().unwrap();
+    for mutation in 0..7 {
+        let mut value = valid.clone();
+        let choices = &mut value.tuning_graphs[0].choices;
+        match mutation {
+            0 => choices[0].value.pop().map(|_| ()).unwrap(),
+            1 => choices.push(choices[0].clone()),
+            2 => choices[0].label.clear(),
+            3 => choices[0].label = "x".repeat(257),
+            4 => choices[0].label.push('\n'),
+            5 => choices[0].value = vec![0; 65],
+            _ => *choices = (0..513u64).map(|v| TuningChoice { value: v.to_ne_bytes().to_vec(), label: "choice".into() }).collect(),
+        }
+        assert!(value.validate().is_err(), "mutation {mutation}");
+    }
 }

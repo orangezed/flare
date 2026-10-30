@@ -1,7 +1,7 @@
 use super::{NativeResources, format::invalid, protobuf::size};
 use crate::{
     Result,
-    execution::{BufferDescriptor, ExecutionManifest, GraphDescriptor, InputBinding, TunedBinding, TuningGraphDescriptor},
+    execution::{BufferDescriptor, ExecutionManifest, GraphDescriptor, InputBinding, TunedBinding, TuningGraphDescriptor, TuningChoice},
 };
 
 impl NativeResources {
@@ -87,6 +87,9 @@ impl NativeResources {
             Ok(TuningGraphDescriptor {
                 name: graph.name.clone(), handle: self.executables[index] as usize,
                 outputs: graph.outputs.clone(), status_buffer: graph.status_buffer.clone(),
+                choices: graph.choices.iter().map(|choice| TuningChoice {
+                    value: choice.value.clone(), label: choice.label.clone(),
+                }).collect(),
             })
         }).collect::<Result<Vec<_>>>()?;
         let manifest = ExecutionManifest {

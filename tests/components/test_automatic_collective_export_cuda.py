@@ -92,6 +92,9 @@ def _rank(rank, directory, readiness):
                 binding = prepared.tuned_bindings["decode"][0]
                 tuner = prepared.tuning_graphs[binding.tuning_graph]
                 assert tuner.outputs == (binding.buffer,)
+                assert tuner.choices == tuple((value.to_bytes(4, sys.byteorder), label)
+                                             for value, label in producer.specs[0].choice_labels())
+                assert tuner.choices
                 assert prepared.buffers[binding.buffer].data_ptr() == operation.plan.prepared.state.selector.data_ptr()
                 assert prepared.buffers[tuner.status_buffer] is producer.status
                 assert set(prepared.graphs) == {*signatures, binding.tuning_graph}
@@ -117,6 +120,9 @@ def _rank(rank, directory, readiness):
                 from ignition.preparation import runtime_package_pb2 as proto
 
                 index, _, _ = read_sources_record(directory / f"rank-{rank}.json")
+                exported_tuner = next(graph for graph in index.ranks[0].execution.tuning_graphs
+                                      if graph.name == binding.tuning_graph)
+                assert [(choice.value, choice.label) for choice in exported_tuner.choices] == list(tuner.choices)
                 allocations = index.ranks[0].allocations
                 outside = [(allocation.name, hex(allocation.address), allocation.nbytes)
                     for allocation in allocations if allocation.memory == proto.DEVICE

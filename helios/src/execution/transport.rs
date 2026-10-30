@@ -361,34 +361,16 @@ pub(super) fn collective_choices_overview(
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Write;
 
-    // Only this decoder assumes the b12x packed mode/CTA encoding.
-    fn decode(bytes: &[u8]) -> (String, Option<u32>) {
-        let Ok(word) = <[u8; 4]>::try_from(bytes) else {
-            return (format!("raw={bytes:02x?}"), None);
-        };
-        let value = u32::from_ne_bytes(word);
-        let name = match value >> 16 {
-            0 => "Full".into(), 1 => "Payload RSAG".into(), 2 => "Bulk Push".into(),
-            3 => "Bulk Pull".into(), 4 => "Pull".into(), id => format!("Mode {id}"),
-        };
-        (name, Some(value & 0xffff))
-    }
-    fn describe<'a>(values: impl Iterator<Item = &'a [u8]>) -> String {
-        let mut modes: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
-        for bytes in values {
-            let (name, ctas) = decode(bytes);
-            modes.entry(name).or_default().extend(ctas);
-        }
-        modes.into_iter().map(|(name, ctas)| {
-            if ctas.is_empty() { return name; }
-            let counts = ctas.into_iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
-            format!("{name} ({counts} CTAs)")
-        }).collect::<Vec<_>>().join(", ")
-    }
+    let labels: BTreeMap<_, _> = manifest.tuning_graphs.iter().flat_map(|graph|
+        graph.outputs.iter().map(move |output| (output.as_str(), graph.choices.as_slice()))).collect();
+    let describe_choice = |buffer: &str, bytes: &[u8]| {
+        labels.get(buffer).and_then(|choices| choices.iter().find(|choice| choice.value == bytes))
+            .map(|choice| choice.label.clone()).unwrap_or_else(|| format!("raw={bytes:02x?}"))
+    };
     let mut totals = BTreeMap::new();
     let mut outputs = BTreeMap::new();
     for group in choices {
-        let modes = group.iter().map(|(_, bytes)| decode(bytes).0).collect::<BTreeSet<_>>();
+        let modes = group.iter().map(|(buffer, bytes)| describe_choice(buffer, bytes)).collect::<BTreeSet<_>>();
         let name = if modes.len() == 1 { modes.into_iter().next().unwrap() } else { "Mixed/unknown".into() };
         *totals.entry(name).or_insert(0usize) += 1;
         outputs.extend(group.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
@@ -402,8 +384,9 @@ pub(super) fn collective_choices_overview(
     graphs.sort_by_key(|graph| (graph.kind as u8, graph.batch_capacity, graph.token_capacity,
         graph.packed_tokens(), graph.prefill_capacity, graph.draft_tokens, graph.name.as_str()));
     for graph in graphs {
-        let values = graph.tuned_bindings.iter().filter_map(|binding| outputs.get(binding.buffer.as_str()).copied());
-        let selected = describe(values);
+        let selected = graph.tuned_bindings.iter().filter_map(|binding|
+            outputs.get(binding.buffer.as_str()).map(|bytes| describe_choice(&binding.buffer, bytes)))
+            .collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(", ");
         writeln!(text, "  {} · {:?} b={} t={} rows={} drafts={} prefill={} · {}",
             graph.name, graph.kind, graph.batch_capacity, graph.token_capacity,
             graph.packed_tokens(), graph.draft_tokens, graph.prefill_capacity,

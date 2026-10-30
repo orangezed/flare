@@ -80,6 +80,15 @@ configurations. Outputs remain fixed during serving. Package graph selection
 retains referenced producers and their executable resources and removes unused
 producers. Tuning storage remains owned through execution drain.
 
+A producer may attach diagnostic `choices`: exact output bytes paired with
+human-readable labels prepared by its implementation. Helios matches the full
+readback to a label without decoding the output's kernel-specific format.
+Missing labels or unknown values print raw bytes and do not change execution.
+The optional catalog permits at most 512 distinct values, each 1–64 bytes and
+equal to every producer output's byte extent. Labels contain 1–256 UTF-8 bytes
+without control characters. This metadata uses the existing bounded diagnostic
+readback and has no selection or replay semantics.
+
 ## Serving graph transport
 
 Supported dtypes are `bool`, `uint8`, `int32`, `int64`, `float32`, `float16`, and

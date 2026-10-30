@@ -693,6 +693,11 @@ message TuningGraph {
   string name = 1;
   repeated string outputs = 2;
   string status_buffer = 3;
+  repeated TuningChoice choices = 4;
+}
+message TuningChoice {
+  bytes value = 1;
+  string label = 2;
 }
 message Buffer {
   string name = 1;

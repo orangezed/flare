@@ -194,14 +194,23 @@ pub(crate) fn execution(
         }
 
     }
+    let mut choices = Vec::new();
     if let Some(tuners) = object.get_mut("tuning_graphs") {
         for tuner in tuners.as_array_mut()
             .ok_or_else(|| super::invalid("tuning graphs must be an array"))? {
-            tuner.as_object_mut()
-                .ok_or_else(|| super::invalid("invalid tuning graph"))?.remove("handle");
+            let tuner = tuner.as_object_mut()
+                .ok_or_else(|| super::invalid("invalid tuning graph"))?;
+            tuner.remove("handle");
+            // The preparation handoff uses JSON byte arrays; Protobuf JSON uses base64.
+            choices.push(serde_json::from_value::<Vec<super::wire::TuningChoice>>(
+                tuner.remove("choices").unwrap_or_else(|| serde_json::json!([])))?);
         }
     }
-    message("Execution", &value)
+    let mut execution: super::wire::Execution = message("Execution", &value)?;
+    for (graph, labels) in execution.tuning_graphs.iter_mut().zip(choices) {
+        graph.choices = labels;
+    }
+    Ok(execution)
 }
 
 pub(crate) fn finish_rank(
@@ -833,12 +842,15 @@ mod tests {
             "graphs": [{"name": "decode", "kind": "decode", "handle": 17,
                 "tuned_bindings": [{"buffer": "winner", "tuning_graph": "tune"}]}],
             "tuning_graphs": [{"name": "tune", "handle": 18,
-                "outputs": ["winner"], "status_buffer": "status"}]
+                "outputs": ["winner"], "status_buffer": "status",
+                "choices": [{"value": [81, 0, 2, 128], "label": "Prepared profile"}]}]
         });
         let encoded = execution(&value, &[]).unwrap();
         assert_eq!(encoded.tuning_graphs[0].name, "tune");
         assert_eq!(encoded.tuning_graphs[0].outputs, ["winner"]);
         assert_eq!(encoded.tuning_graphs[0].status_buffer, "status");
+        assert_eq!(encoded.tuning_graphs[0].choices[0].value, [81, 0, 2, 128]);
+        assert_eq!(encoded.tuning_graphs[0].choices[0].label, "Prepared profile");
         assert_eq!(encoded.graphs[0].tuned_bindings[0].tuning_graph, "tune");
         assert_eq!(encoded.graphs[0].tuned_bindings[0].buffer, "winner");
     }

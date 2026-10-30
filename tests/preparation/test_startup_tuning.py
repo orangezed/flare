@@ -33,7 +33,7 @@ def test_manifest_has_separate_tuners_without_host_uploads(monkeypatch):
     assert set(bundle.signatures) == set(bundle.estimated_durations_ns) == {"decode"}
     assert set(bundle.graphs) == {"decode", "choose"}
     assert manifest["tuning_graphs"] == [dict(name="choose", handle=12,
-                                              outputs=["selector"], status_buffer="status")]
+                                              outputs=["selector"], status_buffer="status", choices=[])]
     assert manifest["graphs"][0]["tuned_bindings"] == [dict(buffer="selector", tuning_graph="choose")]
     assert {binding["buffer_name"] for binding in manifest["graphs"][0]["input_bindings"]} == {
         "frame_index", "submission_sequence", "tokens"}
@@ -154,7 +154,7 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda ordinal: None)
     selector = torch.tensor([7], dtype=torch.uint32)
     owner = SimpleNamespace(plan=SimpleNamespace(prepared=SimpleNamespace(state=SimpleNamespace(selector=selector))))
-    producer = SimpleNamespace(specs=(SimpleNamespace(selector=selector),),
+    producer = SimpleNamespace(specs=(SimpleNamespace(selector=selector, choice_labels=lambda: ((7, "Prepared profile"),)),),
         status=torch.ones(1, dtype=torch.int32), run=lambda: events.append("run"))
     registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=2), capture=nullcontext,
         benchmark_storage=SimpleNamespace(graph_pool=SimpleNamespace(id=(1, 7)))))
@@ -169,6 +169,7 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     output.fill_(5)
     assert selector.item() == 5
     assert resources == (producer,)
+    assert tuners["collective-tuning-0"].choices == ((b"\x07\x00\x00\x00", "Prepared profile"),)
     assert _graphs({name: value.graph for name, value in tuners.items()}) == [
         dict(name="collective-tuning-0", graph=11, executable=12)]
     assert events == ["device-enter", "wait", "capture-enter", "run", "capture-exit",
@@ -221,3 +222,30 @@ def test_memory_report_deduplicates_shared_producer_allocations():
     registry = CollectiveStartupTuning(object())
     registry.groups = {"a": producer("a"), "b": producer("b")}
     assert registry.memory_report() == dict(startup_tuning_bytes=4352, startup_tuning_producers=2)
+
+
+@pytest.mark.parametrize("choices", [((b"", "empty"),), ((b"x" * 65, "large"),),
+    ((b"x", ""),), ((b"x", "x" * 257),), ((b"x", "line\nbreak"),),
+    ((b"x", "first"), (b"x", "second"))])
+def test_diagnostic_choices_reject_malformed_labels(choices):
+    with pytest.raises(ValueError, match="tuning diagnostic"):
+        TuningGraph(object(), ("selector",), "status", choices)
+
+
+def test_diagnostic_choices_match_exact_output_extent(monkeypatch):
+    choice = ((b"\x05\x00\x02\x80", "Prepared profile"),)
+    bundle = execution(tuning_graphs={"choose": TuningGraph(object(), ("selector",), "status", choice)})
+    spans = [(4096 + index * 4096, tensor.numel() * tensor.element_size())
+             for index, tensor in enumerate(bundle.buffers.values())]
+    monkeypatch.setattr(bundle, "_validate_resources", lambda: (9, [11, 12], spans))
+    assert bundle.manifest()["tuning_graphs"][0]["choices"] == [
+        {"value": [5, 0, 2, 128], "label": "Prepared profile"}]
+    with pytest.raises(ValueError, match="byte extent"):
+        execution(tuning_graphs={"choose": TuningGraph(object(), ("selector",), "status", ((b"x", "short"),))})
+
+
+def test_diagnostic_catalog_admits_all_bandwidth_profiles_and_bounds_growth():
+    choices = tuple((value.to_bytes(4, "little"), f"Profile {value}") for value in range(513))
+    assert len(TuningGraph(object(), ("selector",), "status", choices[:258]).choices) == 258
+    with pytest.raises(ValueError, match="at most 512"):
+        TuningGraph(object(), ("selector",), "status", choices)

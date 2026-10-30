@@ -34,6 +34,14 @@ def startup_package(tmp_path_factory):
     ], cwd=root, text=True, capture_output=True, timeout=600)
     assert exported.returncode == 0, exported.stdout + exported.stderr
     assert "all four preparation ranks exited" in exported.stdout
+    from ignition.preparation.package_file import read_sources_record
+
+    for rank in range(4):
+        index, _, _ = read_sources_record(directory / f"rank-{rank}.json")
+        producer = next(graph for graph in index.ranks[0].execution.tuning_graphs
+                        if graph.name == "choose-profile")
+        assert [(choice.value, choice.label) for choice in producer.choices] == [
+            (value.to_bytes(4, sys.byteorder), f"Prepared scalar {value}") for value in (1, 3, 7)]
     return root, target / "debug/test_fixed_runtime_package", directory
 
 
@@ -48,3 +56,6 @@ def test_exported_startup_producers_precede_native_readiness(startup_package, fa
     expected = ("native startup tuning rejected failing rank before request readiness"
                 if failure else "native TP4 collective package replay passed after Python exit")
     assert expected in result.stdout
+    if not failure:
+        assert "Prepared scalar 3" in result.stderr
+        assert "Prepared scalar 7" in result.stderr

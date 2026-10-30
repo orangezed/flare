@@ -162,11 +162,36 @@ pub struct TunedBinding {
 }
 
 #[derive(Clone, Debug)]
+pub struct TuningChoice {
+    pub value: Vec<u8>,
+    pub label: String,
+}
+
+pub(crate) fn validate_tuning_choices<'a>(
+    choices: impl Iterator<Item = (&'a [u8], &'a str)>,
+    output_sizes: impl Iterator<Item = usize>,
+) -> Result<()> {
+    let sizes: Vec<_> = output_sizes.collect();
+    let mut values = HashSet::new();
+    for (index, (value, label)) in choices.enumerate() {
+        if index >= 512 || value.is_empty() || value.len() > 64 || !values.insert(value)
+            || label.trim().is_empty() || label.len() > 256 || label.chars().any(char::is_control) {
+            return Err("tuning diagnostics require at most 512 unique values of 1–64 bytes and nonempty labels of at most 256 bytes without control characters".into());
+        }
+        if sizes.iter().any(|size| *size != value.len()) {
+            return Err("tuning diagnostic choices must match every output's byte extent".into());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
 pub struct TuningGraphDescriptor {
     pub name: String,
     pub handle: usize,
     pub outputs: Vec<String>,
     pub status_buffer: String,
+    pub choices: Vec<TuningChoice>,
 }
 
 #[derive(Clone, Debug)]
@@ -250,12 +275,15 @@ impl ExecutionManifest {
                 return Err("tuning graphs require unique names and persistent outputs".into());
             }
             let status = self.buffer(&graph.status_buffer)?;
+            let sizes = graph.outputs.iter().map(|output| self.buffer(output).map(|buffer| buffer.nbytes))
+                .collect::<Result<Vec<_>>>()?;
+            validate_tuning_choices(graph.choices.iter().map(|choice| (choice.value.as_slice(), choice.label.as_str())),
+                sizes.into_iter())?;
             if status.dtype != Dtype::Int32 || status.shape != [1] || status.strides != [1]
                 || !statuses.insert(graph.status_buffer.as_str()) {
                 return Err("tuning status requires a unique int32[1] buffer".into());
             }
             for output in &graph.outputs {
-                self.buffer(output)?;
                 if producers.insert(output.as_str(), graph.name.as_str()).is_some() {
                     return Err("tuning outputs require exactly one producer".into());
                 }

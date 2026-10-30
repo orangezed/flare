@@ -682,6 +682,7 @@ mod tests {
         let execution = wire::Execution {
             tuning_graphs: vec![wire::TuningGraph {
                 name: "tune".into(), outputs: vec!["winner".into()], status_buffer: "status".into(),
+                choices: vec![wire::TuningChoice { value: vec![0x51, 0x00, 0x02, 0x80], label: "Prepared profile".into() }],
             }],
             graphs: vec![wire::ExecutionGraph { tuned_bindings: vec![binding.clone()], ..Default::default() }],
             ..Default::default()

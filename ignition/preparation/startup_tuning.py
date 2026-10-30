@@ -148,7 +148,11 @@ class CollectiveStartupTuning:
                     producer.run()
                 graph.instantiate()
                 stream.synchronize()
-            tuners[name] = TuningGraph(graph, tuple(outputs), status)
+            import sys
+
+            choices = tuple((value.to_bytes(4, sys.byteorder), label)
+                            for value, label in producer.specs[0].choice_labels())
+            tuners[name] = TuningGraph(graph, tuple(outputs), status, choices)
             resources.append(producer)
             for serving, owners in consumers.items():
                 selected = {id(owner): owner for owner in self.owners if id(owner) in owners
