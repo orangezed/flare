@@ -8,7 +8,16 @@ import sys
 import pytest
 
 
-def _rank(rank, directory, readiness):
+class _ReductionForward:
+    def __init__(self, operation, source):
+        self.operation = operation
+        self.source = source
+
+    def __call__(self):
+        return self.operation(self.source)
+
+
+def _rank(rank, directory, readiness, compile_forward):
     import torch
     import torch.distributed as dist
 
@@ -50,7 +59,7 @@ def _rank(rank, directory, readiness):
                         coordinator=coordinator, name="readiness-barrier")
                     source, output, operation = wait.input, wait.output, wait.barrier
                     assert source.numel() * source.element_size() == 16
-                    assert operation.runtime_profiles == (("full", 1),)
+                    assert operation.runtime_profiles is None
                 else:
                     source = torch.full((13, 2560), rank + 1, dtype=torch.bfloat16, device=device)
                     output = torch.empty_like(source)
@@ -59,9 +68,9 @@ def _rank(rank, directory, readiness):
                 session.tune(show_progress=False)
                 signatures = {name: GraphSignature(name, 1, 1) for name in ("init", "decode")}
                 stream = torch.cuda.Stream(device=device)
-                graphs, _ = capture_forwards(dict.fromkeys(signatures, lambda: operation(source)), signatures,
+                graphs, _ = capture_forwards(dict.fromkeys(signatures, _ReductionForward(operation, source)), signatures,
                     session=session, device=device, stream=stream, pool=storage.graph_pool.id,
-                    collective=runtime, coordinator=coordinator, compile_decoder=False, retain_graphs=True)
+                    collective=runtime, coordinator=coordinator, compile_decoder=compile_forward, retain_graphs=True)
                 session.freeze()
                 source.fill_(rank + 1)
                 torch.cuda.synchronize(device)
@@ -149,10 +158,11 @@ def _rank(rank, directory, readiness):
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1",
                    reason="requires four assigned CUDA devices and FLARE_RUN_TP_CUDA_TESTS=1")
 @pytest.mark.parametrize("readiness", [False, True], ids=["activation", "readiness-16b"])
-def test_prepared_model_exports_automatic_collective_startup_storage(tmp_path, readiness):
+@pytest.mark.parametrize("compile_forward", [False, True], ids=["eager-capture", "compiled-forward"])
+def test_prepared_model_exports_automatic_collective_startup_storage(tmp_path, readiness, compile_forward):
     import torch
     import torch.multiprocessing as mp
 
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign four CUDA devices explicitly"
     assert torch.cuda.device_count() == 4
-    mp.spawn(_rank, args=(tmp_path, readiness), nprocs=4, join=True)
+    mp.spawn(_rank, args=(tmp_path, readiness, compile_forward), nprocs=4, join=True)

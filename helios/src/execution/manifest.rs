@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{BufferSpan, Error, ExecutionError, GraphBundle, Result};
 
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 pub const VECTOR_RECORD_FIELDS: usize = 24;
 pub const MAX_OUTPUT_TOKENS: usize = 8;
 pub const REQUEST_LANES: usize = 64;
@@ -194,6 +194,46 @@ pub struct TuningGraphDescriptor {
     pub choices: Vec<TuningChoice>,
 }
 
+/// An exact startup output domain and the values admitting a prepared kernel.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(any(feature = "frontend", feature = "runtime-package"), derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(any(feature = "frontend", feature = "runtime-package"), serde(deny_unknown_fields))]
+pub struct KernelEnableWhen {
+    pub buffer: String,
+    pub allowed_values: Vec<Vec<u8>>,
+    pub enabled_values: Vec<Vec<u8>>,
+}
+
+impl KernelEnableWhen {
+    pub fn validate(&self, nbytes: usize) -> Result<()> {
+        let allowed: HashSet<_> = self.allowed_values.iter().collect();
+        let enabled: HashSet<_> = self.enabled_values.iter().collect();
+        if self.buffer.is_empty() || !(1..=64).contains(&nbytes)
+            || self.allowed_values.is_empty() || self.allowed_values.len() > 512
+            || allowed.len() != self.allowed_values.len()
+            || self.allowed_values.iter().any(|value| value.len() != nbytes)
+            || enabled.is_empty() || enabled.len() != self.enabled_values.len()
+            || !enabled.is_subset(&allowed) {
+            return Err("kernel startup predicates require a buffer, 1–512 distinct exact values of 1–64 bytes, and a nonempty admitted subset".into());
+        }
+        Ok(())
+    }
+
+    pub fn enabled(&self, value: &[u8]) -> Result<bool> {
+        if !self.allowed_values.iter().any(|allowed| allowed == value) {
+            return Err(format!("startup output {:?} is outside its prepared kernel domain", self.buffer).into());
+        }
+        Ok(self.enabled_values.iter().any(|enabled| enabled == value))
+    }
+}
+
+/// The source graph and its node remain owned until the executable drains.
+#[derive(Clone, Debug)]
+pub struct KernelNodeBinding {
+    pub node: usize,
+    pub predicate: KernelEnableWhen,
+}
+
 #[derive(Clone, Debug)]
 pub struct GraphDescriptor {
     /// Confidence prefixes produced per request in the completion frame.
@@ -214,9 +254,15 @@ pub struct GraphDescriptor {
     pub estimated_duration_ns: u64,
     pub input_bindings: Vec<InputBinding>,
     pub tuned_bindings: Vec<TunedBinding>,
+    pub kernel_predicates: Vec<KernelNodeBinding>,
+    pub startup_graph: Option<std::sync::Arc<super::GraphExecutableBinding>>,
 }
 
 impl GraphDescriptor {
+    pub fn executable(&self) -> usize {
+        self.startup_graph.as_ref().map_or(self.handle, |binding| binding.handle())
+    }
+
     pub fn packed_tokens(&self) -> usize {
         if self.packed_token_capacity != 0 {
             return self.packed_token_capacity;
@@ -297,7 +343,25 @@ impl ExecutionManifest {
         if statuses.iter().any(|name| producers.contains_key(name)) {
             return Err("tuning status cannot also be a tuning output".into());
         }
+        let mut domains = HashMap::new();
+        let mut nodes = HashSet::new();
         for graph in &self.graphs {
+            if graph.kernel_predicates.is_empty() != graph.startup_graph.is_none()
+                || graph.startup_graph.as_ref().is_some_and(|binding| binding.template == 0) {
+                return Err("kernel predicates require a retained source graph and executable binding".into());
+            }
+            for binding in &graph.kernel_predicates {
+                let predicate = &binding.predicate;
+                predicate.validate(self.buffer(&predicate.buffer)?.nbytes)?;
+                if binding.node == 0 || !nodes.insert(binding.node)
+                    || !graph.tuned_bindings.iter().any(|value| value.buffer == predicate.buffer) {
+                    return Err("kernel predicates require unique source nodes and declared tuned bindings".into());
+                }
+                if domains.insert(predicate.buffer.as_str(), &predicate.allowed_values)
+                    .is_some_and(|previous| previous != &predicate.allowed_values) {
+                    return Err("kernel predicates disagree on a startup output domain".into());
+                }
+            }
             let mut bindings = HashSet::new();
             for binding in &graph.tuned_bindings {
                 if !bindings.insert(&binding.buffer)
@@ -468,7 +532,7 @@ impl ExecutionManifest {
         GraphBundle {
             context: self.context,
             device: self.device,
-            graph_execs: self.graphs.iter().map(|graph| graph.handle)
+            graph_execs: self.graphs.iter().map(GraphDescriptor::executable)
                 .chain(self.tuning_graphs.iter().map(|graph| graph.handle)).collect(),
             buffers: self
                 .buffers
@@ -555,7 +619,7 @@ impl ExecutionManifest {
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival") {
             if self.abi_version != ABI_VERSION || buffer.dtype != Dtype::Float32
                 || buffer.shape != [2, self.request_capacity(), MAX_OUTPUT_TOKENS - 1] {
-                return Err("completion_speculative_survival requires ABI5 and two float32 frames of seven prefixes per request slot".into());
+                return Err("completion_speculative_survival requires ABI6 and two float32 frames of seven prefixes per request slot".into());
             }
         }
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "proposal_confidence") {

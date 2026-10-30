@@ -29,7 +29,7 @@ def test_manifest_has_separate_tuners_without_host_uploads(monkeypatch):
              for index, tensor in enumerate(bundle.buffers.values())]
     monkeypatch.setattr(bundle, "_validate_resources", lambda: (9, [11, 12], spans))
     manifest = bundle.manifest()
-    assert manifest["abi_version"] == 5
+    assert manifest["abi_version"] == 6
     assert set(bundle.signatures) == set(bundle.estimated_durations_ns) == {"decode"}
     assert set(bundle.graphs) == {"decode", "choose"}
     assert manifest["tuning_graphs"] == [dict(name="choose", handle=12,
@@ -154,7 +154,10 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda ordinal: None)
     selector = torch.tensor([7], dtype=torch.uint32)
     owner = SimpleNamespace(plan=SimpleNamespace(prepared=SimpleNamespace(state=SimpleNamespace(selector=selector))))
-    producer = SimpleNamespace(specs=(SimpleNamespace(selector=selector, choice_labels=lambda: ((7, "Prepared profile"),)),),
+    predicate = SimpleNamespace(function=41, selector_argument_index=3, selector_argument_byte_offset=0,
+        selector=selector, allowed_values=(b"\x07\x00\x00\x00",), enabled_values=(b"\x07\x00\x00\x00",))
+    producer = SimpleNamespace(specs=(SimpleNamespace(selector=selector,
+        choice_labels=lambda: ((7, "Prepared profile"),), launch_predicates=lambda: (predicate,)),),
         status=torch.ones(1, dtype=torch.int32), run=lambda: events.append("run"))
     registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=2), capture=nullcontext,
         benchmark_storage=SimpleNamespace(graph_pool=SimpleNamespace(id=(1, 7)))))
@@ -164,6 +167,9 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     registry.owner_groups = {id(owner): "key"}
     registry.captures[id(serving)] = {id(owner)}
     buffers, tuners, bindings, resources = registry.catalog({"decode": serving})
+    assert registry.kernel_predicates == [dict(graph="decode", function=41, argument_index=3,
+        argument_offset=0, selector_address=selector.data_ptr(), predicate=dict(
+            buffer="collective-tuning-0-selector-0", allowed_values=[[7, 0, 0, 0]], enabled_values=[[7, 0, 0, 0]]))]
     output = buffers[bindings["decode"][0].buffer]
     assert output.dtype == torch.int32 and output.data_ptr() == selector.data_ptr()
     output.fill_(5)

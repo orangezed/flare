@@ -121,7 +121,7 @@ class PreparedAllReduce:
             if (runtime.world_size < 2 or runtime.algorithm != "oneshot"
                     or not runtime.single_channel):
                 raise ValueError("prepared PCIe reductions require single-channel b12x direct all-reduce")
-            from b12x.comm.pcie import CollectiveConfig
+            from b12x.comm.pcie.joint_profiles import JointLaunchVariant
 
             channel = runtime.for_stream()
             startup_joint = (getattr(session, "collective_tuning", "static") == "runtime"
@@ -137,12 +137,14 @@ class PreparedAllReduce:
                 row = select(ladder, source.numel() * source.element_size(), world_size=runtime.world_size,
                              capability=torch.cuda.get_device_capability(source.device),
                              inplace=source.data_ptr() == output.data_ptr())
-                self.runtime_profiles = tuple((mode, active) for mode, counts in row["profiles"].items() for active in counts)
+                variants = tuple(JointLaunchVariant(
+                    family=variant["implementation"], threads=variant["threads"],
+                    blocks=variant["blocks"], cooperative=variant["cooperative"],
+                    profiles=tuple((mode, active) for mode, counts in variant["profiles"].items()
+                                   for active in counts)) for variant in row["variants"])
+                self.runtime_profiles = None
                 self.runtime_cache_policy = ladder["cache_policy"]
-                # One active CTA is legal at every payload; runtime selects from the supplied profiles.
-                plan_options = dict(joint_only=True, override=CollectiveConfig(
-                    implementation=row["implementation"], threads=row["threads"], blocks=row["blocks"],
-                    submode=self.runtime_profiles[0][0], active_blocks=1))
+                plan_options = dict(joint_only=True, joint_variants=variants)
             self.plan = runtime.plan(source, out=output, **plan_options)
             group = runtime.exchange_group
 

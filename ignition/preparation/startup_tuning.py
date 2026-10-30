@@ -122,6 +122,7 @@ class CollectiveStartupTuning:
         if needed and storage is None:
             raise RuntimeError("collective startup capture requires package storage")
         buffers, tuners, bindings, resources = {}, {}, {}, []
+        self.kernel_predicates = []
         for index, (key, producer) in enumerate(self.groups.items()):
             if key not in needed:
                 continue
@@ -159,6 +160,26 @@ class CollectiveStartupTuning:
                             and self.owner_groups[id(owner)] == key}
                 fields = {addresses[owner.plan.prepared.state.selector.data_ptr()] for owner in selected.values()}
                 bindings.setdefault(serving, []).extend(TunedBinding(field, name) for field in sorted(fields))
+                for spec in producer.specs:
+                    pointer = spec.selector.data_ptr()
+                    if addresses[pointer] not in fields:
+                        continue
+                    for predicate in spec.launch_predicates():
+                        if predicate.selector.data_ptr() != pointer:
+                            raise ValueError("collective kernel predicate must use its startup output")
+                        self.kernel_predicates.append(dict(graph=serving, function=int(predicate.function),
+                            argument_index=predicate.selector_argument_index,
+                            argument_offset=predicate.selector_argument_byte_offset, selector_address=pointer,
+                            predicate=dict(buffer=addresses[pointer],
+                                allowed_values=[list(value) for value in predicate.allowed_values],
+                                enabled_values=[list(value) for value in predicate.enabled_values])))
+        unique = {}
+        for predicate in self.kernel_predicates:
+            key = tuple(predicate[field] for field in ("graph", "function", "argument_index", "argument_offset", "selector_address"))
+            if key in unique and unique[key] != predicate:
+                raise ValueError("one captured kernel cannot have conflicting startup predicates")
+            unique[key] = predicate
+        self.kernel_predicates = list(unique.values())
         torch.cuda.synchronize(self.session.device.ordinal)
         return buffers, tuners, bindings, tuple(resources)
 

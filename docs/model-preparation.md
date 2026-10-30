@@ -180,12 +180,14 @@ declared tuning axes.
 `static` uses ordinary preparation-time autotuning and emits no collective startup
 tuners. Every recipe defaults to `static`. `[preparation] collective_tuning`
 overrides the recipe default; the command-line option overrides configuration.
-`runtime` requires `--collective-ladder PATH` and uses the file's final joint
-kernel geometry for eligible plain BF16 direct PCIe reductions. Preparation
-compiles that geometry without racing alternatives. A captured tuner selects
-among the supplied submode and active-CTA profiles when the package loads,
-including with autotune effort `off`; geometry stays fixed and no search runs
-during requests. Other collective paths retain their preparation policy. The
+`runtime` requires `--collective-ladder PATH` and uses the file's prepared launch
+variants for eligible plain BF16 direct PCIe reductions. Each payload bucket
+admits up to four candidates across kernel families, thread counts, physical
+grids, and ordinary or cooperative launches. Preparation compiles the declared
+variants without racing alternatives. A captured tuner selects a variant and
+its submode and active-CTA profile when the package loads, including with autotune
+effort `off`. Serving retains that selection; no search runs during requests.
+Other collective paths retain their preparation policy. The
 [GB202 PCIe TP4 ladder](../ignition/preparation/ladders/README.md) covers four
 SM120 GPUs with out-of-place BF16 reductions from 16 bytes through 8 MiB:
 

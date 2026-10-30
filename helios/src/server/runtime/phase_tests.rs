@@ -3580,7 +3580,7 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
         embedding_tables: vec![],
         pending_token: None,
     });
-    manifest.graphs.push(GraphDescriptor { tuned_bindings: vec![],
+    manifest.graphs.push(GraphDescriptor { startup_graph: None, kernel_predicates: vec![], tuned_bindings: vec![],
         confidence_width: 0,
         draft_tokens: 0,
         name: "Vision-1-256".into(),

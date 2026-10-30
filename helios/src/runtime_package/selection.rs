@@ -1526,7 +1526,7 @@ mod tests {
     #[test]
     fn malformed_rounds_and_obsolete_abis_reject_before_loading() {
         for rank in [0usize, 1] {
-            for abi in [0, 1, 2, 3, 4, 6] {
+            for abi in [0, 1, 2, 3, 4, 5, 7] {
                 let mut ranks = [round_package(8, 48, false), round_package(8, 48, false)];
                 ranks[rank].execution.as_mut().unwrap().abi_version = abi;
                 assert!(LoadOptions::default().select(&mut ranks, &mut round_config(48)).unwrap_err().to_string().contains("execution ABI"));

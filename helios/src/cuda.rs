@@ -12,6 +12,12 @@ type GetDevice = unsafe extern "C" fn(*mut c_int) -> c_int;
 type StreamCreate = unsafe extern "C" fn(*mut Handle, c_uint) -> c_int;
 type StreamOperation = unsafe extern "C" fn(Handle) -> c_int;
 type GraphLaunch = unsafe extern "C" fn(Handle, Handle) -> c_int;
+type GraphClone = unsafe extern "C" fn(*mut Handle, Handle) -> c_int;
+type GraphNodeClone = unsafe extern "C" fn(*mut Handle, Handle, Handle) -> c_int;
+type GraphAdjacent = unsafe extern "C" fn(Handle, *mut Handle, *mut [u8; 8], *mut usize) -> c_int;
+type GraphEdges = unsafe extern "C" fn(Handle, *const Handle, *const Handle, *const [u8; 8], usize) -> c_int;
+type GraphInstantiate = unsafe extern "C" fn(*mut Handle, Handle, u64) -> c_int;
+type MemoryInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> c_int;
 type ErrorText = unsafe extern "C" fn(c_int, *mut *const c_char) -> c_int;
 type HostAlloc = unsafe extern "C" fn(*mut Handle, usize, c_uint) -> c_int;
 type HostFree = unsafe extern "C" fn(Handle) -> c_int;
@@ -145,6 +151,17 @@ struct Driver {
     stream_synchronize: StreamOperation,
     stream_destroy: StreamOperation,
     graph_launch: GraphLaunch,
+    graph_upload: GraphLaunch,
+    graph_clone: GraphClone,
+    graph_find_node: GraphNodeClone,
+    graph_dependencies: GraphAdjacent,
+    graph_dependents: GraphAdjacent,
+    graph_edges: GraphEdges,
+    graph_node_destroy: StreamOperation,
+    graph_destroy: StreamOperation,
+    graph_exec_destroy: StreamOperation,
+    graph_instantiate: GraphInstantiate,
+    memory_info: MemoryInfo,
     error_name: ErrorText,
     error_string: ErrorText,
     host_alloc: HostAlloc,
@@ -209,6 +226,17 @@ impl Driver {
                 stream_synchronize: symbol!("cuStreamSynchronize"),
                 stream_destroy: symbol!("cuStreamDestroy_v2"),
                 graph_launch: symbol!("cuGraphLaunch"),
+                graph_upload: symbol!("cuGraphUpload"),
+                graph_clone: symbol!("cuGraphClone"),
+                graph_find_node: symbol!("cuGraphNodeFindInClone"),
+                graph_dependencies: symbol!("cuGraphNodeGetDependencies_v2"),
+                graph_dependents: symbol!("cuGraphNodeGetDependentNodes_v2"),
+                graph_edges: symbol!("cuGraphAddDependencies_v2"),
+                graph_node_destroy: symbol!("cuGraphDestroyNode"),
+                graph_destroy: symbol!("cuGraphDestroy"),
+                graph_exec_destroy: symbol!("cuGraphExecDestroy"),
+                graph_instantiate: symbol!("cuGraphInstantiateWithFlags"),
+                memory_info: symbol!("cuMemGetInfo_v2"),
                 error_name: symbol!("cuGetErrorName"),
                 error_string: symbol!("cuGetErrorString"),
                 host_alloc: symbol!("cuMemHostAlloc"),
@@ -560,6 +588,37 @@ pub(crate) fn map_device_host_parts(requests: &[(usize, i32, usize)]) -> Result<
     Ok(memory)
 }
 
+type GraphDependency = (usize, usize, [u8; 8]);
+
+/// Compose only full-completion edges when an unselected kernel is removed.
+/// Typed incident edges or a typed direct edge cannot be replaced or weakened.
+fn full_completion_contraction(
+    incoming: &[(usize, [u8; 8])],
+    outgoing: &[(usize, [u8; 8])],
+    existing: &[GraphDependency],
+) -> Result<Vec<GraphDependency>> {
+    if incoming.iter().chain(outgoing).any(|(_, data)| *data != [0; 8]) {
+        return Err("startup kernel contraction requires full-completion incident edges".into());
+    }
+    let mut result = Vec::new();
+    let mut added = std::collections::HashSet::new();
+    for &(source, _) in incoming {
+        for &(destination, _) in outgoing {
+            if source == destination {
+                return Err("startup kernel contraction would create a self-dependency".into());
+            }
+            let direct: Vec<_> = existing.iter().filter(|&&(a, b, _)| a == source && b == destination).collect();
+            if direct.iter().any(|edge| edge.2 != [0; 8]) {
+                return Err("startup kernel contraction conflicts with an existing typed dependency".into());
+            }
+            if direct.is_empty() && added.insert((source, destination)) {
+                result.push((source, destination, [0; 8]));
+            }
+        }
+    }
+    Ok(result)
+}
+
 pub(crate) struct Stream {
     driver: Arc<Driver>,
     handle: usize,
@@ -698,6 +757,80 @@ impl Stream {
     pub(crate) fn launch(&self, graph: usize) -> Result<()> {
         self.driver.check("cuGraphLaunch", unsafe {
             (self.driver.graph_launch)(graph as Handle, self.handle as Handle)
+        })
+    }
+
+    pub(crate) fn clone_pruned_graph(&self, source: usize, disabled: &[usize]) -> Result<usize> {
+        let mut graph = std::ptr::null_mut();
+        self.driver.check("cuGraphClone", unsafe { (self.driver.graph_clone)(&mut graph, source as Handle) })?;
+        let result = (|| -> Result<()> {
+            for &original in disabled {
+                let mut node = std::ptr::null_mut();
+                self.driver.check("cuGraphNodeFindInClone", unsafe {
+                    (self.driver.graph_find_node)(&mut node, original as Handle, graph)
+                })?;
+                let adjacent = |target: Handle, operation: GraphAdjacent, name: &str| -> Result<Vec<(Handle, [u8; 8])>> {
+                    let mut count = 0;
+                    self.driver.check(name, unsafe { operation(target, std::ptr::null_mut(), std::ptr::null_mut(), &mut count) })?;
+                    let mut nodes = vec![std::ptr::null_mut(); count];
+                    let mut data = vec![[0u8; 8]; count];
+                    if count != 0 {
+                        self.driver.check(name, unsafe { operation(target, nodes.as_mut_ptr(), data.as_mut_ptr(), &mut count) })?;
+                    }
+                    Ok(nodes.into_iter().zip(data).take(count).collect())
+                };
+                let incoming = adjacent(node, self.driver.graph_dependencies, "cuGraphNodeGetDependencies_v2")?;
+                let outgoing = adjacent(node, self.driver.graph_dependents, "cuGraphNodeGetDependentNodes_v2")?;
+                let mut existing = Vec::new();
+                for &(predecessor, _) in &incoming {
+                    existing.extend(adjacent(predecessor, self.driver.graph_dependents, "cuGraphNodeGetDependentNodes_v2")?
+                        .into_iter().map(|(successor, data)| (predecessor as usize, successor as usize, data)));
+                }
+                let incoming: Vec<_> = incoming.into_iter().map(|(node, data)| (node as usize, data)).collect();
+                let outgoing: Vec<_> = outgoing.into_iter().map(|(node, data)| (node as usize, data)).collect();
+                for (predecessor, successor, data) in full_completion_contraction(&incoming, &outgoing, &existing)? {
+                    let predecessor = predecessor as Handle;
+                    let successor = successor as Handle;
+                    self.driver.check("contract startup full-completion dependency", unsafe {
+                        (self.driver.graph_edges)(graph, &predecessor, &successor, &data, 1)
+                    })?;
+                }
+                self.driver.check("cuGraphDestroyNode", unsafe { (self.driver.graph_node_destroy)(node) })?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = self.destroy_graph_template(graph as usize);
+            return Err(error);
+        }
+        Ok(graph as usize)
+    }
+
+    pub(crate) fn instantiate_graph(&self, graph: usize, flags: u64) -> Result<usize> {
+        let mut executable = std::ptr::null_mut();
+        self.driver.check("cuGraphInstantiateWithFlags", unsafe {
+            (self.driver.graph_instantiate)(&mut executable, graph as Handle, flags)
+        })?;
+        Ok(executable as usize)
+    }
+
+    pub(crate) fn destroy_graph_executable(&self, graph: usize) -> Result<()> {
+        self.driver.check("cuGraphExecDestroy", unsafe { (self.driver.graph_exec_destroy)(graph as Handle) })
+    }
+
+    pub(crate) fn destroy_graph_template(&self, graph: usize) -> Result<()> {
+        self.driver.check("cuGraphDestroy", unsafe { (self.driver.graph_destroy)(graph as Handle) })
+    }
+
+    pub(crate) fn free_device_memory(&self) -> Result<usize> {
+        let (mut free, mut total) = (0, 0);
+        self.driver.check("cuMemGetInfo_v2", unsafe { (self.driver.memory_info)(&mut free, &mut total) })?;
+        Ok(free)
+    }
+
+    pub(crate) fn upload_graph(&self, graph: usize) -> Result<()> {
+        self.driver.check("cuGraphUpload", unsafe {
+            (self.driver.graph_upload)(graph as Handle, self.handle as Handle)
         })
     }
 
@@ -1283,5 +1416,54 @@ mod tests {
             direct || std::env::var_os("FLARE_OFFLOAD_TEST_DIR").is_none(),
             "the configured test directory refused direct I/O"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod graph_contraction_tests {
+    use super::full_completion_contraction;
+    const FULL: [u8; 8] = [0; 8];
+    const PROGRAMMATIC: [u8; 8] = [1, 0, 1, 0, 0, 0, 0, 0];
+
+    #[test]
+    fn consecutive_losers_preserve_surviving_dependencies_and_annotations() {
+        let mut edges = vec![(1, 2, FULL), (2, 3, FULL), (3, 4, FULL), (1, 5, PROGRAMMATIC)];
+        for removed in [2, 3] {
+            let incoming: Vec<_> = edges.iter().filter(|edge| edge.1 == removed).map(|edge| (edge.0, edge.2)).collect();
+            let outgoing: Vec<_> = edges.iter().filter(|edge| edge.0 == removed).map(|edge| (edge.1, edge.2)).collect();
+            let additions = full_completion_contraction(&incoming, &outgoing, &edges).unwrap();
+            edges.retain(|edge| edge.0 != removed && edge.1 != removed);
+            edges.extend(additions);
+        }
+        edges.sort();
+        assert_eq!(edges, [(1, 4, FULL), (1, 5, PROGRAMMATIC)]);
+    }
+
+    #[test]
+    fn fan_in_and_fan_out_preserve_every_completion_path_without_duplicates() {
+        let result = full_completion_contraction(&[(1, FULL), (2, FULL)], &[(4, FULL), (5, FULL)],
+            &[(1, 4, FULL), (2, 6, PROGRAMMATIC)]).unwrap();
+        assert_eq!(result, [(1, 5, FULL), (2, 4, FULL), (2, 5, FULL)]);
+    }
+
+    #[test]
+    fn incident_programmatic_or_unknown_annotations_are_rejected() {
+        for data in [PROGRAMMATIC, [0, 0, 2, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 1]] {
+            assert!(full_completion_contraction(&[(1, data)], &[(3, FULL)], &[]).is_err());
+            assert!(full_completion_contraction(&[(1, FULL)], &[(3, data)], &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn a_typed_direct_edge_is_not_silently_replaced_by_full_completion() {
+        assert!(full_completion_contraction(&[(1, FULL)], &[(3, FULL)], &[(1, 3, PROGRAMMATIC)]).is_err());
+        assert!(full_completion_contraction(&[(1, FULL)], &[(1, FULL)], &[]).is_err());
+    }
+
+    #[test]
+    fn optional_roots_and_sinks_add_no_unrelated_dependencies() {
+        assert!(full_completion_contraction(&[], &[(2, FULL)], &[]).unwrap().is_empty());
+        assert!(full_completion_contraction(&[(1, FULL)], &[], &[]).unwrap().is_empty());
     }
 }

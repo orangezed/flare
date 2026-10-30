@@ -1,4 +1,4 @@
-"""Offline ladders select final geometry at inclusive payload boundaries."""
+"""Offline ladders retain bounded launch variants at inclusive payload boundaries."""
 
 from copy import deepcopy
 from pathlib import Path
@@ -28,8 +28,15 @@ def test_supplied_ladder_covers_every_interval(path, name):
     for row in data["buckets"]:
         assert choose(data, lower) is row
         assert choose(data, row["max_bytes"]) is row
-        assert sum(map(len, row["profiles"].values())) <= 4
+        assert sum(len(counts) for variant in row["variants"] for counts in variant["profiles"].values()) <= 4
         lower = row["max_bytes"] + 16
+
+
+@pytest.mark.parametrize("path", [path for path, _ in LADDERS])
+def test_packaged_measured_buckets_preserve_both_launch_kinds(path):
+    for row in load(path)["buckets"][1:]:
+        assert {variant["cooperative"] for variant in row["variants"]} == {False, True}
+        assert sum(len(counts) for variant in row["variants"] for counts in variant["profiles"].values()) == 4
 
 
 @pytest.mark.parametrize("size", [0, 8, 1025, (8 << 20) + 16, True])
@@ -44,21 +51,48 @@ def test_rejects_incompatible_reduction(changes):
         choose(load(LADDER), 4096, **changes)
 
 
-@pytest.mark.parametrize("changes", [dict(version=2), dict(extra=1), dict(world_size=1),
+@pytest.mark.parametrize("changes", [dict(version=3), dict(extra=1), dict(world_size=1),
     dict(dtype="float16"), dict(inplace=0), dict(min_bytes=1025), dict(buckets=[]), dict(cache_policy="unknown")])
 def test_invalid_contract(changes):
     with pytest.raises(UsageError, match="collective ladder"):
         validate(load(LADDER) | changes)
 
 
-@pytest.mark.parametrize("changes", [dict(max_bytes=0), dict(implementation="oneshot"),
-    dict(threads=96), dict(blocks=0), dict(profiles={}), dict(profiles={"full": [0]}),
-    dict(profiles={"full": [65]}), dict(profiles={"full": [1, 1]}), dict(profiles={"bulk_push": [1]})])
+@pytest.mark.parametrize("changes", [dict(max_bytes=0), dict(variants=[]), dict(variants={})])
 def test_invalid_bucket(changes):
     data = deepcopy(load(LADDER))
     data["buckets"][0].update(changes)
     with pytest.raises(UsageError, match="collective ladder"):
         validate(data)
+
+
+@pytest.mark.parametrize("changes", [dict(implementation="oneshot"), dict(cooperative=1),
+    dict(threads=96), dict(blocks=0), dict(profiles={}), dict(profiles={"full": [0]}),
+    dict(profiles={"full": [65]}), dict(profiles={"full": [1, 1]}), dict(profiles={"bulk_push": [1]})])
+def test_invalid_variant(changes):
+    data = deepcopy(load(LADDER))
+    data["buckets"][0]["variants"][0].update(changes)
+    with pytest.raises(UsageError, match="collective ladder"):
+        validate(data)
+
+
+def test_unsupported_schema_requires_regeneration():
+    with pytest.raises(UsageError, match="regenerate.*version 2"):
+        validate(load(LADDER) | dict(version=1))
+
+
+def test_variants_have_distinct_geometries_and_a_shared_candidate_budget():
+    data = deepcopy(load(LADDER))
+    row = data["buckets"][0]
+    row["variants"].append(deepcopy(row["variants"][0]))
+    with pytest.raises(UsageError, match="duplicate launch geometry"):
+        validate(data)
+    row["variants"][1]["threads"] = 128
+    row["variants"][1]["profiles"] = {"full": [1, 2, 4, 8]}
+    with pytest.raises(UsageError, match="at most four runtime candidates"):
+        validate(data)
+    row["variants"][1]["profiles"] = {"full": [1, 2, 4]}
+    assert validate(data) is data
 
 
 def test_runtime_requires_file_and_static_rejects_it(tmp_path):
@@ -96,21 +130,26 @@ def test_b12x_accepts_pinned_geometry_at_both_ends_of_every_bucket(effort, path)
     lower = data["min_bytes"]
     with autotune_effort(effort):
         for row in data["buckets"]:
-            family = row["implementation"]
-            config = CollectiveConfig(implementation=family, threads=row["threads"], blocks=row["blocks"],
-                                      submode=next(iter(row["profiles"])), active_blocks=1)
-            for size in (lower, row["max_bytes"]):
-                query = CollectiveQuery(operation="all_reduce", world_size=4, rank=0,
-                    alternatives=FrozenMapping({family: dict(surface="OneshotAllReduce.all_reduce",
-                        world_size=4, rank=0, topology="pcie_ipc", setup={},
-                        call=dict(threads=256, blocks=64, submode=config.submode, active_blocks=1,
-                                  size_packs=size // 16, stage_input=True, dtype="bfloat16"))}),
-                    default=config)
-                configured = TUNING.configure(query, device=None, override=config, search=effort != "off")
-                assert configured.pinned == config
-            for mode, counts in row["profiles"].items():
-                for count in counts:
-                    assert selected_profile(family, row["blocks"], mode, count) & 0xffff == count
+            for variant in row["variants"]:
+                family = variant["implementation"]
+                mode, counts = next(iter(variant["profiles"].items()))
+                config = CollectiveConfig(implementation=family, threads=variant["threads"], blocks=variant["blocks"],
+                                          submode=mode, active_blocks=counts[0] if variant["cooperative"] else 1,
+                                          cooperative=variant["cooperative"])
+                for size in (lower, row["max_bytes"]):
+                    query = CollectiveQuery(operation="all_reduce", world_size=4, rank=0,
+                        alternatives=FrozenMapping({family: dict(surface="OneshotAllReduce.all_reduce",
+                            world_size=4, rank=0, topology="pcie_ipc", setup={},
+                            call=dict(threads=256, blocks=64, submode=config.submode,
+                                      active_blocks=config.active_blocks, cooperative=config.cooperative,
+                                      size_packs=size // 16, stage_input=True, dtype="bfloat16"))}),
+                        default=config)
+                    configured = TUNING.configure(query, device=None, override=config, search=effort != "off")
+                    assert configured.pinned == config
+                for mode, counts in variant["profiles"].items():
+                    for count in counts:
+                        assert selected_profile(family, variant["blocks"], mode, count,
+                                                cooperative=variant["cooperative"]) & 0xffff == count
             lower = row["max_bytes"] + 16
 
 
@@ -121,6 +160,9 @@ def test_native_export_preserves_ladder_contents():
     from tests.preparation.test_frontend_metadata import server
 
     data = load(LADDER)
+    data["buckets"][0]["variants"].append(dict(implementation="joint_bandwidth", threads=256,
+        blocks=8, cooperative=True, profiles={"bulk_push_phased": [8]}))
+    validate(data)
     source = server()
     source["rebuild_manifest"] = dict(version=1, collective_tuning="runtime",
                                       collective_ladder_json=json.dumps(data))
@@ -136,13 +178,33 @@ def test_native_export_preserves_ladder_contents():
     ("joint_bandwidth", "bulk_push_phased")])
 def test_phased_profile_admission_uses_b12x(family, mode):
     data = deepcopy(load(LADDER))
-    row = data["buckets"][0]
+    row = data["buckets"][0]["variants"][0]
     row.update(implementation=family, profiles={mode: [1]})
     assert validate(data) is data
     row["profiles"][mode] = [2]
     with pytest.raises(UsageError, match="exactly one active CTA"):
         validate(data)
     row["profiles"][mode] = [1]
+    data["world_size"] = 2
+    with pytest.raises(UsageError, match="TP size"):
+        validate(data)
+
+
+@pytest.mark.parametrize("family,mode", [("joint_latency", "full_phased"),
+    ("joint_latency", "payload_rsag_phased"), ("joint_bandwidth", "payload_rsag_phased"),
+    ("joint_bandwidth", "bulk_push_phased")])
+def test_cooperative_variants_require_phased_profiles_and_exact_physical_grids(family, mode):
+    data = deepcopy(load(LADDER))
+    row = data["buckets"][0]["variants"][0]
+    row.update(implementation=family, blocks=8, cooperative=True, profiles={mode: [8]})
+    assert validate(data) is data
+    row["profiles"] = {mode: [4]}
+    with pytest.raises(UsageError, match="physical and active CTA counts must match"):
+        validate(data)
+    row["profiles"] = {"pull": [8]}
+    with pytest.raises(UsageError, match="require a phased protocol"):
+        validate(data)
+    row["profiles"] = {mode: [8]}
     data["world_size"] = 2
     with pytest.raises(UsageError, match="TP size"):
         validate(data)

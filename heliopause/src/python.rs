@@ -211,7 +211,29 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
                 tuning_graph: field!(binding, "tuning_graph", String),
             });
         }
+        let mut kernel_predicates = Vec::new();
+        if let Ok(items) = graph.get_item("kernel_predicates") {
+            for item in items.try_iter()? {
+                let item = item?;
+                let predicate = item.get_item("predicate")?;
+                kernel_predicates.push(helios_core::execution::KernelNodeBinding {
+                    node: field!(item, "node", usize),
+                    predicate: helios_core::execution::KernelEnableWhen {
+                        buffer: field!(predicate, "buffer", String),
+                        allowed_values: field!(predicate, "allowed_values", Vec<Vec<u8>>),
+                        enabled_values: field!(predicate, "enabled_values", Vec<Vec<u8>>),
+                    },
+                });
+            }
+        }
+        let startup_graph = if let Ok(binding) = graph.get_item("startup_graph") {
+            Some(helios_core::execution::GraphExecutableBinding::new(
+                field!(binding, "template", usize), field!(graph, "handle", usize), field!(binding, "flags", u64),
+                helios_core::execution::GraphExecutableOwnership::Borrowed))
+        } else { None };
         graphs.push(GraphDescriptor {
+            startup_graph,
+            kernel_predicates,
             confidence_width: field!(graph, "confidence_width", usize),
             draft_tokens: if field!(graph, "kind", String) == "speculative" { field!(graph, "draft_tokens", usize) } else { 0 },
             name: field!(graph, "name", String),

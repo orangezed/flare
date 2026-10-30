@@ -74,3 +74,94 @@ fn oversized_cooperative_grids_replay_at_device_capacity() {
     }
     assert!(worker.close().drained);
 }
+
+#[test]
+#[ignore = "requires FLARE_KERNEL_PREDICATE_TEST_PACKAGE exported by kernel_predicate_package_fixture.py on the assigned GPU"]
+fn startup_kernel_predicates_replay_only_the_selected_launch() {
+    use crate::execution::GraphExecutor;
+    let root = std::path::PathBuf::from(std::env::var_os("FLARE_KERNEL_PREDICATE_TEST_PACKAGE").unwrap());
+    for selected in [1i32, 2, 3] {
+        let owner = unsafe { NativeResources::load(test_support::authorize(root.join("package")), 0).unwrap() };
+        owner.upload("choice_source", &[selected.to_ne_bytes(), 0i32.to_ne_bytes()].concat()).unwrap();
+        let executor = unsafe { GraphExecutor::new(owner.execution_manifest().unwrap()) };
+        if selected == 3 {
+            assert!(executor.is_err(), "unknown startup output must reject before replay");
+            continue;
+        }
+        let mut executor = executor.unwrap();
+        for index in 0..executor.manifest().graphs.len() {
+            owner.upload("output", &[0i32, 0, -1, -1].into_iter().flat_map(i32::to_ne_bytes).collect::<Vec<_>>()).unwrap();
+            for _ in 0..3 {
+                assert!(executor.submit(index, &[], false).unwrap().is_some());
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    if executor.poll().unwrap().is_some() { break; }
+                    assert!(std::time::Instant::now() < deadline, "native executor completion timed out");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            let values: Vec<_> = owner.download("output").unwrap().chunks_exact(4)
+                .map(|bytes| i32::from_ne_bytes(bytes.try_into().unwrap())).collect();
+            let scale = if executor.manifest().graphs[index].name == "decode1" { 1 } else { 2 };
+            assert_eq!(values, if selected == 1 { vec![3, 0, scale, -1] } else { vec![0, 3, -1, 2 * scale] });
+        }
+        assert!(executor.close().drained);
+        owner.upload("choice_source", &[3i32.to_ne_bytes(), 0i32.to_ne_bytes()].concat()).unwrap();
+        assert!(unsafe { GraphExecutor::new(owner.execution_manifest().unwrap()) }.is_err());
+        assert_eq!(owner.download("selector").unwrap(), selected.to_ne_bytes());
+        // Inspect the instantiated graph's actual source clone. Losing kernels
+        // have been removed, and selected kernels retain their launch policy.
+        unsafe {
+            let library = crate::os::cuda_library().unwrap();
+            let attribute = library.get::<unsafe extern "C" fn(Handle, i32, *mut std::ffi::c_void) -> i32>(
+                b"cuGraphKernelNodeGetAttribute\0").unwrap();
+            let parameters = library.get::<unsafe extern "C" fn(Handle, *mut driver::KernelParams) -> i32>(
+                b"cuGraphKernelNodeGetParams_v2\0").unwrap();
+            let nodes = library.get::<unsafe extern "C" fn(Handle, *mut Handle, *mut usize) -> i32>(
+                b"cuGraphGetNodes\0").unwrap();
+            let kind = library.get::<unsafe extern "C" fn(Handle, *mut i32) -> i32>(b"cuGraphNodeGetType\0").unwrap();
+            for graph in owner.execution_manifest().unwrap().graphs {
+                let binding = graph.startup_graph.as_ref().unwrap();
+                assert!(binding.ready());
+                assert_eq!(graph.handle, graph.executable());
+                let mut count = 0;
+                owner.driver.check("cuGraphGetNodes", nodes(binding.selected_template() as Handle, std::ptr::null_mut(), &mut count)).unwrap();
+                assert_eq!(count, 1);
+                let mut handles = vec![std::ptr::null_mut(); count];
+                owner.driver.check("cuGraphGetNodes", nodes(binding.selected_template() as Handle, handles.as_mut_ptr(), &mut count)).unwrap();
+                let mut kernels = 0;
+                for node in handles {
+                    let mut node_kind = -1;
+                    owner.driver.check("cuGraphNodeGetType", kind(node, &mut node_kind)).unwrap();
+                    assert_eq!(node_kind, 0);
+                    kernels += 1;
+                    let mut value = [0u64; 8];
+                    owner.driver.check("cuGraphKernelNodeGetAttribute", attribute(node, 2, value.as_mut_ptr().cast())).unwrap();
+                    assert_eq!(value[0], u64::from(selected == 2));
+                    let mut params: driver::KernelParams = std::mem::zeroed();
+                    owner.driver.check("cuGraphKernelNodeGetParams_v2", parameters(node, &mut params)).unwrap();
+                    let scale = if graph.name == "decode1" { 1 } else { 2 };
+                    assert_eq!(params.grid, [scale * selected as u32, 1, 1]);
+                }
+                assert_eq!(kernels, 1);
+            }
+        }
+        let worker = unsafe { ReplayWorker::new(owner.graph_bundle(), 1).unwrap() };
+        for _ in 0..4 {
+            for (index, name) in owner.graph_names().iter().enumerate().filter(|(_, name)| name.starts_with("decode")) {
+                owner.upload("output", &[0i32, 0, -1, -1].into_iter().flat_map(i32::to_ne_bytes).collect::<Vec<_>>()).unwrap();
+                worker.submit(index, 3).unwrap();
+                let result = worker.poll(Duration::from_secs(10)).unwrap().unwrap();
+                assert!(result.error.is_none(), "{:?}", result.error);
+                let values: Vec<_> = owner.download("output").unwrap().chunks_exact(4)
+                    .map(|bytes| i32::from_ne_bytes(bytes.try_into().unwrap())).collect();
+                let scale = if name == "decode1" { 1 } else { 2 };
+                assert_eq!(values, if selected == 1 { vec![3, 0, scale, -1] } else { vec![0, 3, -1, 2 * scale] });
+            }
+        }
+        assert!(worker.close().drained);
+    }
+    let owner = unsafe { NativeResources::load(test_support::authorize(root.join("package")), 0).unwrap() };
+    owner.upload("choice_source", &[1i32.to_ne_bytes(), 7i32.to_ne_bytes()].concat()).unwrap();
+    assert!(unsafe { GraphExecutor::new(owner.execution_manifest().unwrap()) }.is_err());
+}

@@ -99,6 +99,17 @@ pub(crate) struct Kernel {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KernelPredicateRegistration {
+    pub graph: String,
+    pub function: usize,
+    pub argument_index: usize,
+    pub argument_offset: usize,
+    pub selector_address: u64,
+    pub predicate: helios_core::execution::KernelEnableWhen,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct GraphHandle {
     pub name: String,
     pub graph: usize,
@@ -149,6 +160,8 @@ pub(crate) struct CaptureRequest {
     #[serde(default)]
     pub peer_mappings: Vec<(u64, u64)>,
     pub graphs: Vec<GraphHandle>,
+    #[serde(default)]
+    pub kernel_predicates: Vec<KernelPredicateRegistration>,
     pub allocations: Vec<Allocation>,
     #[serde(default)]
     pub discover_allocations: bool,

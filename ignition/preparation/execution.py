@@ -246,7 +246,7 @@ class PreparedExecution(PreparedGraphBundle):
             if signature.draft_tokens is not None:
                 graphs[-1].update(draft_tokens=signature.draft_tokens,
                                   verify_tokens=signature.token_capacity, draft_source=1)
-        abi_version = 5
+        abi_version = 6
         return {"abi_version": abi_version, "context": context, "device": self.device,
                 "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,
                 "buffers": descriptors, "graphs": graphs,

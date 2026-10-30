@@ -55,8 +55,8 @@ def test_preparation_uses_selected_surface_and_retains_storage(monkeypatch, surf
 
 @pytest.mark.parametrize("mode", ["static", "runtime"])
 @pytest.mark.parametrize("effort", ["off", "default", "audit"])
-def test_runtime_geometry_is_pinned_for_every_tuning_effort(monkeypatch, effort, mode):
-    from b12x.comm import pcie
+def test_runtime_catalog_is_declared_for_every_tuning_effort(monkeypatch, effort, mode):
+    from b12x.comm.pcie.joint_profiles import JointLaunchVariant
     from b12x.preparation import AutotuneEffort
     from ignition.components import collectives
     from ignition.preparation import startup_tuning
@@ -83,10 +83,13 @@ def test_runtime_geometry_is_pinned_for_every_tuning_effort(monkeypatch, effort,
         assert registered == []
     else:
         row = select(ladder, 4096, world_size=4, capability=(12, 0), inplace=False)
-        assert calls == [dict(out=output, joint_only=True, override=pcie.CollectiveConfig(
-            implementation=row["implementation"], threads=row["threads"], blocks=row["blocks"],
-            submode=next(iter(row["profiles"])), active_blocks=1))]
-        assert operation.runtime_profiles == tuple((mode, count) for mode, counts in row["profiles"].items() for count in counts)
+        variants = tuple(JointLaunchVariant(
+            family=variant["implementation"], threads=variant["threads"], blocks=variant["blocks"],
+            cooperative=variant["cooperative"],
+            profiles=tuple((mode, count) for mode, counts in variant["profiles"].items() for count in counts))
+            for variant in row["variants"])
+        assert calls == [dict(out=output, joint_only=True, joint_variants=variants)]
+        assert operation.runtime_profiles is None
         assert operation.runtime_cache_policy == "cold"
         assert registered == [operation]
 
@@ -95,16 +98,14 @@ def test_direct_collective_requires_joint_api_before_capability_lookup(monkeypat
     from importlib import import_module
     from ignition.components import collectives
 
-    pcie = import_module("b12x.comm.pcie")
-    api = import_module("b12x.comm.pcie.api")
-    monkeypatch.delattr(pcie, "CollectiveConfig", raising=False)
-    monkeypatch.delattr(api, "CollectiveConfig", raising=False)
+    profiles = import_module("b12x.comm.pcie.joint_profiles")
+    monkeypatch.delattr(profiles, "JointLaunchVariant", raising=False)
     monkeypatch.setattr(collectives, "_roce", lambda _: False)
     def channel():
         raise AssertionError("capability lookup must follow the required API import")
     runtime = SimpleNamespace(algorithm="oneshot", world_size=2, single_channel=True, for_stream=channel)
     source = torch.ones(2048, dtype=torch.bfloat16)
-    with pytest.raises(ImportError, match="CollectiveConfig"):
+    with pytest.raises(ImportError, match="JointLaunchVariant"):
         collectives.PreparedAllReduce(source, torch.empty_like(source), runtime=runtime,
             session=object(), coordinator=object(), name="reduce")
 

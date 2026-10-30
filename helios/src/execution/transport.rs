@@ -384,13 +384,17 @@ pub(super) fn collective_choices_overview(
     graphs.sort_by_key(|graph| (graph.kind as u8, graph.batch_capacity, graph.token_capacity,
         graph.packed_tokens(), graph.prefill_capacity, graph.draft_tokens, graph.name.as_str()));
     for graph in graphs {
-        let selected = graph.tuned_bindings.iter().filter_map(|binding|
-            outputs.get(binding.buffer.as_str()).map(|bytes| describe_choice(&binding.buffer, bytes)))
-            .collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(", ");
-        writeln!(text, "  {} · {:?} b={} t={} rows={} drafts={} prefill={} · {}",
+        writeln!(text, "  {} · {:?} b={} t={} rows={} drafts={} prefill={}",
             graph.name, graph.kind, graph.batch_capacity, graph.token_capacity,
-            graph.packed_tokens(), graph.draft_tokens, graph.prefill_capacity,
-            if selected.is_empty() { "unavailable" } else { &selected }).unwrap();
+            graph.packed_tokens(), graph.draft_tokens, graph.prefill_capacity).unwrap();
+        for binding in &graph.tuned_bindings {
+            if let Some(bytes) = outputs.get(binding.buffer.as_str()) {
+                writeln!(text, "    {} · {} · bytes={bytes:02x?}", binding.buffer,
+                    describe_choice(&binding.buffer, bytes)).unwrap();
+            } else {
+                writeln!(text, "    {} · unavailable", binding.buffer).unwrap();
+            }
+        }
     }
     text
 }
@@ -439,6 +443,9 @@ impl GraphExecutor {
     /// Construct rank-local streams without launching any collective graphs.
     pub(super) unsafe fn new_unstarted(manifest: ExecutionManifest) -> Result<Self> {
         manifest.validate()?;
+        if manifest.graphs.iter().filter_map(|graph| graph.startup_graph.as_ref()).any(|binding| !binding.unprepared()) {
+            return Err("captured graph startup construction may run only once per resource owner".into());
+        }
         let upload_capacity = manifest
             .graphs
             .iter()
@@ -598,6 +605,25 @@ impl GraphExecutor {
     pub(super) fn finish_startup(&mut self) -> Result<()> {
         if self.startup_next != self.manifest.referenced_tuning_graphs().len() {
             return Err("startup tuning graphs have not completed".into());
+        }
+        let outputs: std::collections::HashMap<_, _> = self.diagnostic_choices.iter().flatten()
+            .map(|(name, value)| (name.as_str(), value.as_slice())).collect();
+        // Validate every value before changing any executable. The producer owns selection;
+        // native startup only applies the prepared exact-byte predicates.
+        let changes = self.manifest.graphs.iter().map(|graph| {
+            graph.kernel_predicates.iter().filter_map(|binding| {
+                let selected = outputs.get(binding.predicate.buffer.as_str())
+                    .ok_or_else(|| crate::Error::from("kernel predicate startup output is unavailable"))
+                    .and_then(|value| binding.predicate.enabled(value));
+                match selected { Ok(true) => None, Ok(false) => Some(Ok(binding.node)), Err(error) => Some(Err(error)) }
+            }).collect::<Result<Vec<_>>>()
+        }).collect::<Result<Vec<_>>>()?;
+        let resources = self.resources.as_ref().ok_or("executor is closed")?;
+        for (graph, disabled) in self.manifest.graphs.iter_mut().zip(changes) {
+            if let Some(binding) = &graph.startup_graph {
+                binding.prepare(&resources.model, &disabled)?;
+                graph.handle = binding.handle();
+            }
         }
         self.startup_ready = true;
         Ok(())
@@ -793,7 +819,7 @@ impl GraphExecutor {
                     engram.enqueue(fence.0, graph.packed_tokens(), uploads, &frame.started)?;
                 }
             }
-            resources.model.launch(graph.handle)?;
+            resources.model.launch(graph.executable())?;
             resources.model.record(&frame.produced)?;
             resources.copy.wait(&frame.produced)?;
             let address = self.manifest.buffer("completion_records")?.address
@@ -1055,12 +1081,17 @@ impl GraphExecutor {
             .map_or(Ok(()), |e| e.drain())
             .map_err(Error::drain);
         let drained = compute.is_ok() && copy.is_ok() && engram.is_ok();
-        let error = compute
+        let mut error = compute
             .err()
             .or(copy.err())
             .or(engram.err())
             .or(self.poison.take());
         if drained {
+            for graph in &self.manifest.graphs {
+                if let Some(binding) = &graph.startup_graph {
+                    if let Err(failure) = binding.release_borrowed(&resources.model) { error.get_or_insert(failure); }
+                }
+            }
             drop(resources);
         } else {
             std::mem::forget(resources);

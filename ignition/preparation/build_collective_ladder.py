@@ -1,4 +1,4 @@
-"""Combine measured PCIe cohorts into a fixed-geometry runtime profile ladder."""
+"""Combine measured PCIe cohorts into bounded runtime launch-variant ladders."""
 
 import argparse
 from dataclasses import dataclass
@@ -22,7 +22,7 @@ class Cohort:
 
 def read_cohort(name, path, *, switched):
     """Restore b12x screening medians without pooling confirmation batches."""
-    from b12x.comm.pcie.joint_profiles import selected_profile
+    from b12x.comm.pcie.joint_profiles import JointLaunchVariant
     from b12x.tools._collective_ladder_search import Search, read_report
 
     metadata, records, summaries = read_report(path)
@@ -36,6 +36,9 @@ def read_cohort(name, path, *, switched):
         raise ValueError(f"{name}: all devices must have the same compute capability")
     contract = dict(compute_capability=list(capabilities.pop()), world_size=len(devices),
                     dtype=metadata["dtype"], inplace=metadata["alias"], cache_policy=metadata["cache_policy"])
+    if not isinstance(metadata["sizes"], list) or any(
+            type(size) is not int or size < 1024 or size % 16 for size in metadata["sizes"]):
+        raise ValueError(f"{name}: measured sizes must be integers of at least 1024 bytes, aligned to 16 bytes")
     sizes = tuple(sorted(metadata["sizes"]))
     if not sizes or len(sizes) != len(set(sizes)) or sizes[0] != 1024:
         raise ValueError(f"{name}: distinct measured sizes must start at 1024 bytes")
@@ -48,17 +51,20 @@ def read_cohort(name, path, *, switched):
     timings = {}
     for (size, key), latency in search.latencies.items():
         config = search.configs[size, key]
-        geometry = (config["implementation"], config["threads"], config["blocks"])
+        geometry = (config["implementation"], config["threads"], config["blocks"], config.get("cooperative", False))
         profile = (config["submode"], config["active_blocks"])
-        selected_profile(geometry[0], geometry[2], *profile, world=contract["world_size"])
-        timings.setdefault(size, {}).setdefault(geometry, {})[profile] = latency
+        JointLaunchVariant(*geometry[:3], profiles=(profile,), cooperative=geometry[3]).validate(contract["world_size"])
+        profiles = timings.setdefault(size, {}).setdefault(geometry, {})
+        if profile in profiles:
+            raise ValueError(f"{name}: duplicate measured launch configuration at {size} bytes")
+        profiles[profile] = latency
     if any(size not in timings for size in sizes):
         raise ValueError(f"{name}: every declared size requires correct measured configurations")
     return Cohort(name, switched, Path(path), contract, sizes, timings)
 
 
 def profile_menu(timings, *, limit=4):
-    """Find the smallest measured profile set covering all cohorts at 1% or 5%."""
+    """Find the smallest measured candidate set covering all cohorts at 1% or 5%."""
     best = [min(rows.values()) for rows in timings]
     profiles = sorted(set().union(*(rows.keys() for rows in timings)))
     full = (1 << len(timings)) - 1
@@ -81,17 +87,40 @@ def profile_menu(timings, *, limit=4):
                     covers[combined] = candidate
         if full in covers:
             return covers[full], tolerance
-    raise ValueError(f"no set of at most {limit} measured profiles covers every cohort within 5%")
+    raise ValueError(f"no set of at most {limit} measured candidates covers every cohort within 5%")
+
+
+def launch_menu(timings, *, limit=4):
+    """Cover all cohorts, retaining both launch classes when the budget permits."""
+    menu, tolerance = profile_menu(timings, limit=limit)
+    classes = [
+        {candidate: latency for candidate, latency in row.items() if candidate[3] == cooperative}
+        for row in timings for cooperative in (False, True)
+        if any(candidate[3] == cooperative for candidate in row)
+    ]
+    try:
+        expanded, _ = profile_menu(classes, limit=limit)
+    except ValueError:
+        expanded = ()
+    if expanded and all(min(row.get(candidate, float("inf")) for candidate in expanded)
+                        <= min(row.values()) * (1 + tolerance) for row in timings):
+        return expanded, tolerance
+    preferred = {}
+    for row in classes:
+        candidate = min(row, key=lambda candidate: (row[candidate], candidate))
+        preferred[candidate] = preferred.get(candidate, 0) + 1
+    additions = sorted(set(preferred) - set(menu), key=lambda candidate: (-preferred[candidate], candidate))
+    return (*menu, *additions[:max(0, limit - len(menu))]), tolerance
 
 
 def mode_finalists(menu, timings, *, limit=4):
     """Fill unused slots with measured representatives of distinct additional modes."""
-    covered = {mode for mode, _ in menu}
+    covered = {candidate[-2] for candidate in menu}
     best = [min(rows.values()) for rows in timings]
     shared = set.intersection(*(set(rows) for rows in timings))
     winners = {}
     for profile in shared:
-        mode, _ = profile
+        mode = profile[-2]
         if mode in covered:
             continue
         score = max(rows[profile] / fastest for rows, fastest in zip(timings, best))
@@ -103,52 +132,43 @@ def mode_finalists(menu, timings, *, limit=4):
 
 
 def combine(cohorts, *, name, retain_mode_finalists=False):
-    """Select shared geometry with switched-first or single-fabric minimax scoring."""
+    """Retain measured launch candidates covering each supplied timing cohort."""
     if not cohorts:
         raise ValueError("at least one measured report is required")
     if len({c.name for c in cohorts}) != len(cohorts):
         raise ValueError("cohort names must be distinct")
     first = cohorts[0]
-    both_fabrics = len({cohort.switched for cohort in cohorts}) == 2
     if any(c.contract != first.contract or c.sizes != first.sizes for c in cohorts[1:]):
         raise ValueError("reports must agree on GPU capability, TP size, dtype, aliasing, cache policy, and payload sizes")
-    buckets = [dict(max_bytes=1008, implementation="joint_latency", threads=64, blocks=64,
-                    profiles={"full": [1]})]
+    buckets = [dict(max_bytes=1008, variants=[dict(implementation="joint_latency", threads=64,
+                    blocks=64, cooperative=False, profiles={"full": [1]})])]
     measurements = []
     for size in first.sizes:
-        rows = [c.timings[size] for c in cohorts]
-        shared = set.intersection(*(set(row) for row in rows))
-        if not shared:
-            raise ValueError(f"{size} bytes: no compiled geometry was measured in every cohort")
-        best = [min(value for profiles in row.values() for value in profiles.values()) for row in rows]
-        ratios = {geometry: [min(row[geometry].values()) / fastest for row, fastest in zip(rows, best)]
-                  for geometry in shared}
-        if both_fabrics:
-            switched_penalty = lambda geometry: max(ratio for c, ratio in zip(cohorts, ratios[geometry]) if c.switched)
-            bridge_penalty = lambda geometry: max(ratio for c, ratio in zip(cohorts, ratios[geometry]) if not c.switched)
-            within = [geometry for geometry in shared if switched_penalty(geometry) <= 1.02]
-            if within:
-                geometry = min(within, key=lambda g: (bridge_penalty(g), switched_penalty(g), g))
-            else:
-                geometry = min(shared, key=lambda g: (switched_penalty(g), bridge_penalty(g), g))
-        else:
-            geometry = min(shared, key=lambda g: (max(ratios[g]), g))
+        rows = [{(*geometry, *profile): latency
+                 for geometry, profiles in cohort.timings[size].items() for profile, latency in profiles.items()}
+                for cohort in cohorts]
+        best = [min(row.values()) for row in rows]
         try:
-            menu, tolerance = profile_menu([row[geometry] for row in rows])
+            menu, tolerance = launch_menu(rows)
         except ValueError as error:
-            raise ValueError(f"{size} bytes, {geometry}: {error}") from error
+            raise ValueError(f"{size} bytes: {error}") from error
         if retain_mode_finalists:
-            menu = mode_finalists(menu, [row[geometry] for row in rows])
-        profiles = {}
-        for mode, active in menu:
-            profiles.setdefault(mode, []).append(active)
-        bucket = dict(max_bytes=size, implementation=geometry[0], threads=geometry[1], blocks=geometry[2], profiles=profiles)
+            menu = mode_finalists(menu, rows)
+        variants = {}
+        for family, threads, blocks, cooperative, mode, active in menu:
+            variant = variants.setdefault((family, threads, blocks, cooperative), dict(
+                implementation=family, threads=threads, blocks=blocks, cooperative=cooperative, profiles={}))
+            variant["profiles"].setdefault(mode, []).append(active)
+        bucket = dict(max_bytes=size, variants=list(variants.values()))
         buckets.append(bucket)
-        measurements.append(dict(bytes=size, profile_tolerance=tolerance, geometry=bucket,
-            cohorts={cohort.name: dict(best_us=fastest, geometry_best_us=min(row[geometry].values()),
-                menu_best_us=min(row[geometry].get(profile, float("inf")) for profile in menu))
+        measurements.append(dict(bytes=size, profile_tolerance=tolerance, variants=bucket["variants"],
+            cohorts={cohort.name: dict(best_us=fastest,
+                menu_best_us=min(row.get(candidate, float("inf")) for candidate in menu),
+                candidate_latencies=[dict(implementation=candidate[0], threads=candidate[1],
+                    blocks=candidate[2], cooperative=candidate[3], submode=candidate[4],
+                    active_blocks=candidate[5], median_us=row.get(candidate)) for candidate in menu])
                 for cohort, row, fastest in zip(cohorts, rows, best)}))
-    ladder = validate(dict(version=1, name=name, **first.contract, min_bytes=16, buckets=buckets))
+    ladder = validate(dict(version=2, name=name, **first.contract, min_bytes=16, buckets=buckets))
     return ladder, measurements
 
 
@@ -158,9 +178,9 @@ def main():
     parser.add_argument("--host-bridge", metavar="NAME=REPORT", action="append", default=[])
     parser.add_argument("--name", required=True)
     parser.add_argument("--retain-mode-finalists", action="store_true",
-                        help="fill unused profile slots with measured winners of other modes, up to four profiles")
+                        help="fill unused candidate slots with measured winners of other modes, up to four candidates")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--measurements", type=Path, required=True, help="JSON comparison of selected geometry and menu against each report")
+    parser.add_argument("--measurements", type=Path, required=True, help="JSON comparison of selected launch variants against each report")
     args = parser.parse_args()
     if args.output.resolve() == args.measurements.resolve() or args.output.exists() or args.measurements.exists():
         parser.error("output paths must be distinct and unused")
@@ -177,7 +197,7 @@ def main():
         parser.error(str(error))
     comparison = dict(
         aggregation="b12x screening medians; successful confirmation and final batches remain separate",
-        geometry_policy=("switched-first" if len({c.switched for c in cohorts}) == 2 else "single-fabric minimax"),
+        candidate_policy="cohort coverage with ordinary and cooperative finalists",
         retain_mode_finalists=args.retain_mode_finalists,
         cohorts=[dict(name=c.name, switched=c.switched, report=str(c.path)) for c in cohorts],
         control_bucket=dict(min_bytes=16, max_bytes=1008, performance_measured=False),

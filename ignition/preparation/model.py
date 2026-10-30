@@ -27,6 +27,8 @@ class PreparedModel(PreparedExecution):
             kwargs["resources"] = (*kwargs.get("resources", ()), *owners)
             kwargs["tuning_graphs"] = tuners
             kwargs["tuned_bindings"] = bindings
+        self.export_kernel_predicates = () if registry is None else tuple(registry.kernel_predicates)
+        self._resolved_kernel_predicates = None
         super().__init__(**kwargs)
         if forwards is not None and set(forwards) != set(self.serving_graphs):
             raise ValueError("retained forwards must cover exactly the captured graphs")
@@ -57,6 +59,15 @@ class PreparedModel(PreparedExecution):
     def manifest(self, *, all_variants=False):
         """Expose the serving width to diagnostics and the complete catalog to export."""
         manifest = super().manifest(all_variants=all_variants)
+        if self.export_kernel_predicates:
+            if self._resolved_kernel_predicates is None:
+                import flare_heliopause
+                from .runtime_package import _graphs
+                self._resolved_kernel_predicates = json.loads(flare_heliopause.resolve_kernel_predicates(
+                    manifest["context"], json.dumps(_graphs(self.serving_graphs)),
+                    json.dumps(self.export_kernel_predicates)))
+            for graph in manifest["graphs"]:
+                graph.update(self._resolved_kernel_predicates.get(graph["name"], {}))
         fixed = self.server_config.get("speculative_fixed_width")
         if fixed is not None and not all_variants:
             manifest["graphs"] = [graph for graph in manifest["graphs"]
