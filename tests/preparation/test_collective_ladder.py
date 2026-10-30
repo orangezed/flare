@@ -9,15 +9,18 @@ from ignition.errors import UsageError
 from ignition.preparation.collective_ladder import load, resolve, select, validate
 
 LADDER = Path(__file__).resolve().parents[2] / "ignition/preparation/ladders/gb202_pcie_tp4.json"
+LADDERS = ((LADDER, "gb202_pcie_tp4"),
+           (LADDER.with_name("gb202_pcie_tp4_host_bridge.json"), "gb202_pcie_tp4_host_bridge_candidates"))
 
 
 def choose(data, size, **changes):
     return select(data, size, **(dict(world_size=4, capability=(12, 0), inplace=False) | changes))
 
 
-def test_supplied_ladder_covers_every_interval():
-    data = load(LADDER)
-    assert data["name"] == "gb202_pcie_tp4"
+@pytest.mark.parametrize("path,name", LADDERS)
+def test_supplied_ladder_covers_every_interval(path, name):
+    data = load(path)
+    assert data["name"] == name
     assert len(data["buckets"]) == 210
     assert data["min_bytes"] == 16
     assert data["buckets"][-1]["max_bytes"] == 8 << 20
@@ -82,13 +85,14 @@ def test_preparation_cli_accepts_ladder(command):
     assert args.collective_ladder == LADDER
 
 
+@pytest.mark.parametrize("path", [path for path, _ in LADDERS])
 @pytest.mark.parametrize("effort", ["off", "default", "audit"])
-def test_b12x_accepts_pinned_geometry_at_both_ends_of_every_bucket(effort):
+def test_b12x_accepts_pinned_geometry_at_both_ends_of_every_bucket(effort, path):
     from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery, TUNING
     from b12x.comm.pcie._joint_profile import selected_profile
     from b12x.preparation import FrozenMapping, autotune_effort
 
-    data = load(LADDER)
+    data = load(path)
     lower = data["min_bytes"]
     with autotune_effort(effort):
         for row in data["buckets"]:
@@ -125,3 +129,30 @@ def test_native_export_preserves_ladder_contents():
     restored = ModelIndex.FromString(index.SerializeToString())
     assert restored.rebuild.collective_tuning == "runtime"
     assert json.loads(restored.rebuild.collective_ladder_json) == data
+
+
+@pytest.mark.parametrize("family,mode", [("joint_latency", "full_phased"),
+    ("joint_latency", "payload_rsag_phased"), ("joint_bandwidth", "payload_rsag_phased"),
+    ("joint_bandwidth", "bulk_push_phased")])
+def test_phased_profile_admission_uses_b12x(family, mode):
+    data = deepcopy(load(LADDER))
+    row = data["buckets"][0]
+    row.update(implementation=family, profiles={mode: [1]})
+    assert validate(data) is data
+    row["profiles"][mode] = [2]
+    with pytest.raises(UsageError, match="exactly one active CTA"):
+        validate(data)
+    row["profiles"][mode] = [1]
+    data["world_size"] = 2
+    with pytest.raises(UsageError, match="TP size"):
+        validate(data)
+
+
+def test_ladder_validation_does_not_import_cuda_libraries():
+    import subprocess
+    import sys
+
+    subprocess.run([sys.executable, "-c",
+        "import sys; from ignition.preparation.collective_ladder import load; "
+        "load(sys.argv[1]); assert 'torch' not in sys.modules; assert 'cuda' not in sys.modules",
+        str(LADDER)], check=True)

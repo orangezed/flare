@@ -5,14 +5,10 @@ from pathlib import Path
 
 from ignition.errors import UsageError
 
-MODES = {
-    "joint_latency": ("full", "payload_rsag", "pull"),
-    "joint_bandwidth": ("payload_rsag", "bulk_push", "bulk_pull", "pull"),
-}
-
-
 def validate(data):
-    """Validate the JSON contract without importing CUDA or preparation backends."""
+    """Validate the JSON contract against b12x's CPU-only profile catalog."""
+    from b12x.comm.pcie.joint_profiles import joint_modes, selected_profile
+
     def require(condition, message):
         if not condition:
             raise UsageError(f"collective ladder: {message}")
@@ -39,15 +35,24 @@ def validate(data):
         require(type(upper) is int and upper > previous and upper % 16 == 0,
                 "bucket max_bytes must increase and be 16-byte aligned")
         previous = upper
-        require(isinstance(row["implementation"], str) and row["implementation"] in MODES, "unknown joint kernel")
+        require(isinstance(row["implementation"], str), "unknown joint kernel")
+        try:
+            modes = joint_modes(row["implementation"], data["world_size"])
+        except ValueError as error:
+            raise UsageError(f"collective ladder: {error}") from error
         require(type(row["threads"]) is int and row["threads"] in (32, 64, 128, 256, 512), "invalid threads")
         require(type(row["blocks"]) is int and 1 <= row["blocks"] <= 64, "invalid physical grid")
         require(isinstance(row["profiles"], dict) and bool(row["profiles"]), "profiles must be nonempty")
         for mode, counts in row["profiles"].items():
-            require(mode in MODES[row["implementation"]], "mode does not belong to joint kernel")
+            require(mode in modes, "mode does not belong to joint kernel or TP size")
             require(isinstance(counts, list) and bool(counts)
                     and all(type(v) is int and 1 <= v <= row["blocks"] for v in counts), "invalid active CTA counts")
             require(len(set(counts)) == len(counts), "duplicate active CTA counts")
+            for count in counts:
+                try:
+                    selected_profile(row["implementation"], row["blocks"], mode, count, world=data["world_size"])
+                except ValueError as error:
+                    raise UsageError(f"collective ladder: {error}") from error
     return data
 
 
