@@ -8,7 +8,16 @@ import sys
 import pytest
 
 
-def _rank(rank, directory, readiness):
+class _ReductionForward:
+    def __init__(self, operation, source):
+        self.operation = operation
+        self.source = source
+
+    def __call__(self):
+        return self.operation(self.source)
+
+
+def _rank(rank, directory, readiness, compile_forward):
     import torch
     import torch.distributed as dist
 
@@ -50,7 +59,7 @@ def _rank(rank, directory, readiness):
                         coordinator=coordinator, name="readiness-barrier")
                     source, output, operation = wait.input, wait.output, wait.barrier
                     assert source.numel() * source.element_size() == 16
-                    assert operation.runtime_profiles == (("full", 1),)
+                    assert operation.runtime_profiles is None
                 else:
                     source = torch.full((13, 2560), rank + 1, dtype=torch.bfloat16, device=device)
                     output = torch.empty_like(source)
@@ -59,9 +68,9 @@ def _rank(rank, directory, readiness):
                 session.tune(show_progress=False)
                 signatures = {name: GraphSignature(name, 1, 1) for name in ("init", "decode")}
                 stream = torch.cuda.Stream(device=device)
-                graphs, _ = capture_forwards(dict.fromkeys(signatures, lambda: operation(source)), signatures,
+                graphs, _ = capture_forwards(dict.fromkeys(signatures, _ReductionForward(operation, source)), signatures,
                     session=session, device=device, stream=stream, pool=storage.graph_pool.id,
-                    collective=runtime, coordinator=coordinator, compile_decoder=False, retain_graphs=True)
+                    collective=runtime, coordinator=coordinator, compile_decoder=compile_forward, retain_graphs=True)
                 session.freeze()
                 source.fill_(rank + 1)
                 torch.cuda.synchronize(device)
@@ -92,6 +101,9 @@ def _rank(rank, directory, readiness):
                 binding = prepared.tuned_bindings["decode"][0]
                 tuner = prepared.tuning_graphs[binding.tuning_graph]
                 assert tuner.outputs == (binding.buffer,)
+                assert tuner.choices == tuple((value.to_bytes(4, sys.byteorder), label)
+                                             for value, label in producer.specs[0].choice_labels())
+                assert tuner.choices
                 assert prepared.buffers[binding.buffer].data_ptr() == operation.plan.prepared.state.selector.data_ptr()
                 assert prepared.buffers[tuner.status_buffer] is producer.status
                 assert set(prepared.graphs) == {*signatures, binding.tuning_graph}
@@ -117,6 +129,9 @@ def _rank(rank, directory, readiness):
                 from ignition.preparation import runtime_package_pb2 as proto
 
                 index, _, _ = read_sources_record(directory / f"rank-{rank}.json")
+                exported_tuner = next(graph for graph in index.ranks[0].execution.tuning_graphs
+                                      if graph.name == binding.tuning_graph)
+                assert [(choice.value, choice.label) for choice in exported_tuner.choices] == list(tuner.choices)
                 allocations = index.ranks[0].allocations
                 outside = [(allocation.name, hex(allocation.address), allocation.nbytes)
                     for allocation in allocations if allocation.memory == proto.DEVICE
@@ -143,10 +158,11 @@ def _rank(rank, directory, readiness):
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1",
                    reason="requires four assigned CUDA devices and FLARE_RUN_TP_CUDA_TESTS=1")
 @pytest.mark.parametrize("readiness", [False, True], ids=["activation", "readiness-16b"])
-def test_prepared_model_exports_automatic_collective_startup_storage(tmp_path, readiness):
+@pytest.mark.parametrize("compile_forward", [False, True], ids=["eager-capture", "compiled-forward"])
+def test_prepared_model_exports_automatic_collective_startup_storage(tmp_path, readiness, compile_forward):
     import torch
     import torch.multiprocessing as mp
 
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign four CUDA devices explicitly"
     assert torch.cuda.device_count() == 4
-    mp.spawn(_rank, args=(tmp_path, readiness), nprocs=4, join=True)
+    mp.spawn(_rank, args=(tmp_path, readiness, compile_forward), nprocs=4, join=True)

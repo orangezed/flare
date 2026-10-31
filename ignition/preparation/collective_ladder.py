@@ -1,18 +1,14 @@
-"""Final compiled geometries and runtime profiles for plain PCIe reductions."""
+"""Prepared launch variants and runtime profiles for plain PCIe reductions."""
 
 import json
 from pathlib import Path
 
 from ignition.errors import UsageError
 
-MODES = {
-    "joint_latency": ("full", "payload_rsag", "pull"),
-    "joint_bandwidth": ("payload_rsag", "bulk_push", "bulk_pull", "pull"),
-}
-
-
 def validate(data):
-    """Validate the JSON contract without importing CUDA or preparation backends."""
+    """Validate the JSON contract against b12x's CPU-only profile catalog."""
+    from b12x.comm.pcie.joint_profiles import joint_modes, selected_profile
+
     def require(condition, message):
         if not condition:
             raise UsageError(f"collective ladder: {message}")
@@ -20,7 +16,8 @@ def validate(data):
     require(isinstance(data, dict), "expected an object")
     require(set(data) == {"version", "name", "compute_capability", "world_size", "dtype",
                           "inplace", "cache_policy", "min_bytes", "buckets"}, "invalid fields")
-    require(type(data["version"]) is int and data["version"] == 1, "unsupported version")
+    require(type(data["version"]) is int and data["version"] == 2,
+            "unsupported version; regenerate the collective ladder in version 2 format")
     require(isinstance(data["name"], str) and bool(data["name"]), "name must be nonempty")
     require(isinstance(data["compute_capability"], list) and len(data["compute_capability"]) == 2
             and all(type(v) is int and v >= 0 for v in data["compute_capability"]), "invalid compute capability")
@@ -33,21 +30,44 @@ def validate(data):
     require(isinstance(data["buckets"], list) and bool(data["buckets"]), "buckets must be nonempty")
     previous = data["min_bytes"] - 16
     for row in data["buckets"]:
-        require(isinstance(row, dict) and set(row) == {"max_bytes", "implementation", "threads", "blocks", "profiles"},
+        require(isinstance(row, dict) and set(row) == {"max_bytes", "variants"},
                 "invalid bucket fields")
         upper = row["max_bytes"]
         require(type(upper) is int and upper > previous and upper % 16 == 0,
                 "bucket max_bytes must increase and be 16-byte aligned")
         previous = upper
-        require(isinstance(row["implementation"], str) and row["implementation"] in MODES, "unknown joint kernel")
-        require(type(row["threads"]) is int and row["threads"] in (32, 64, 128, 256, 512), "invalid threads")
-        require(type(row["blocks"]) is int and 1 <= row["blocks"] <= 64, "invalid physical grid")
-        require(isinstance(row["profiles"], dict) and bool(row["profiles"]), "profiles must be nonempty")
-        for mode, counts in row["profiles"].items():
-            require(mode in MODES[row["implementation"]], "mode does not belong to joint kernel")
-            require(isinstance(counts, list) and bool(counts)
-                    and all(type(v) is int and 1 <= v <= row["blocks"] for v in counts), "invalid active CTA counts")
-            require(len(set(counts)) == len(counts), "duplicate active CTA counts")
+        require(isinstance(row["variants"], list) and 1 <= len(row["variants"]) <= 4,
+                "each bucket requires one to four launch variants")
+        geometries = set()
+        candidates = 0
+        for variant in row["variants"]:
+            require(isinstance(variant, dict) and set(variant) == {
+                "implementation", "threads", "blocks", "cooperative", "profiles"}, "invalid variant fields")
+            require(isinstance(variant["implementation"], str), "unknown joint kernel")
+            try:
+                modes = joint_modes(variant["implementation"], data["world_size"])
+            except ValueError as error:
+                raise UsageError(f"collective ladder: {error}") from error
+            require(type(variant["threads"]) is int and variant["threads"] in (32, 64, 128, 256, 512), "invalid threads")
+            require(type(variant["blocks"]) is int and 1 <= variant["blocks"] <= 64, "invalid physical grid")
+            require(type(variant["cooperative"]) is bool, "cooperative must be boolean")
+            geometry = (variant["implementation"], variant["threads"], variant["blocks"], variant["cooperative"])
+            require(geometry not in geometries, "duplicate launch geometry")
+            geometries.add(geometry)
+            require(isinstance(variant["profiles"], dict) and bool(variant["profiles"]), "profiles must be nonempty")
+            for mode, counts in variant["profiles"].items():
+                require(mode in modes, "mode does not belong to joint kernel or TP size")
+                require(isinstance(counts, list) and bool(counts)
+                        and all(type(v) is int and 1 <= v <= variant["blocks"] for v in counts), "invalid active CTA counts")
+                require(len(set(counts)) == len(counts), "duplicate active CTA counts")
+                candidates += len(counts)
+                for count in counts:
+                    try:
+                        selected_profile(variant["implementation"], variant["blocks"], mode, count,
+                                         world=data["world_size"], cooperative=variant["cooperative"])
+                    except ValueError as error:
+                        raise UsageError(f"collective ladder: {error}") from error
+        require(candidates <= 4, "each bucket permits at most four runtime candidates")
     return data
 
 

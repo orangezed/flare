@@ -4,6 +4,57 @@
 
 > **Coding agents:** skip this README and read [AGENTS.md](AGENTS.md) directly.
 
+## Build the cooperative-collective runtime
+
+The `astra/cooperative-collective-preparation` branch contains the native loader for the
+[DeepSeek V4.1 `phased-cooperative` package](https://huggingface.co/local-inference-lab/DeepSeek-V4.1-Flash-1017-FLARE/tree/phased-cooperative).
+It requires execution ABI 6 and prepared contract 3 and removes unselected
+kernel nodes after startup tuning while preserving their dependencies.
+
+With Rust and the native build dependencies installed, build from this repository:
+
+```sh
+cargo build --release --locked --manifest-path flare/Cargo.toml
+./flare/target/release/flare --help
+```
+
+The repository Dockerfile also builds the server from source:
+
+```sh
+docker build -t flare:phased-cooperative .
+```
+
+Building this native server and serving the published package does not require
+Python, PyTorch, or a FlashInfer checkout: the package already contains its CUDA
+kernels. Follow the linked model card for download and serving flags, substituting
+the executable or image built here. Preparing another model export uses the
+companion FlashInfer revision pinned in `pyproject.toml` and `uv.lock`.
+The native loader remains independent of the preparation environment.
+
+With the source checkpoint available and four free SM120 GPUs, prepare the
+DeepSeek V4.1 configuration used by the published CSF package:
+
+```sh
+uv sync --locked --extra prepare --extra test
+.venv/bin/python -m ignition export deepseek-v4.1-flash \
+  --gpus 0,1,2,3 --max-concurrency 32 --image-concurrency 1 \
+  --mtp-draft-tokens 7 --speculative-token-capacity 128 \
+  --speculative-graph-budget 64 --prefill-chunk-size 4096 \
+  --mla-compute-mode bf16 --expert-scale-compression csf \
+  --autotune-effort default --compile-workers 24 \
+  --collective-tuning runtime \
+  --collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json \
+  --draft-head-quantization nvfp4 --markov-head-quantization fp8 \
+  --vocabulary-parallel-sampling --verbose
+```
+
+Use `--expert-scale-compression native` for uncompressed expert scales.
+`--compile-workers` controls preparation CPU resources; it does not change serving
+capacity. Add `--reuse-weights` only when the selected cached package has matching
+weight layouts, including the scale and draft-head formats. Automatic tuning on
+another host can select different kernel plans. The published measurements apply
+to the tested packages, not every subsequent export.
+
 Flare is a local inference server for NVIDIA SM120/SM121 GPUs, built for
 long conversations, coding agents, and repeated tool use. Its goal is to make
 the memory, bandwidth, and compute in workstations and compact systems such

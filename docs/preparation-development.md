@@ -148,12 +148,14 @@ order. Each candidate executes on the whole TP group and is scored by the slowes
 rank. `ReplicaPreparation` keeps these exchanges within each serving TP replica;
 independent kernel candidates retain corresponding-rank sharding across replicas.
 Preparation-time search ends before graph handoff. With `--collective-tuning
-runtime`, the required `--collective-ladder PATH` file supplies final compiled
-geometries for eligible plain BF16 PCIe reductions. These pinned plans do not
-race geometries during preparation, including with `--autotune-effort off`.
-Captured tuning graphs select among the supplied submode/active-CTA profiles
-before serving begins; native rank coordination only launches those graphs and
-waits for their completion. See the [ladder format](../ignition/preparation/ladders/README.md).
+runtime`, the required `--collective-ladder PATH` file supplies prepared launch
+variants for eligible plain BF16 PCIe reductions. Each variant declares its
+kernel family, threads, physical grid, ordinary or cooperative launch, and
+submode/active-CTA profiles. Preparation compiles these variants without racing
+geometries, including with `--autotune-effort off`. Captured tuning graphs select
+among at most four candidates per payload bucket before serving begins. Native
+rank coordination launches those graphs, waits for completion, and preserves
+the selected serving nodes. See the [ladder format](../ignition/preparation/ladders/README.md).
 
 - **Compile tensor-parallel forwards once, sharded across ranks.** Pass the
   preparation coordinator to `capture_forwards`. Each forward variant compiles
