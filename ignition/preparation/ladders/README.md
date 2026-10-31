@@ -54,6 +54,38 @@ capability, and input/output aliasing must match. Other collective transports
 and fused operations retain their preparation policy. Runtime profile selection
 cannot change the compiled family, threads, or physical grid.
 
+### Thread-block clusters
+
+A bucket may set `"cluster_size": 8` to launch eight-CTA CUDA thread-block
+clusters. Omitting the field, or setting it to `1`, retains an ordinary launch.
+Clustered buckets require SM120 or SM121 with at least 64 SMs, 512 threads per
+CTA, and 64 physical CTAs. Preparation checks that the compiled function can
+keep eight clusters resident. Ordinary profiles retain their active-CTA counts.
+The latency family also admits `full_phased` and `payload_rsag_phased`; the
+bandwidth family admits `payload_rsag_phased`. Each phased profile must select
+exactly eight active CTAs.
+
+Phased execution uses the first complete cluster to write one peer destination
+at a time. All its CTAs participate in each phase barrier; other clusters return
+without changing collective state. System-scope publication fences remain
+required for peer-visible writes. This uses existing kernel launch attributes
+in execution ABI 5 and does not require cooperative launch.
+
+`gb202_pcie_tp4_clustered.json` adds a phased RSAG candidate to the buckets
+containing 160 KiB and 320 KiB. It retains every ordinary candidate and leaves
+all other buckets unchanged. The compiled cluster geometry also applies when
+startup selects an ordinary profile; its performance therefore needs checking
+on the intended GPU topology. Use this file explicitly for qualification;
+`gb202_pcie_tp4.json` remains the ordinary catalog.
+
+Preparation requires b12x's `joint_cluster_size` plan interface. When developing
+Flare and FlashInfer in sibling source checkouts, install the FlashInfer checkout
+after setting up the preparation environment:
+
+```sh
+uv pip install --python .venv/bin/python --no-deps -e ../flashinfer
+```
+
 ## GB202 PCIe TP4 recommendations
 
 `gb202_pcie_tp4.json` contains 210 buckets from 16 bytes through 8 MiB.
