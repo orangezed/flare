@@ -78,9 +78,13 @@ def test_clustered_geometry_retains_ordinary_profiles_and_exact_contents():
     assert validate(ordinary) is ordinary
 
 
-def test_clustered_catalog_preserves_every_ordinary_candidate():
+@pytest.mark.parametrize("filename, changed_count", [
+    ("gb202_pcie_tp4_clustered.json", 36),
+    ("gb202_pcie_tp4_clustered_full.json", 37),
+])
+def test_clustered_catalog_preserves_every_ordinary_candidate(filename, changed_count):
     baseline = load(LADDER)
-    clustered = load(LADDER.with_name("gb202_pcie_tp4_clustered.json"))
+    clustered = load(LADDER.with_name(filename))
     assert {key: value for key, value in clustered.items() if key not in ("name", "buckets")} == {
         key: value for key, value in baseline.items() if key not in ("name", "buckets")}
     assert len(clustered["buckets"]) == len(baseline["buckets"])
@@ -91,9 +95,28 @@ def test_clustered_catalog_preserves_every_ordinary_candidate():
         changed.append(candidate["max_bytes"])
         without_cluster = deepcopy(candidate)
         assert without_cluster.pop("cluster_size") == 8
-        assert without_cluster["profiles"].pop("payload_rsag_phased") == [8]
+        for mode in ("payload_rsag_phased", "full_phased"):
+            if mode in without_cluster["profiles"]:
+                assert without_cluster["profiles"].pop(mode) == [8]
         assert without_cluster == ordinary
-    assert changed == [169984, 339952]
+        assert ordinary["threads"] == 512 and ordinary["blocks"] == 64
+    assert len(changed) == changed_count
+    assert {169984, 339952} <= set(changed)
+    assert (84992 in changed) == filename.endswith("_full.json")
+
+
+def test_full_phase_catalog_differs_only_at_the_80_kib_bucket():
+    packed = load(LADDER.with_name("gb202_pcie_tp4_clustered.json"))
+    full = load(LADDER.with_name("gb202_pcie_tp4_clustered_full.json"))
+    changed = [(before, after) for before, after in zip(packed["buckets"], full["buckets"], strict=True)
+               if before != after]
+    assert len(changed) == 1
+    before, after = changed[0]
+    assert before["max_bytes"] == 84992
+    expected = deepcopy(before)
+    expected.update(cluster_size=8)
+    expected["profiles"]["full_phased"] = [8]
+    assert after == expected
 
 
 @pytest.mark.parametrize("changes", [dict(cluster_size=True), dict(cluster_size=0),
@@ -175,12 +198,13 @@ def test_b12x_accepts_pinned_geometry_at_both_ends_of_every_bucket(effort):
 
 
 @pytest.mark.parametrize("effort", ["off", "default", "audit"])
-def test_clustered_catalog_profiles_are_admitted_by_b12x(effort):
+@pytest.mark.parametrize("filename", ["gb202_pcie_tp4_clustered.json", "gb202_pcie_tp4_clustered_full.json"])
+def test_clustered_catalog_profiles_are_admitted_by_b12x(effort, filename):
     from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery, TUNING
     from b12x.comm.pcie._joint_profile import selected_profile
     from b12x.preparation import FrozenMapping, autotune_effort
 
-    data = load(LADDER.with_name("gb202_pcie_tp4_clustered.json"))
+    data = load(LADDER.with_name(filename))
     lower = data["min_bytes"]
     with autotune_effort(effort):
         for row in data["buckets"]:

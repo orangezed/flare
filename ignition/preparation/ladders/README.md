@@ -71,11 +71,18 @@ without changing collective state. System-scope publication fences remain
 required for peer-visible writes. This uses existing kernel launch attributes
 in execution ABI 5 and does not require cooperative launch.
 
-`gb202_pcie_tp4_clustered.json` adds a phased RSAG candidate to the buckets
-containing 160 KiB and 320 KiB. It retains every ordinary candidate and leaves
-all other buckets unchanged. The compiled cluster geometry also applies when
-startup selects an ordinary profile; its performance therefore needs checking
-on the intended GPU topology. Use this file explicitly for qualification;
+`gb202_pcie_tp4_clustered.json` adds phased RSAG to 36 compatible buckets used
+by packed DeepSeek V4.1 TP4 verification graphs with eight, sixteen, or thirty-two
+requests, seven draft positions, and up to 128 target rows. It retains every
+ordinary candidate and every original kernel family, thread count, and physical
+grid. Buckets using 256 threads remain unchanged.
+`gb202_pcie_tp4_clustered_full.json` adds one further choice: phased Full in the
+bucket containing 80 KiB. This also covers the target reductions for one request
+verified at eight rows.
+
+The compiled cluster geometry also applies when startup selects an ordinary
+profile. Qualify these catalogs on the intended GPU topology and complete serving
+workload; component improvements do not establish a throughput gain.
 `gb202_pcie_tp4.json` remains the ordinary catalog.
 
 Preparation requires b12x's `joint_cluster_size` plan interface. When developing
