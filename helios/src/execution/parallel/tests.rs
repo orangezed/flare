@@ -636,3 +636,18 @@ fn startup_tuning_rank_agreement_includes_producers_bindings_and_buffer_schemas(
         assert_ne!(layout(&peer), expected, "mutation {mutation}");
     }
 }
+
+#[test]
+fn startup_kernel_predicate_wire_agreement_ignores_process_handles() {
+    let mut value = super::super::tests::tuning_manifest();
+    value.graphs[0].kernel_predicates.push(crate::execution::KernelNodeBinding {
+        node: 17, predicate: crate::execution::KernelEnableWhen { buffer: "choice".into(),
+            allowed_values: vec![vec![1; 8], vec![2; 8]], enabled_values: vec![vec![2; 8]] },
+    });
+    let expected = layout(&value);
+    let mut peer = value.clone();
+    peer.graphs[0].kernel_predicates[0].node = 99;
+    assert_eq!(layout(&peer), expected);
+    peer.graphs[0].kernel_predicates[0].predicate.enabled_values = vec![vec![1; 8]];
+    assert_ne!(layout(&peer), expected);
+}

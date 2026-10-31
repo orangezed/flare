@@ -706,6 +706,7 @@ mod tests {
         manifest.tuning_graphs.push(TuningGraphDescriptor {
             name: "startup_tune".into(), handle: 99999, outputs: vec!["tuning_winner".into()],
             status_buffer: "tuning_status".into(),
+            choices: Vec::new(),
         });
         let binding = TunedBinding { buffer: "tuning_winner".into(), tuning_graph: "startup_tune".into() };
         manifest.graphs[0].tuned_bindings.push(binding.clone());
@@ -738,6 +739,7 @@ mod tests {
         });
         manifest.tuning_graphs.push(crate::execution::TuningGraphDescriptor {
             name: "tune".into(), handle: 99999, outputs: vec![storage.buffer], status_buffer: "frame_index".into(),
+            choices: Vec::new(),
         });
         assert!(contract.validate(&manifest).unwrap_err().to_string().contains("overlaps request"));
     }

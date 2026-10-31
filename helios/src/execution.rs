@@ -1,6 +1,9 @@
 //! Fixed-capacity graph execution over two pinned transport frames.
 
 mod manifest;
+mod startup_graph;
+pub use startup_graph::{GraphExecutableBinding, GraphExecutableOwnership};
+pub(crate) use manifest::validate_tuning_choices;
 mod parallel;
 mod rank_stream;
 mod ranks;
@@ -29,7 +32,7 @@ mod tests;
 
 pub use manifest::{
     ABI_VERSION, BATCH_CAPACITIES, BufferDescriptor, CollectiveHealth, Dtype, ExecutionManifest,
-    GraphDescriptor, TuningGraphDescriptor, TunedBinding, GraphKind, PrefixAllocation, InputBinding, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS,
+    GraphDescriptor, KernelEnableWhen, KernelNodeBinding, TuningGraphDescriptor, TuningChoice, TunedBinding, GraphKind, PrefixAllocation, InputBinding, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS,
     MAX_OUTPUT_TOKENS, MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS, PROMPT_FIELDS, REQUEST_LANES,
     SamplingMode, VECTOR_RECORD_FIELDS,
 };

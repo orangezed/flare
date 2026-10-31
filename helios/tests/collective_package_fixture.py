@@ -126,7 +126,9 @@ def _rank(rank, directory, startup_tuning=False):
                     graph.instantiate()
                     captured.append(graph)
                     tuning_graphs["choose-profile"] = TuningGraph(graph=graph,
-                        outputs=("startup-selector", "startup-bias", "startup-count"), status_buffer="startup-status")
+                        outputs=("startup-selector", "startup-bias", "startup-count"), status_buffer="startup-status",
+                        choices=tuple((value.to_bytes(4, sys.byteorder), f"Prepared scalar {value}")
+                                      for value in (1, 3, 7)))
                     bindings = tuple(TunedBinding(buffer=name, tuning_graph="choose-profile")
                                      for name in ("startup-selector", "startup-bias"))
                     tuned_bindings = dict.fromkeys(("init", "decode"), bindings)

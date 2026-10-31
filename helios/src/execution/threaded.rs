@@ -569,6 +569,9 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
                 && a.packed_token_capacity == b.packed_token_capacity
                 && a.prefill_capacity == b.prefill_capacity
                 && a.tuned_bindings == b.tuned_bindings
+                && a.startup_graph.as_ref().map(|binding| binding.flags) == b.startup_graph.as_ref().map(|binding| binding.flags)
+                && a.kernel_predicates.iter().map(|binding| &binding.predicate)
+                    .eq(b.kernel_predicates.iter().map(|binding| &binding.predicate))
                 && a.input_bindings.len() == b.input_bindings.len()
                 && a.input_bindings
                     .iter()
@@ -623,6 +626,20 @@ mod tests {
             }
             assert!(!same_layout(&root, &peer), "mutation {mutation}");
         }
+    }
+
+    #[test]
+    fn startup_kernel_predicates_compare_values_but_not_node_handles() {
+        let mut root = super::super::tests::tuning_manifest();
+        root.graphs[0].kernel_predicates.push(crate::execution::KernelNodeBinding {
+            node: 17, predicate: crate::execution::KernelEnableWhen { buffer: "choice".into(),
+                allowed_values: vec![vec![1; 8], vec![2; 8]], enabled_values: vec![vec![2; 8]] },
+        });
+        let mut peer = root.clone();
+        peer.graphs[0].kernel_predicates[0].node = 99;
+        assert!(same_layout(&root, &peer));
+        peer.graphs[0].kernel_predicates[0].predicate.enabled_values = vec![vec![1; 8]];
+        assert!(!same_layout(&root, &peer));
     }
 
     #[test]

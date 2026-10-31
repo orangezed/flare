@@ -173,6 +173,8 @@ pub(super) enum Node {
         shared: u32,
         arguments: Vec<Blob>,
         attributes: Vec<Attribute>,
+        enable_when: Option<crate::execution::KernelEnableWhen>,
+        exact_grid: bool,
     },
     Memset {
         destination: Reference,

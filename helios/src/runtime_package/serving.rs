@@ -1,7 +1,7 @@
 use super::{NativeResources, format::invalid, protobuf::size};
 use crate::{
     Result,
-    execution::{BufferDescriptor, ExecutionManifest, GraphDescriptor, InputBinding, TunedBinding, TuningGraphDescriptor},
+    execution::{BufferDescriptor, ExecutionManifest, GraphDescriptor, InputBinding, TunedBinding, TuningGraphDescriptor, TuningChoice},
 };
 
 impl NativeResources {
@@ -47,6 +47,8 @@ impl NativeResources {
                     .position(|name| *name == g.name)
                     .ok_or_else(|| invalid("execution references an unknown graph"))?;
                 Ok(GraphDescriptor {
+                    kernel_predicates: self.kernel_predicates.get(&g.name).cloned().unwrap_or_default(),
+                    startup_graph: self.startup_graphs.get(&g.name).cloned(),
                     tuned_bindings: g.tuned_bindings.iter().map(|binding| TunedBinding {
                         buffer: binding.buffer.clone(), tuning_graph: binding.tuning_graph.clone(),
                     }).collect(),
@@ -62,7 +64,7 @@ impl NativeResources {
                     name: g.name.clone(),
                     kind: g.kind.as_str().try_into()?,
                     sampling_mode: g.sampling_mode.as_str().try_into()?,
-                    handle: self.executables[index] as usize,
+                    handle: self.graph_executable(index),
                     batch_capacity: size(g.batch_capacity)?,
                     token_capacity: size(g.token_capacity)?,
                     prefill_capacity: size(g.prefill_capacity)?,
@@ -85,8 +87,11 @@ impl NativeResources {
             let index = self.names.iter().position(|name| *name == graph.name)
                 .ok_or_else(|| invalid("tuning metadata references an unknown graph"))?;
             Ok(TuningGraphDescriptor {
-                name: graph.name.clone(), handle: self.executables[index] as usize,
+                name: graph.name.clone(), handle: self.graph_executable(index),
                 outputs: graph.outputs.clone(), status_buffer: graph.status_buffer.clone(),
+                choices: graph.choices.iter().map(|choice| TuningChoice {
+                    value: choice.value.clone(), label: choice.label.clone(),
+                }).collect(),
             })
         }).collect::<Result<Vec<_>>>()?;
         let manifest = ExecutionManifest {

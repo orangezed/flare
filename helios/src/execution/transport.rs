@@ -361,34 +361,16 @@ pub(super) fn collective_choices_overview(
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Write;
 
-    // Only this decoder assumes the b12x packed mode/CTA encoding.
-    fn decode(bytes: &[u8]) -> (String, Option<u32>) {
-        let Ok(word) = <[u8; 4]>::try_from(bytes) else {
-            return (format!("raw={bytes:02x?}"), None);
-        };
-        let value = u32::from_ne_bytes(word);
-        let name = match value >> 16 {
-            0 => "Full".into(), 1 => "Payload RSAG".into(), 2 => "Bulk Push".into(),
-            3 => "Bulk Pull".into(), 4 => "Pull".into(), id => format!("Mode {id}"),
-        };
-        (name, Some(value & 0xffff))
-    }
-    fn describe<'a>(values: impl Iterator<Item = &'a [u8]>) -> String {
-        let mut modes: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
-        for bytes in values {
-            let (name, ctas) = decode(bytes);
-            modes.entry(name).or_default().extend(ctas);
-        }
-        modes.into_iter().map(|(name, ctas)| {
-            if ctas.is_empty() { return name; }
-            let counts = ctas.into_iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
-            format!("{name} ({counts} CTAs)")
-        }).collect::<Vec<_>>().join(", ")
-    }
+    let labels: BTreeMap<_, _> = manifest.tuning_graphs.iter().flat_map(|graph|
+        graph.outputs.iter().map(move |output| (output.as_str(), graph.choices.as_slice()))).collect();
+    let describe_choice = |buffer: &str, bytes: &[u8]| {
+        labels.get(buffer).and_then(|choices| choices.iter().find(|choice| choice.value == bytes))
+            .map(|choice| choice.label.clone()).unwrap_or_else(|| format!("raw={bytes:02x?}"))
+    };
     let mut totals = BTreeMap::new();
     let mut outputs = BTreeMap::new();
     for group in choices {
-        let modes = group.iter().map(|(_, bytes)| decode(bytes).0).collect::<BTreeSet<_>>();
+        let modes = group.iter().map(|(buffer, bytes)| describe_choice(buffer, bytes)).collect::<BTreeSet<_>>();
         let name = if modes.len() == 1 { modes.into_iter().next().unwrap() } else { "Mixed/unknown".into() };
         *totals.entry(name).or_insert(0usize) += 1;
         outputs.extend(group.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
@@ -402,12 +384,17 @@ pub(super) fn collective_choices_overview(
     graphs.sort_by_key(|graph| (graph.kind as u8, graph.batch_capacity, graph.token_capacity,
         graph.packed_tokens(), graph.prefill_capacity, graph.draft_tokens, graph.name.as_str()));
     for graph in graphs {
-        let values = graph.tuned_bindings.iter().filter_map(|binding| outputs.get(binding.buffer.as_str()).copied());
-        let selected = describe(values);
-        writeln!(text, "  {} · {:?} b={} t={} rows={} drafts={} prefill={} · {}",
+        writeln!(text, "  {} · {:?} b={} t={} rows={} drafts={} prefill={}",
             graph.name, graph.kind, graph.batch_capacity, graph.token_capacity,
-            graph.packed_tokens(), graph.draft_tokens, graph.prefill_capacity,
-            if selected.is_empty() { "unavailable" } else { &selected }).unwrap();
+            graph.packed_tokens(), graph.draft_tokens, graph.prefill_capacity).unwrap();
+        for binding in &graph.tuned_bindings {
+            if let Some(bytes) = outputs.get(binding.buffer.as_str()) {
+                writeln!(text, "    {} · {} · bytes={bytes:02x?}", binding.buffer,
+                    describe_choice(&binding.buffer, bytes)).unwrap();
+            } else {
+                writeln!(text, "    {} · unavailable", binding.buffer).unwrap();
+            }
+        }
     }
     text
 }
@@ -456,6 +443,9 @@ impl GraphExecutor {
     /// Construct rank-local streams without launching any collective graphs.
     pub(super) unsafe fn new_unstarted(manifest: ExecutionManifest) -> Result<Self> {
         manifest.validate()?;
+        if manifest.graphs.iter().filter_map(|graph| graph.startup_graph.as_ref()).any(|binding| !binding.unprepared()) {
+            return Err("captured graph startup construction may run only once per resource owner".into());
+        }
         let upload_capacity = manifest
             .graphs
             .iter()
@@ -615,6 +605,25 @@ impl GraphExecutor {
     pub(super) fn finish_startup(&mut self) -> Result<()> {
         if self.startup_next != self.manifest.referenced_tuning_graphs().len() {
             return Err("startup tuning graphs have not completed".into());
+        }
+        let outputs: std::collections::HashMap<_, _> = self.diagnostic_choices.iter().flatten()
+            .map(|(name, value)| (name.as_str(), value.as_slice())).collect();
+        // Validate every value before changing any executable. The producer owns selection;
+        // native startup only applies the prepared exact-byte predicates.
+        let changes = self.manifest.graphs.iter().map(|graph| {
+            graph.kernel_predicates.iter().filter_map(|binding| {
+                let selected = outputs.get(binding.predicate.buffer.as_str())
+                    .ok_or_else(|| crate::Error::from("kernel predicate startup output is unavailable"))
+                    .and_then(|value| binding.predicate.enabled(value));
+                match selected { Ok(true) => None, Ok(false) => Some(Ok(binding.node)), Err(error) => Some(Err(error)) }
+            }).collect::<Result<Vec<_>>>()
+        }).collect::<Result<Vec<_>>>()?;
+        let resources = self.resources.as_ref().ok_or("executor is closed")?;
+        for (graph, disabled) in self.manifest.graphs.iter_mut().zip(changes) {
+            if let Some(binding) = &graph.startup_graph {
+                binding.prepare(&resources.model, &disabled)?;
+                graph.handle = binding.handle();
+            }
         }
         self.startup_ready = true;
         Ok(())
@@ -810,7 +819,7 @@ impl GraphExecutor {
                     engram.enqueue(fence.0, graph.packed_tokens(), uploads, &frame.started)?;
                 }
             }
-            resources.model.launch(graph.handle)?;
+            resources.model.launch(graph.executable())?;
             resources.model.record(&frame.produced)?;
             resources.copy.wait(&frame.produced)?;
             let address = self.manifest.buffer("completion_records")?.address
@@ -1072,12 +1081,17 @@ impl GraphExecutor {
             .map_or(Ok(()), |e| e.drain())
             .map_err(Error::drain);
         let drained = compute.is_ok() && copy.is_ok() && engram.is_ok();
-        let error = compute
+        let mut error = compute
             .err()
             .or(copy.err())
             .or(engram.err())
             .or(self.poison.take());
         if drained {
+            for graph in &self.manifest.graphs {
+                if let Some(binding) = &graph.startup_graph {
+                    if let Err(failure) = binding.release_borrowed(&resources.model) { error.get_or_insert(failure); }
+                }
+            }
             drop(resources);
         } else {
             std::mem::forget(resources);

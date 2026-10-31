@@ -146,11 +146,24 @@ fn collective_overview_uses_graph_geometry_and_individual_bindings() {
         ("target-choice".into(), 4u32.to_ne_bytes().to_vec()),
         ("mixed-choice".into(), ((1u32 << 16) | 64).to_ne_bytes().to_vec()),
     ]];
+    value.tuning_graphs.push(TuningGraphDescriptor {
+        name: "choose".into(), handle: 0, outputs: vec!["target-choice".into(), "mixed-choice".into()],
+        status_buffer: "status".into(), choices: vec![
+            TuningChoice { value: 4u32.to_ne_bytes().to_vec(), label: "Prepared full (4 CTAs)".into() },
+            TuningChoice { value: ((1u32 << 16) | 64).to_ne_bytes().to_vec(), label: "Prepared RSAG (64 CTAs)".into() },
+        ],
+    });
     let text = super::transport::collective_choices_overview(&value, &choices);
     assert!(text.contains("Mixed/unknown: 1 group\n"));
-    assert!(text.contains("arbitrary-decode-name · Decode b=4 t=1 rows=4 drafts=0 prefill=0 · Full (4 CTAs)\n"));
-    assert!(text.contains("arbitrary-target-name · Speculative b=4 t=6 rows=16 drafts=5 prefill=0 · Full (4 CTAs)\n"));
-    assert!(text.contains("arbitrary-mixed-name · Mixed b=4 t=1 rows=131 drafts=0 prefill=128 · Payload RSAG (64 CTAs)\n"));
+    assert!(text.contains("arbitrary-decode-name · Decode b=4 t=1 rows=4 drafts=0 prefill=0\n"));
+    assert!(text.contains("arbitrary-target-name · Speculative b=4 t=6 rows=16 drafts=5 prefill=0\n"));
+    assert!(text.contains("arbitrary-mixed-name · Mixed b=4 t=1 rows=131 drafts=0 prefill=128\n"));
+    assert!(text.contains("target-choice · Prepared full (4 CTAs) · bytes=[04, 00, 00, 00]"));
+    assert!(text.contains("mixed-choice · Prepared RSAG (64 CTAs)"));
+    value.tuning_graphs[0].choices.clear();
+    let text = super::transport::collective_choices_overview(&value, &choices);
+    assert!(text.contains("raw=[04, 00, 00, 00]"));
+    assert!(!text.contains("Prepared"));
 }
 
 pub(super) fn manifest() -> ExecutionManifest {
@@ -188,7 +201,7 @@ pub(super) fn manifest() -> ExecutionManifest {
             strides: vec![1],
         },
     ];
-    let graph = GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
+    let graph = GraphDescriptor { startup_graph: None, kernel_predicates: vec![], tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
         name: "decode4".into(),
         kind: GraphKind::Decode,
         sampling_mode: SamplingMode::General,
@@ -233,11 +246,13 @@ pub(super) fn manifest() -> ExecutionManifest {
 #[test]
 fn execution_abi_and_unsupported_sampling_modes_reject_before_cuda() {
     let mut value = manifest();
-    value.abi_version = 1;
-    assert!(matches!(
-        value.validate().unwrap_err(),
-        Error::Execution(ExecutionError::Manifest(_))
-    ));
+    for unsupported in [0, 1, 2, 3, 4, 5, ABI_VERSION + 1] {
+        value.abi_version = unsupported;
+        assert!(matches!(
+            value.validate().unwrap_err(),
+            Error::Execution(ExecutionError::Manifest(_))
+        ));
+    }
     value.abi_version = ABI_VERSION;
     value.validate().unwrap();
     assert!(SamplingMode::try_from("greedy").is_err());
@@ -1220,7 +1235,7 @@ pub(super) fn tuning_manifest() -> ExecutionManifest {
             shape: vec![1], strides: vec![1] });
     }
     value.tuning_graphs.push(TuningGraphDescriptor { name: "select".into(), handle: 0x90000,
-        outputs: vec!["choice".into()], status_buffer: "tuning_status".into() });
+        outputs: vec!["choice".into()], status_buffer: "tuning_status".into(), choices: Vec::new() });
     value.graphs[0].tuned_bindings.push(TunedBinding { buffer: "choice".into(), tuning_graph: "select".into() });
     value
 }
@@ -1251,4 +1266,64 @@ fn tuning_order_is_manifest_order_and_deduplicates_consumers() {
     assert_eq!(value.referenced_tuning_graphs(), vec![0]);
     value.graphs.iter_mut().for_each(|graph| graph.tuned_bindings.clear());
     assert!(value.referenced_tuning_graphs().is_empty());
+}
+
+#[test]
+fn tuning_diagnostic_labels_validate_exact_bytes_and_bounds() {
+    let mut valid = tuning_manifest();
+    valid.tuning_graphs[0].choices = vec![TuningChoice { value: vec![7; 8], label: "Prepared profile".into() }];
+    valid.validate().unwrap();
+    for mutation in 0..7 {
+        let mut value = valid.clone();
+        let choices = &mut value.tuning_graphs[0].choices;
+        match mutation {
+            0 => choices[0].value.pop().map(|_| ()).unwrap(),
+            1 => choices.push(choices[0].clone()),
+            2 => choices[0].label.clear(),
+            3 => choices[0].label = "x".repeat(257),
+            4 => choices[0].label.push('\n'),
+            5 => choices[0].value = vec![0; 65],
+            _ => *choices = (0..513u64).map(|v| TuningChoice { value: v.to_ne_bytes().to_vec(), label: "choice".into() }).collect(),
+        }
+        assert!(value.validate().is_err(), "mutation {mutation}");
+    }
+}
+
+#[test]
+fn kernel_predicates_select_exact_bytes_independently_of_diagnostic_labels() {
+    let mut manifest = tuning_manifest();
+    let predicate = KernelEnableWhen {
+        buffer: "choice".into(),
+        allowed_values: vec![1u64.to_ne_bytes().to_vec(), 2u64.to_ne_bytes().to_vec()],
+        enabled_values: vec![2u64.to_ne_bytes().to_vec()],
+    };
+    manifest.graphs[0].kernel_predicates.push(KernelNodeBinding { node: 0x91000, predicate: predicate.clone() });
+    manifest.graphs[0].startup_graph = Some(GraphExecutableBinding::new(0x92000, manifest.graphs[0].handle,
+        0, GraphExecutableOwnership::Borrowed));
+    manifest.validate().unwrap();
+    assert!(!predicate.enabled(&1u64.to_ne_bytes()).unwrap());
+    assert!(predicate.enabled(&2u64.to_ne_bytes()).unwrap());
+    assert!(predicate.enabled(&3u64.to_ne_bytes()).is_err());
+    // A producer's optional labels cannot admit an unsupported executable choice.
+    manifest.tuning_graphs[0].choices = vec![TuningChoice {
+        value: 3u64.to_ne_bytes().to_vec(), label: "Unrelated diagnostic value".into(),
+    }];
+    manifest.validate().unwrap();
+    assert!(predicate.enabled(&3u64.to_ne_bytes()).is_err());
+    for mutation in 0..9 {
+        let mut value = manifest.clone();
+        let binding = &mut value.graphs[0].kernel_predicates[0];
+        match mutation {
+            0 => binding.node = 0,
+            1 => binding.predicate.buffer = "tokens".into(),
+            2 => binding.predicate.allowed_values.clear(),
+            3 => binding.predicate.allowed_values[0].pop().map(|_| ()).unwrap(),
+            4 => binding.predicate.enabled_values.clear(),
+            5 => binding.predicate.enabled_values[0] = 9u64.to_ne_bytes().to_vec(),
+            6 => binding.predicate.allowed_values.push(binding.predicate.allowed_values[0].clone()),
+            7 => value.graphs[0].tuned_bindings.clear(),
+            _ => { let duplicate = binding.clone(); value.graphs[0].kernel_predicates.push(duplicate); }
+        }
+        assert!(value.validate().is_err(), "mutation {mutation}");
+    }
 }

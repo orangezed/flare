@@ -110,12 +110,22 @@ class TuningGraph:
     graph: Any
     outputs: tuple[str, ...]
     status_buffer: str
+    choices: tuple[tuple[bytes, str], ...] = ()
 
     def __post_init__(self):
         if not self.outputs or len(set(self.outputs)) != len(self.outputs):
             raise ValueError("tuning graphs require distinct persistent outputs")
         if self.status_buffer in self.outputs:
             raise ValueError("tuning status must be separate from selected outputs")
+        if len(self.choices) > 512:
+            raise ValueError("tuning diagnostics permit at most 512 choices")
+        values = set()
+        for value, label in self.choices:
+            if not isinstance(value, bytes) or not 1 <= len(value) <= 64 or value in values:
+                raise ValueError("tuning diagnostic choices require unique values of 1–64 bytes")
+            if not isinstance(label, str) or not label.strip() or len(label.encode()) > 256 or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in label):
+                raise ValueError("tuning diagnostic labels require 1–256 UTF-8 bytes without control characters")
+            values.add(value)
 
 
 class PreparedExecution(PreparedGraphBundle):
@@ -168,6 +178,10 @@ class PreparedExecution(PreparedGraphBundle):
                 raise ValueError("tuning graph status must be int32[1]")
             if uploads.intersection((*tuner.outputs, tuner.status_buffer)):
                 raise ValueError("tuning outputs and status cannot receive host uploads")
+            for output in tuner.outputs:
+                tensor = self.buffers[output]
+                if any(len(value) != tensor.numel() * tensor.element_size() for value, _ in tuner.choices):
+                    raise ValueError("tuning diagnostic choices must match every output's byte extent")
         for values in bindings.values():
             if any(not isinstance(value, TunedBinding) for value in values):
                 raise TypeError("serving tuning dependencies must be TunedBinding objects")
@@ -232,12 +246,14 @@ class PreparedExecution(PreparedGraphBundle):
             if signature.draft_tokens is not None:
                 graphs[-1].update(draft_tokens=signature.draft_tokens,
                                   verify_tokens=signature.token_capacity, draft_source=1)
-        abi_version = 5
+        abi_version = 6
         return {"abi_version": abi_version, "context": context, "device": self.device,
                 "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,
                 "buffers": descriptors, "graphs": graphs,
                 "tuning_graphs": [dict(name=name, handle=graph_handles[name], outputs=list(value.outputs),
-                                       status_buffer=value.status_buffer) for name, value in self.tuning_graphs.items()]}
+                                       status_buffer=value.status_buffer,
+                                       choices=[dict(value=list(raw), label=label) for raw, label in value.choices])
+                                  for name, value in self.tuning_graphs.items()]}
 
     def start_executor(self, *, peers=None):
         """Synchronize preparation and consume the bundle into the native executor."""

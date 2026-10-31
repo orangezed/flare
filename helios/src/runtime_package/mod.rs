@@ -84,6 +84,8 @@ pub struct NativeResources {
     modules: Vec<Handle>,
     functions: HashMap<usize, Handle>,
     templates: Vec<Handle>,
+    kernel_predicates: HashMap<String, Vec<crate::execution::KernelNodeBinding>>,
+    startup_graphs: HashMap<String, Arc<crate::execution::GraphExecutableBinding>>,
     executables: Vec<Handle>,
     names: Vec<String>,
     reservations: Vec<(u64, usize)>,
@@ -341,6 +343,8 @@ impl NativeResources {
                 modules: vec![],
                 functions: HashMap::new(),
                 templates: vec![],
+                kernel_predicates: HashMap::new(),
+                startup_graphs: HashMap::new(),
                 executables: vec![],
                 names: vec![],
                 reservations: vec![],
@@ -776,6 +780,7 @@ impl NativeResources {
                 driver.check("cuGraphCreate", (driver.graph_create)(&mut handle, 0))?;
                 self.templates.push(handle);
                 let mut nodes = Vec::with_capacity(graph.node_count);
+                let mut predicates = Vec::new();
                 let mut records = files.records(package, &graph.resource)?;
                 for _ in 0..graph.node_count {
                     let node = protobuf::node(records.read()?)?;
@@ -797,6 +802,8 @@ impl NativeResources {
                             shared,
                             arguments,
                             attributes,
+                            enable_when,
+                            exact_grid,
                         } => {
                             let function_handle = self.functions[function];
                             let allowance =
@@ -862,6 +869,9 @@ impl NativeResources {
                                     value.as_ptr().cast(),
                                 );
                                 if attribute.id == 2 && value[0] as u32 != 0 && status == 720 {
+                                    if *exact_grid || enable_when.is_some() {
+                                        return Err(invalid("cooperative kernel requires its exact prepared grid, which exceeds resident capacity"));
+                                    }
                                     self.clamp_cooperative_launch(&mut params)?;
                                     driver.check(
                                         "cuGraphKernelNodeSetParams_v2",
@@ -874,6 +884,18 @@ impl NativeResources {
                                     );
                                 }
                                 driver.check("cuGraphKernelNodeSetAttribute", status)?;
+                            }
+                            if let Some(predicate) = enable_when {
+                                let execution = package.execution.as_ref().ok_or_else(|| invalid("kernel predicates require an execution contract"))?;
+                                let descriptor = execution.graphs.iter().find(|entry| entry.name == graph.name)
+                                    .ok_or_else(|| invalid("kernel predicates belong to serving graphs"))?;
+                                if !descriptor.tuned_bindings.iter().any(|binding| binding.buffer == predicate.buffer) {
+                                    return Err(invalid("kernel predicate lacks its graph's tuned binding"));
+                                }
+                                let buffer = execution.buffers.iter().find(|entry| entry.name == predicate.buffer)
+                                    .ok_or_else(|| invalid("kernel predicate names an unknown buffer"))?;
+                                predicate.validate(usize::try_from(buffer.nbytes).map_err(|_| invalid("kernel predicate buffer is too large"))?)?;
+                                predicates.push(crate::execution::KernelNodeBinding { node: result as usize, predicate: predicate.clone() });
                             }
                         }
                         Node::Memset {
@@ -1013,8 +1035,15 @@ impl NativeResources {
                     (driver.graph_upload)(executable, null_mut()),
                 )?;
                 driver.check("cuCtxSynchronize", (driver.context_sync)())?;
-                driver.check("cuGraphDestroy", (driver.graph_destroy)(handle))?;
-                self.templates.pop();
+                if predicates.is_empty() {
+                    driver.check("cuGraphDestroy", (driver.graph_destroy)(handle))?;
+                    self.templates.pop();
+                } else {
+                    predicates.sort_by(|a, b| a.predicate.cmp(&b.predicate));
+                    self.kernel_predicates.insert(graph.name.clone(), predicates);
+                    self.startup_graphs.insert(graph.name.clone(), crate::execution::GraphExecutableBinding::new(
+                        handle as usize, executable as usize, graph.flags, crate::execution::GraphExecutableOwnership::Native));
+                }
                 phase.advance(1);
             }
             self.functions.clear();
@@ -1066,11 +1095,19 @@ impl NativeResources {
         (self.context as usize, self.device)
     }
 
+    fn graph_executable(&self, index: usize) -> usize {
+        self.startup_graphs.get(&self.names[index]).map_or(self.executables[index] as usize, |binding| binding.handle())
+    }
+
     pub fn graph_bundle(&self) -> GraphBundle {
         GraphBundle {
             context: self.context as usize,
             device: self.device,
-            graph_execs: self.executables.iter().map(|v| *v as usize).collect(),
+            graph_execs: self.names.iter().enumerate().map(|(index, name)| {
+                // A raw replay bundle cannot expose the unselected superset.
+                self.startup_graphs.get(name).filter(|binding| !binding.ready())
+                    .map_or_else(|| self.graph_executable(index), |_| 0)
+            }).collect(),
             buffers: self
                 .allocations
                 .values()
@@ -1144,8 +1181,13 @@ impl Drop for NativeResources {
                 std::mem::forget(self.driver.clone());
                 return;
             }
-            for executable in self.executables.iter().rev() {
-                (self.driver.executable_destroy)(*executable);
+            for (index, name) in self.names.iter().enumerate().rev() {
+                let executable = self.startup_graphs.get(name).map_or(self.executables[index] as usize, |binding| binding.take_handle());
+                if executable != 0 { (self.driver.executable_destroy)(executable as Handle); }
+                if let Some(binding) = self.startup_graphs.get(name) {
+                    let template = binding.take_template();
+                    if template != 0 { (self.driver.graph_destroy)(template as Handle); }
+                }
             }
             for graph in self.templates.iter().rev() {
                 (self.driver.graph_destroy)(*graph);

@@ -454,6 +454,93 @@ fn function_layout(cuda: &Cuda, function: usize) -> ExportResult<Vec<(usize, usi
     Err(invalid("kernel exceeds supported parameter count"))
 }
 
+pub(crate) fn resolve_kernel_predicates(
+    context: usize,
+    graphs: &[super::GraphHandle],
+    registrations: &[super::KernelPredicateRegistration],
+) -> ExportResult<BTreeMap<String, Vec<(usize, super::KernelPredicateRegistration)>>> {
+    if registrations.is_empty() { return Ok(BTreeMap::new()); }
+    let cuda = Cuda::new()?;
+    let _context = ContextGuard::enter(&cuda, context)?;
+    let mut result = BTreeMap::new();
+    let mut matched = vec![false; registrations.len()];
+    for registration in registrations {
+        registration.predicate.validate(registration.predicate.allowed_values.first().map_or(0, Vec::len))?;
+        if registration.function == 0 || registration.selector_address == 0
+            || !graphs.iter().any(|graph| graph.name == registration.graph) {
+            return Err(invalid("kernel predicate requires a captured graph, function, and selector address"));
+        }
+    }
+    for graph in graphs {
+        let mut bindings = Vec::new();
+        for node in nodes(&cuda, graph.graph)? {
+            if node_kind(&cuda, node)? != 0 { continue; }
+            let (params, function) = kernel_params(&cuda, node)?;
+            let candidates: Vec<_> = registrations.iter().enumerate().filter(|(_, entry)|
+                entry.graph == graph.name && entry.function == function).collect();
+            if candidates.is_empty() { continue; }
+            let arguments = unsafe { argument_data(&params, &function_layout(&cuda, function)?)? };
+            let mut selected = None;
+            for (index, registration) in candidates {
+                if !predicate_argument_matches(registration, &arguments)? { continue; }
+                if selected.is_some() { return Err(invalid("captured kernel matches ambiguous startup predicates")); }
+                selected = Some(registration.clone());
+                matched[index] = true;
+            }
+            if let Some(registration) = selected { bindings.push((node as usize, registration)); }
+        }
+        bindings.sort_by(|a, b| a.1.predicate.cmp(&b.1.predicate));
+        if !bindings.is_empty() { result.insert(graph.name.clone(), bindings); }
+    }
+    if matched.iter().any(|found| !found) {
+        return Err(invalid("startup kernel predicate did not match any captured function and selector argument"));
+    }
+    Ok(result)
+}
+
+fn predicate_argument_matches(
+    registration: &super::KernelPredicateRegistration,
+    arguments: &[Vec<u8>],
+) -> ExportResult<bool> {
+    let end = registration.argument_offset.checked_add(8)
+        .ok_or_else(|| invalid("kernel selector argument offset overflow"))?;
+    let bytes = arguments.get(registration.argument_index).and_then(|argument|
+        argument.get(registration.argument_offset..end))
+        .ok_or_else(|| invalid("kernel predicate selector is outside its declared argument"))?;
+    Ok(u64::from_ne_bytes(bytes.try_into().unwrap()) == registration.selector_address)
+}
+
+fn bind_kernel_selector(
+    arguments: &mut [wire::Blob],
+    metadata: &[Argument],
+    registration: &super::KernelPredicateRegistration,
+    target: wire::Reference,
+) -> ExportResult<()> {
+    let start = registration.argument_offset;
+    let end = start.checked_add(8).ok_or_else(|| invalid("kernel selector offset overflow"))?;
+    let argument = arguments.get_mut(registration.argument_index)
+        .ok_or_else(|| invalid("kernel selector argument is absent"))?;
+    if argument.data.get(start..end) != Some(registration.selector_address.to_ne_bytes().as_slice()) {
+        return Err(invalid("kernel selector bytes differ from its declared pointer"));
+    }
+    if metadata[registration.argument_index].numeric.iter().any(|&(left, right)| start < right && left < end) {
+        return Err(invalid("kernel selector pointer overlaps a numeric argument declaration"));
+    }
+    let expected = wire::Relocation { offset: start as u64, target: Some(target), kind: 0 };
+    if argument.relocations.contains(&expected) { return Ok(()); }
+    for relocation in &argument.relocations {
+        let width = if relocation.kind == 0 { 8 } else { 128 };
+        if (start as u64) < relocation.offset.saturating_add(width) && relocation.offset < end as u64 {
+            return Err(invalid("kernel selector pointer conflicts with an existing relocation"));
+        }
+    }
+    // Automatic VMM export retains raw fixed addresses. The launch registration
+    // supplies explicit pointer semantics, including its exact argument location.
+    argument.relocations.push(expected);
+    argument.relocations.sort_by_key(|relocation| relocation.offset);
+    Ok(())
+}
+
 fn kernel_node(
     cuda: &Cuda,
     node: Handle,
@@ -461,13 +548,15 @@ fn kernel_node(
     kernels: &[Kernel],
     layouts: &[Vec<(usize, usize)>],
     indices: &HashMap<usize, usize>,
+    predicate: Option<&super::KernelPredicateRegistration>,
+    exact_functions: &HashSet<usize>,
 ) -> ExportResult<wire::Kernel> {
     let (params, function) = kernel_params(cuda, node)?;
     let index = *indices
         .get(&function)
         .ok_or_else(|| invalid("no explicit argument bindings for kernel"))?;
     let kernel = &kernels[index];
-    let arguments = unsafe { argument_data(&params, &layouts[index])? }
+    let mut arguments = unsafe { argument_data(&params, &layouts[index])? }
         .into_iter()
         .zip(&kernel.arguments)
         .map(|(data, argument)| {
@@ -482,6 +571,14 @@ fn kernel_node(
             })
         })
         .collect::<ExportResult<Vec<_>>>()?;
+    let enable_when = if let Some(registration) = predicate {
+        let target = reference(allocations, registration.selector_address,
+            registration.predicate.allowed_values[0].len() as u64)?;
+        bind_kernel_selector(&mut arguments, &kernel.arguments, registration, target)?;
+        Some(wire::KernelEnableWhen { buffer: registration.predicate.buffer.clone(),
+            allowed_values: registration.predicate.allowed_values.clone(),
+            enabled_values: registration.predicate.enabled_values.clone() })
+    } else { None };
     let mut attributes = Vec::new();
     for id in [1, 2, 4, 5, 8, 9, 10, 11, 13, 14] {
         let mut value = [0u64; 8];
@@ -528,12 +625,22 @@ fn kernel_node(
     }
     Ok(wire::Kernel {
         function: index as u64,
+        enable_when,
+        exact_grid: exact_functions.contains(&function),
         grid: params.grid.to_vec(),
         block: params.block.to_vec(),
         shared: params.shared,
         arguments,
         attributes,
     })
+}
+
+pub(crate) fn graph_flags(context: usize, executable: usize) -> ExportResult<u64> {
+    let cuda = Cuda::new()?;
+    let _context = ContextGuard::enter(&cuda, context)?;
+    let mut flags = 0;
+    cu!(&cuda, "cuGraphExecGetFlags", (Handle, *mut u64), executable as Handle, &mut flags)?;
+    Ok(flags)
 }
 
 fn capture_graph(
@@ -546,6 +653,8 @@ fn capture_graph(
     layouts: &[Vec<(usize, usize)>],
     indices: &HashMap<usize, usize>,
     events: &BTreeMap<String, usize>,
+    predicates: &[(usize, super::KernelPredicateRegistration)],
+    exact_functions: &HashSet<usize>,
 ) -> ExportResult<(Vec<wire::Node>, Vec<wire::Edge>, u64)> {
     let mut ordered = nodes(cuda, graph.graph)?
         .into_iter()
@@ -586,6 +695,8 @@ fn capture_graph(
                 kernels,
                 layouts,
                 indices,
+                predicates.iter().find(|(handle, _)| *handle == node as usize).map(|(_, entry)| entry),
+                exact_functions,
             )?),
             1 => {
                 let mut params = CopyParams::default();
@@ -2843,6 +2954,8 @@ pub(crate) fn capture_rank(
         };
     let mut other_resources = Vec::new();
     let graph_phase = progress.phase("Serialize CUDA graphs", Some(request.graphs.len() as u64));
+    let predicates = resolve_kernel_predicates(request.context, &request.graphs, &request.kernel_predicates)?;
+    let exact_functions = request.kernel_predicates.iter().map(|entry| entry.function).collect();
     let mut graph_bytes = 0u64;
     for (index, graph) in request.graphs.iter().enumerate() {
         let (nodes, edges, flags) = capture_graph(
@@ -2855,6 +2968,8 @@ pub(crate) fn capture_rank(
             &layouts,
             &indices,
             &request.events,
+            predicates.get(&graph.name).map_or(&[], Vec::as_slice),
+            &exact_functions,
         )?;
         reach.graph(&nodes, &kernels)?;
         let file = format!("graph-{index}.bin");
@@ -3228,6 +3343,51 @@ mod tests {
             snapshot_spans: None,
             sizing: None,
         }
+    }
+
+    #[test]
+    fn kernel_selector_registration_adds_an_exact_relocation_to_fixed_address_arguments() {
+        let registration = super::super::KernelPredicateRegistration {
+            graph: "decode".into(), function: 17, argument_index: 0, argument_offset: 8,
+            selector_address: 0x12340000,
+            predicate: helios_core::execution::KernelEnableWhen { buffer: "choice".into(),
+                allowed_values: vec![vec![0; 4]], enabled_values: vec![vec![0; 4]] },
+        };
+        let target = wire::Reference { allocation: "selector_storage".into(), offset: 128 };
+        let mut bytes = vec![0; 16];
+        bytes[8..].copy_from_slice(&registration.selector_address.to_ne_bytes());
+        let metadata = vec![Argument { size: 16, relocations: vec![], numeric: vec![] }];
+        let mut arguments = vec![wire::Blob { data: bytes, relocations: vec![] }];
+        bind_kernel_selector(&mut arguments, &metadata, &registration, target.clone()).unwrap();
+        assert_eq!(arguments[0].relocations, vec![wire::Relocation { offset: 8, target: Some(target.clone()), kind: 0 }]);
+        bind_kernel_selector(&mut arguments, &metadata, &registration, target.clone()).unwrap();
+        assert_eq!(arguments[0].relocations.len(), 1);
+        let mut wrong = arguments.clone();
+        wrong[0].relocations[0].target.as_mut().unwrap().offset += 8;
+        assert!(bind_kernel_selector(&mut wrong, &metadata, &registration, target.clone()).is_err());
+        let mut numeric = metadata.clone();
+        numeric[0].numeric.push((0, 16));
+        assert!(bind_kernel_selector(&mut arguments, &numeric, &registration, target.clone()).is_err());
+        arguments[0].data[8] ^= 1;
+        assert!(bind_kernel_selector(&mut arguments, &metadata, &registration, target).is_err());
+    }
+
+    #[test]
+    fn kernel_predicate_matches_only_its_explicit_pointer_argument() {
+        let registration = super::super::KernelPredicateRegistration {
+            graph: "decode".into(), function: 17, argument_index: 1, argument_offset: 8,
+            selector_address: 0x12340000,
+            predicate: helios_core::execution::KernelEnableWhen {
+                buffer: "choice".into(), allowed_values: vec![vec![0; 4], vec![1; 4]],
+                enabled_values: vec![vec![1; 4]],
+            },
+        };
+        let mut arguments = vec![0x12340000u64.to_ne_bytes().to_vec(), vec![0; 16]];
+        assert!(!predicate_argument_matches(&registration, &arguments).unwrap());
+        arguments[1][8..16].copy_from_slice(&0x12340000u64.to_ne_bytes());
+        assert!(predicate_argument_matches(&registration, &arguments).unwrap());
+        arguments[1].pop();
+        assert!(predicate_argument_matches(&registration, &arguments).is_err());
     }
 
     #[test]

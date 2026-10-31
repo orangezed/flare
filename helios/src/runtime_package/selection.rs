@@ -300,6 +300,13 @@ impl LoadOptions {
                         return Err(invalid("startup tuning storage requires one registered producer"));
                     }
                 }
+                let sizes = tuner.outputs.iter().map(|name| {
+                    let buffer = execution.buffers.iter().find(|buffer| buffer.name == *name).unwrap();
+                    usize::try_from(buffer.nbytes).map_err(|_| invalid("tuning output size exceeds address space"))
+                }).collect::<Result<Vec<_>>>()?;
+                crate::execution::validate_tuning_choices(
+                    tuner.choices.iter().map(|choice| (choice.value.as_slice(), choice.label.as_str())),
+                    sizes.into_iter())?;
             }
             let mut referenced = HashSet::new();
             for graph in &execution.graphs {
@@ -504,8 +511,8 @@ mod tests {
             });
         }
         execution.tuning_graphs = vec![
-            wire::TuningGraph { name: "tune".into(), outputs: vec!["winner".into()], status_buffer: "status".into() },
-            wire::TuningGraph { name: "unused_tune".into(), outputs: vec!["unused_winner".into()], status_buffer: "unused_status".into() },
+            wire::TuningGraph { name: "tune".into(), outputs: vec!["winner".into()], status_buffer: "status".into(), choices: Vec::new() },
+            wire::TuningGraph { name: "unused_tune".into(), outputs: vec!["unused_winner".into()], status_buffer: "unused_status".into(), choices: Vec::new() },
         ];
         for graph in &mut execution.graphs {
             if graph.name == "decode1-no-mtp" {
@@ -517,7 +524,10 @@ mod tests {
 
     #[test]
     fn selected_graphs_retain_startup_producers_and_their_kernels() {
-        let package = tuning_package();
+        let mut package = tuning_package();
+        package.execution.as_mut().unwrap().tuning_graphs[0].choices = vec![wire::TuningChoice {
+            value: vec![0x51, 0x00, 0x02, 0x80], label: "Prepared profile".into(),
+        }];
         let function = package.graphs.iter().find(|graph| graph.name == "tune").unwrap().functions[0];
         let mut packages = [package];
         LoadOptions { max_concurrency: Some(1), mtp_draft_tokens: Some(0), ..Default::default() }
@@ -527,18 +537,22 @@ mod tests {
         assert!(!package.graphs.iter().any(|graph| graph.name == "unused_tune"));
         assert!(package.functions.iter().any(|item| item.id == function));
         assert_eq!(package.execution.as_ref().unwrap().tuning_graphs.len(), 1);
+        assert_eq!(package.execution.as_ref().unwrap().tuning_graphs[0].choices[0].label, "Prepared profile");
     }
 
     #[test]
     fn startup_producer_selection_rejects_dangling_and_rank_mismatched_schemas() {
-        for invalid in 0..4 {
+        for invalid in 0..5 {
             let mut packages = [tuning_package(), tuning_package()];
             let execution = packages[1].execution.as_mut().unwrap();
             match invalid {
                 0 => execution.tuning_graphs[0].outputs[0] = "missing".into(),
                 1 => execution.buffers.iter_mut().find(|buffer| buffer.name == "winner").unwrap().dtype = "float32".into(),
                 2 => execution.tuning_graphs[0].name = "decode1-no-mtp".into(),
-                _ => execution.tuning_graphs[1].outputs[0] = "winner".into(),
+                3 => execution.tuning_graphs[1].outputs[0] = "winner".into(),
+                _ => execution.tuning_graphs[0].choices = vec![wire::TuningChoice {
+                    value: vec![0; 3], label: "Wrong byte extent".into(),
+                }],
             }
             assert!(LoadOptions { max_concurrency: Some(1), mtp_draft_tokens: Some(0), ..Default::default() }
                 .select(&mut packages, &mut config()).is_err());
@@ -1512,7 +1526,7 @@ mod tests {
     #[test]
     fn malformed_rounds_and_obsolete_abis_reject_before_loading() {
         for rank in [0usize, 1] {
-            for abi in [0, 1, 2, 3, 4, 6] {
+            for abi in [0, 1, 2, 3, 4, 5, 7] {
                 let mut ranks = [round_package(8, 48, false), round_package(8, 48, false)];
                 ranks[rank].execution.as_mut().unwrap().abi_version = abi;
                 assert!(LoadOptions::default().select(&mut ranks, &mut round_config(48)).unwrap_err().to_string().contains("execution ABI"));

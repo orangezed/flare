@@ -105,6 +105,10 @@ pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let fail_startup = std::env::args().any(|argument| argument == "--startup-failure");
     let workers = if expected.startup_tuning {
         for manifest in &manifests {
+            let producer = manifest.tuning_graphs.iter().find(|graph| graph.name == "choose-profile").unwrap();
+            assert_eq!(producer.choices.iter().map(|choice| (choice.value.clone(), choice.label.clone()))
+                .collect::<Vec<_>>(), [1i32, 3, 7].into_iter().map(|value|
+                    (value.to_ne_bytes().to_vec(), format!("Prepared scalar {value}"))).collect::<Vec<_>>());
             assert_eq!(scalar(&driver, manifest, "startup-count")?, 0);
             assert_eq!(scalar(&driver, manifest, "startup-selector")?, 0);
             assert_eq!(scalar(&driver, manifest, "startup-bias")?, 0);

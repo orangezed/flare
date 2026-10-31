@@ -1,6 +1,6 @@
 # Prepared execution manifest
 
-Execution ABI `5` describes graph execution and transport over one existing CUDA
+Execution ABI `6` describes graph execution and transport over one existing CUDA
 context. A resource owner retains the context, graphs and allocations through
 shutdown. `NativeResources` reconstructs these resources from a runtime package written
 by Ignition before native serving starts. The model recipe defines the numerical behavior of each executable.
@@ -9,7 +9,7 @@ The Python representation is a dictionary with these fields:
 
 ```python
 {
-    "abi_version": 5,
+    "abi_version": 6,
     "context": int,                 # Existing CUcontext handle.
     "device": int,                  # Visible device ordinal.
     "max_active": int,              # 1 through 64.
@@ -79,6 +79,45 @@ outputs as opaque values; it neither interprets kernel protocols nor searches
 configurations. Outputs remain fixed during serving. Package graph selection
 retains referenced producers and their executable resources and removes unused
 producers. Tuning storage remains owned through execution drain.
+
+A producer may attach diagnostic `choices`: exact output bytes paired with
+human-readable labels prepared by its implementation. Helios matches the full
+readback to a label without decoding the output's kernel-specific format.
+Missing labels or unknown values print raw bytes and do not change execution.
+The optional catalog permits at most 512 distinct values, each 1–64 bytes and
+equal to every producer output's byte extent. Labels contain 1–256 UTF-8 bytes
+without control characters. This metadata uses the existing bounded diagnostic
+readback and has no selection or replay semantics.
+
+A serving kernel may additionally declare an exact-byte startup predicate. Its
+`allowed_values` lists the complete prepared output domain; `enabled_values` is
+a nonempty subset. Both lists contain distinct values, and each value covers the
+entire 1–64-byte output. The complete domain has at most 512 entries and must
+agree across every predicate consuming that buffer. Domains are execution data,
+independent of the optional diagnostic labels.
+
+After all required producers complete, native startup rejects outputs outside
+those domains and constructs each selected executable from its retained source
+graph. Unselected kernels are removed, connecting each predecessor directly to
+each successor through full-completion dependencies. Existing full-completion
+edges are reused. Startup rejects non-default incident edge metadata and bypasses
+that would conflict with an existing typed dependency. Other edges, including
+programmatic dependencies between retained nodes, keep their exact metadata.
+Selected kernels retain their captured function, arguments, launch attributes,
+and exact geometry. The package marks those functions' launches with `exact_grid`, including
+candidates in startup producer graphs; insufficient residency fails loading
+instead of reducing the grid.
+
+A native package owns a shared executable binding. Startup clears that handle
+before destroying its unselected executable, then instantiates and uploads the
+selected graph. Graphs are processed sequentially, and the selected graph must
+fit the device memory previously occupied by its superset. Raw replay bundles,
+manifest snapshots, and teardown resolve the shared binding. Diagnostic Python
+graphs retain their Python-owned original; the diagnostic executor owns and
+releases only the selected clone. Source graphs, modules, and storage remain
+owned through drain. Serving performs no graph construction or selector parsing.
+Rank startup agreement compares predicate data and graph flags while excluding
+process-local node and graph handles.
 
 ## Serving graph transport
 

@@ -204,6 +204,11 @@ pub(super) fn node(value: wire::Node) -> Result<Node> {
             grid: array(value.grid, "kernel grid")?,
             block: array(value.block, "kernel block")?,
             shared: value.shared,
+            exact_grid: value.exact_grid,
+            enable_when: value.enable_when.map(|predicate| crate::execution::KernelEnableWhen {
+                buffer: predicate.buffer, allowed_values: predicate.allowed_values,
+                enabled_values: predicate.enabled_values,
+            }),
             arguments: convert(value.arguments, blob)?,
             attributes: convert(value.attributes, |value| {
                 Ok(Attribute {
@@ -682,6 +687,7 @@ mod tests {
         let execution = wire::Execution {
             tuning_graphs: vec![wire::TuningGraph {
                 name: "tune".into(), outputs: vec!["winner".into()], status_buffer: "status".into(),
+                choices: vec![wire::TuningChoice { value: vec![0x51, 0x00, 0x02, 0x80], label: "Prepared profile".into() }],
             }],
             graphs: vec![wire::ExecutionGraph { tuned_bindings: vec![binding.clone()], ..Default::default() }],
             ..Default::default()
@@ -694,6 +700,30 @@ mod tests {
             serde_json::from_value(serde_json::to_value(restored).unwrap()).unwrap();
         assert_eq!(contract.tuned_bindings[0].buffer, "winner");
         assert_eq!(contract.tuned_bindings[0].tuning_graph, "tune");
+    }
+
+    #[test]
+    fn kernel_predicates_roundtrip_exact_domains_and_launch_geometry() {
+        use prost::Message;
+        let encoded = wire::Node { operation: Some(wire::node::Operation::Kernel(wire::Kernel {
+            function: 3, grid: vec![8, 1, 1], block: vec![512, 1, 1], exact_grid: true,
+            enable_when: Some(wire::KernelEnableWhen { buffer: "selector".into(),
+                allowed_values: vec![vec![1, 0, 0, 0], vec![2, 0, 0, 0]],
+                enabled_values: vec![vec![2, 0, 0, 0]] }), ..Default::default()
+        })) };
+        let restored = wire::Node::decode(encoded.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(restored, encoded);
+        match node(restored).unwrap() {
+            Node::Kernel { grid, block, exact_grid, enable_when: Some(predicate), .. } => {
+                assert_eq!(grid, [8, 1, 1]);
+                assert_eq!(block, [512, 1, 1]);
+                assert!(exact_grid);
+                assert!(!predicate.enabled(&[1, 0, 0, 0]).unwrap());
+                assert!(predicate.enabled(&[2, 0, 0, 0]).unwrap());
+                assert!(predicate.enabled(&[3, 0, 0, 0]).is_err());
+            },
+            _ => panic!("kernel predicate missing after roundtrip"),
+        }
     }
 
     #[test]

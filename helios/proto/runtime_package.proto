@@ -651,6 +651,12 @@ enum RelocationKind { POINTER = 0; TENSOR_MAP = 1; }
 message Relocation { uint64 offset = 1; Reference target = 2; RelocationKind kind = 3; }
 message Blob { bytes data = 1; repeated Relocation relocations = 2; }
 message Attribute { int32 id = 1; Blob value = 2; }
+// Exact opaque startup values control a fully prepared kernel launch.
+message KernelEnableWhen {
+  string buffer = 1;
+  repeated bytes allowed_values = 2;
+  repeated bytes enabled_values = 3;
+}
 message Kernel {
   uint64 function = 1;
   repeated uint32 grid = 2;
@@ -658,6 +664,9 @@ message Kernel {
   uint32 shared = 4;
   repeated Blob arguments = 5;
   repeated Attribute attributes = 6;
+  KernelEnableWhen enable_when = 7;
+  // Its algorithm requires the captured physical grid; occupancy cannot reduce it.
+  bool exact_grid = 8;
 }
 message Memset {
   Reference destination = 1;
@@ -693,6 +702,11 @@ message TuningGraph {
   string name = 1;
   repeated string outputs = 2;
   string status_buffer = 3;
+  repeated TuningChoice choices = 4;
+}
+message TuningChoice {
+  bytes value = 1;
+  string label = 2;
 }
 message Buffer {
   string name = 1;

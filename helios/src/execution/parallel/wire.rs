@@ -198,6 +198,16 @@ pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
         if graph.kind == super::super::GraphKind::Speculative {
             number(&mut bytes, graph.draft_tokens);
         }
+        number(&mut bytes, usize::from(graph.startup_graph.is_some()));
+        if let Some(binding) = &graph.startup_graph { number(&mut bytes, binding.flags as usize); }
+        number(&mut bytes, graph.kernel_predicates.len());
+        for binding in &graph.kernel_predicates {
+            string(&mut bytes, &binding.predicate.buffer);
+            for values in [&binding.predicate.allowed_values, &binding.predicate.enabled_values] {
+                number(&mut bytes, values.len());
+                for value in values { number(&mut bytes, value.len()); bytes.extend_from_slice(value); }
+            }
+        }
         number(&mut bytes, graph.tuned_bindings.len());
         for binding in &graph.tuned_bindings {
             string(&mut bytes, &binding.buffer);

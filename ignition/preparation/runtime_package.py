@@ -100,7 +100,7 @@ class RuntimePackage:
             cubin_bytes=sum(len(image) for image in self.modules.values() if isinstance(image, bytes)))
 
     def write(self, path, graphs, *, execution=None, server=None, progress=None, package_data=None,
-              publisher=None, sources=False, rebuild_weights=None, zero_ranges=()):
+              publisher=None, sources=False, rebuild_weights=None, zero_ranges=(), kernel_predicates=()):
         import flare_heliopause
         from .package_snapshot import _OPTIONS
         from .rebuild_manifest import rebuild_weights_metadata, weight_payload_request
@@ -113,7 +113,7 @@ class RuntimePackage:
         # Absent cache configuration stays absent: the native exporter owns
         # default destination and cache selection.
         cache = _OPTIONS.get()
-        request = dict(path=str(path), context=context, graphs=_graphs(graphs),
+        request = dict(path=str(path), context=context, graphs=_graphs(graphs), kernel_predicates=kernel_predicates,
             allocations=[asdict(a) for a in self.allocations], kernels=[asdict(k) for k in self.kernels],
             modules={name: str(path) for name,path in self.modules.items()},
             roots=[a.name for a in self.allocations],
@@ -218,7 +218,7 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         peer_addresses=[] if storage.peer_storage is None else list(storage.peer_storage.owned),
         peer_mappings=[] if storage.peer_storage is None else
             [part for parts in storage.peer_storage.imported_mappings.values() for part in parts],
-        graphs=_graphs(prepared.graphs), allocations=[asdict(a) for a in allocations], discover_allocations=True,
+        graphs=_graphs(prepared.graphs), kernel_predicates=getattr(prepared, "export_kernel_predicates", ()), allocations=[asdict(a) for a in allocations], discover_allocations=True,
         events=prepared.export_events, numeric=numeric, inactive=inactive,
         parameter_layouts=parameter_layouts, zero_ranges=zero_ranges, transports=transports,
         device_address_floor=storage.EXTERNAL_FLOOR if storage.integrated else 0,

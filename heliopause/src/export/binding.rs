@@ -95,7 +95,31 @@ fn export_capture(
     Ok(NativeRankOutput { output: result })
 }
 
+#[pyfunction]
+fn resolve_kernel_predicates(context: usize, graphs: &str, registrations: &str) -> PyResult<String> {
+    let graphs: Vec<super::GraphHandle> = serde_json::from_str(graphs)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let registrations: Vec<super::KernelPredicateRegistration> = serde_json::from_str(registrations)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let resolved = super::capture::resolve_kernel_predicates(context, &graphs, &registrations)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let mut values = std::collections::BTreeMap::new();
+    for (name, bindings) in resolved {
+        let graph = graphs.iter().find(|graph| graph.name == name).unwrap();
+        let flags = super::capture::graph_flags(context, graph.executable)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        values.insert(name, serde_json::json!({
+            "startup_graph": {"template": graph.graph, "flags": flags},
+            "kernel_predicates": bindings.into_iter().map(|(node, entry)| serde_json::json!({
+                "node": node, "predicate": entry.predicate,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    serde_json::to_string(&values).map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(resolve_kernel_predicates, module)?)?;
     module.add_function(wrap_pyfunction!(export_capture, module)?)?;
     module.add_function(wrap_pyfunction!(export_synchronize, module)?)?;
     module.add_function(wrap_pyfunction!(export_reset_peer_storage, module)?)?;
@@ -172,6 +196,8 @@ pub(crate) fn execution(
             .as_object_mut()
             .ok_or_else(|| super::invalid("invalid execution graph"))?;
         graph.remove("handle");
+        graph.remove("kernel_predicates");
+        graph.remove("startup_graph");
         let kind = graph
             .get("kind")
             .and_then(|v| v.as_str())
@@ -194,14 +220,23 @@ pub(crate) fn execution(
         }
 
     }
+    let mut choices = Vec::new();
     if let Some(tuners) = object.get_mut("tuning_graphs") {
         for tuner in tuners.as_array_mut()
             .ok_or_else(|| super::invalid("tuning graphs must be an array"))? {
-            tuner.as_object_mut()
-                .ok_or_else(|| super::invalid("invalid tuning graph"))?.remove("handle");
+            let tuner = tuner.as_object_mut()
+                .ok_or_else(|| super::invalid("invalid tuning graph"))?;
+            tuner.remove("handle");
+            // The preparation handoff uses JSON byte arrays; Protobuf JSON uses base64.
+            choices.push(serde_json::from_value::<Vec<super::wire::TuningChoice>>(
+                tuner.remove("choices").unwrap_or_else(|| serde_json::json!([])))?);
         }
     }
-    message("Execution", &value)
+    let mut execution: super::wire::Execution = message("Execution", &value)?;
+    for (graph, labels) in execution.tuning_graphs.iter_mut().zip(choices) {
+        graph.choices = labels;
+    }
+    Ok(execution)
 }
 
 pub(crate) fn finish_rank(
@@ -722,8 +757,45 @@ fn validate_sampling(value: &serde_json::Value) -> super::Result<()> {
 }
 
 pub(crate) fn validate_metadata(request: &CaptureRequest) -> super::Result<()> {
+    validate_kernel_predicates(request)?;
     if let Some(server) = request.server.as_ref() {
         serving_metadata(&mut Default::default(), server)?;
+    }
+    Ok(())
+}
+
+fn validate_kernel_predicates(request: &CaptureRequest) -> super::Result<()> {
+    let mut registrations = std::collections::HashSet::new();
+    let mut domains = std::collections::HashMap::new();
+    for entry in &request.kernel_predicates {
+        let execution = request.execution.as_ref().ok_or_else(|| super::invalid("kernel predicates require execution metadata"))?;
+        let buffer = execution["buffers"].as_array().and_then(|buffers| buffers.iter()
+            .find(|buffer| buffer["name"].as_str() == Some(&entry.predicate.buffer)))
+            .ok_or_else(|| super::invalid("kernel predicate output buffer is missing"))?;
+        let nbytes = buffer["nbytes"].as_u64().and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| super::invalid("kernel predicate output extent is invalid"))?;
+        entry.predicate.validate(nbytes)?;
+        let graph = execution["graphs"].as_array().and_then(|graphs| graphs.iter()
+            .find(|graph| graph["name"].as_str() == Some(&entry.graph)))
+            .ok_or_else(|| super::invalid("kernel predicate must name a serving graph"))?;
+        let binding = graph["tuned_bindings"].as_array().and_then(|bindings| bindings.iter()
+            .find(|binding| binding["buffer"].as_str() == Some(&entry.predicate.buffer)))
+            .ok_or_else(|| super::invalid("kernel predicate must name a graph's tuned output"))?;
+        let producer = execution["tuning_graphs"].as_array().and_then(|graphs| graphs.iter()
+            .find(|graph| graph["name"] == binding["tuning_graph"]))
+            .ok_or_else(|| super::invalid("kernel predicate output producer is missing"))?;
+        if !producer["outputs"].as_array().is_some_and(|outputs| outputs.iter()
+                .any(|output| output.as_str() == Some(&entry.predicate.buffer)))
+            || buffer["address"].as_u64() != Some(entry.selector_address)
+            || entry.function == 0 || entry.selector_address == 0
+            || !registrations.insert((&entry.graph, entry.function, entry.argument_index,
+                entry.argument_offset, entry.selector_address)) {
+            return Err(super::invalid("kernel predicate registration has an invalid producer, pointer, or duplicate identity"));
+        }
+        if domains.insert(&entry.predicate.buffer, &entry.predicate.allowed_values)
+            .is_some_and(|previous| previous != &entry.predicate.allowed_values) {
+            return Err(super::invalid("kernel predicate output domains differ"));
+        }
     }
     Ok(())
 }
@@ -829,18 +901,51 @@ mod tests {
     #[test]
     fn startup_tuning_export_preserves_bindings_and_omits_process_handles() {
         let value = serde_json::json!({
-            "abi_version": 5, "max_active": 1, "input_frame_bytes": 8, "buffers": [],
+            "abi_version": 6, "max_active": 1, "input_frame_bytes": 8, "buffers": [],
             "graphs": [{"name": "decode", "kind": "decode", "handle": 17,
                 "tuned_bindings": [{"buffer": "winner", "tuning_graph": "tune"}]}],
             "tuning_graphs": [{"name": "tune", "handle": 18,
-                "outputs": ["winner"], "status_buffer": "status"}]
+                "outputs": ["winner"], "status_buffer": "status",
+                "choices": [{"value": [81, 0, 2, 128], "label": "Prepared profile"}]}]
         });
         let encoded = execution(&value, &[]).unwrap();
         assert_eq!(encoded.tuning_graphs[0].name, "tune");
         assert_eq!(encoded.tuning_graphs[0].outputs, ["winner"]);
         assert_eq!(encoded.tuning_graphs[0].status_buffer, "status");
+        assert_eq!(encoded.tuning_graphs[0].choices[0].value, [81, 0, 2, 128]);
+        assert_eq!(encoded.tuning_graphs[0].choices[0].label, "Prepared profile");
         assert_eq!(encoded.graphs[0].tuned_bindings[0].tuning_graph, "tune");
         assert_eq!(encoded.graphs[0].tuned_bindings[0].buffer, "winner");
+    }
+
+    #[test]
+    fn kernel_predicate_export_requires_the_exact_tuned_output_pointer() {
+        let value = serde_json::json!({
+            "path": "unused", "context": 0, "graphs": [], "allocations": [],
+            "kernel_predicates": [{"graph": "decode", "function": 17, "argument_index": 3,
+                "argument_offset": 0, "selector_address": 4096,
+                "predicate": {"buffer": "winner", "allowed_values": [[1,0,0,0],[2,0,0,0]],
+                    "enabled_values": [[2,0,0,0]]}}],
+            "execution": {"buffers": [{"name": "winner", "address": 4096, "nbytes": 4}],
+                "graphs": [{"name": "decode", "tuned_bindings": [{"buffer": "winner", "tuning_graph": "choose"}]}],
+                "tuning_graphs": [{"name": "choose", "outputs": ["winner"]}]},
+            "server": null, "package_data": null
+        });
+        let valid: CaptureRequest = serde_json::from_value(value).unwrap();
+        validate_kernel_predicates(&valid).unwrap();
+        for mutation in 0..7 {
+            let mut changed = valid.clone();
+            match mutation {
+                0 => changed.kernel_predicates[0].selector_address += 4,
+                1 => changed.kernel_predicates[0].predicate.buffer = "missing".into(),
+                2 => changed.kernel_predicates[0].graph = "choose".into(),
+                3 => changed.kernel_predicates[0].predicate.allowed_values[0].pop().map(|_| ()).unwrap(),
+                4 => changed.execution.as_mut().unwrap()["tuning_graphs"][0]["outputs"] = serde_json::json!([]),
+                5 => changed.kernel_predicates.push(changed.kernel_predicates[0].clone()),
+                _ => changed.execution = None,
+            }
+            assert!(validate_kernel_predicates(&changed).is_err(), "mutation {mutation}");
+        }
     }
 
     fn rebuild_catalog() -> (super::super::wire::RebuildWeights, Vec<super::super::wire::Allocation>) {
@@ -1008,7 +1113,7 @@ mod tests {
             snapshot_spans: None,
             sizing: None,
         };
-        let input = serde_json::json!({"abi_version":5,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3,"draft_tokens":2,"packed_token_capacity":3,"confidence_width":0}]});
+        let input = serde_json::json!({"abi_version":6,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3,"draft_tokens":2,"packed_token_capacity":3,"confidence_width":0}]});
         let parsed = execution(&input, &[allocation]).unwrap();
         assert_eq!(parsed.buffers[0].reference.as_ref().unwrap().offset, 32);
         assert_eq!(parsed.graphs[0].draft_tokens, Some(2));
