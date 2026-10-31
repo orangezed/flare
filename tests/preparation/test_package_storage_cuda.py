@@ -349,21 +349,21 @@ def test_compiled_variants_release_warmup_storage(tmp_path, mailbox_storage):
     signatures = {name: GraphSignature("prefill", 1, forward.source.shape[0])
                   for name, forward in functions.items()}
     warmed = []
+    initial_pools = storage._preparation_pools.copy()
 
     @contextmanager
     def warmup():
-        previous = storage._preparation_pools.copy()
         with storage.transient():
             temporary = torch.empty(4 << 20, dtype=torch.uint8, device="cuda")
             temporary.zero_()
             del temporary
             yield
-        pools = storage._preparation_pools - previous
-        assert pools
-        assert not [segment for segment in torch.cuda.memory_snapshot()
-                    if tuple(segment["segment_pool_id"]) in pools]
-        assert storage._snapshot()["retained_handles"] > 0
-        warmed.append(pools)
+        pools = storage._preparation_pools - initial_pools
+        assert len(pools) == 1
+        assert [segment for segment in torch.cuda.memory_snapshot()
+                if tuple(segment["segment_pool_id"]) in pools]
+        assert storage._snapshot()["retained_handles"] == 0
+        warmed.append(pools.copy())
 
     cache = ForwardCache(namespace={"model": "warmup-storage"}, device="cuda:0", root=tmp_path)
     with storage.retain_transient_backing():
@@ -371,6 +371,9 @@ def test_compiled_variants_release_warmup_storage(tmp_path, mailbox_storage):
     assert storage._snapshot()["retained_handles"] == 0
     assert storage._snapshot()["retained_bytes"] == 0
     assert len(warmed) == 2 * len(functions)
+    assert all(pools == warmed[0] for pools in warmed)
+    assert not [segment for segment in torch.cuda.memory_snapshot()
+                if tuple(segment["segment_pool_id"]) in warmed[0]]
     graph = torch.cuda.CUDAGraph()
     for name, forward in functions.items():
         with torch.cuda.graph(graph, pool=storage.graph_pool.id):
@@ -423,3 +426,52 @@ def test_mapped_mailbox_publishes_rows_during_graph_replay(count, mailbox_storag
         finally:
             graph.reset()
             region.close()
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
+                    reason="requires an explicitly assigned CUDA device")
+def test_repeated_warmups_reuse_bounded_backing_and_preserve_escaping_tensors(mailbox_storage):
+    import torch
+
+    storage = mailbox_storage
+    initial_pools = storage._preparation_pools.copy()
+    retained_before = storage._snapshot()["retained_bytes"]
+    addresses = []
+    mapped_working_set = None
+    with storage.retain_transient_backing():
+        with storage.transient():
+            persistent = torch.full((1024,), 37, dtype=torch.int32, device="cuda")
+        persistent_address = persistent.data_ptr()
+        for iteration in range(12):
+            with storage.transient():
+                small = torch.empty(8 << 20, dtype=torch.uint8, device="cuda")
+                large = torch.empty(32 << 20, dtype=torch.uint8, device="cuda")
+                small.fill_(iteration + 1)
+                large.fill_(iteration + 2)
+                assert small[0].item() == iteration + 1
+                assert large[-1].item() == iteration + 2
+                addresses.append((small.data_ptr(), large.data_ptr()))
+                del small, large
+            assert persistent.data_ptr() == persistent_address
+            assert persistent[0].item() == persistent[-1].item() == 37
+            pools = storage._preparation_pools - initial_pools
+            assert len(pools) == 1
+            mapped = sum(segment["total_size"] for segment in torch.cuda.memory_snapshot()
+                         if tuple(segment["segment_pool_id"]) in pools)
+            # Allow caching-allocator segment rounding in the first working set,
+            # then require every later warmup to reuse exactly that backing.
+            if mapped_working_set is None:
+                assert mapped <= 64 << 20, mapped
+                mapped_working_set = mapped
+            assert mapped == mapped_working_set
+            assert storage._snapshot()["retained_bytes"] == retained_before
+        assert len(set(addresses)) == 1, addresses
+    assert storage._snapshot()["retained_bytes"] == storage._snapshot()["retained_handles"] == 0
+    assert persistent.data_ptr() == persistent_address
+    torch.testing.assert_close(persistent, torch.full_like(persistent, 37), rtol=0, atol=0)
+    del persistent
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    assert not [segment for segment in torch.cuda.memory_snapshot()
+                if tuple(segment["segment_pool_id"]) in pools]
+    assert storage.error is None

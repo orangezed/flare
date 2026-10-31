@@ -51,6 +51,7 @@ class PackageStorage:
         properties = torch.cuda.get_device_properties(device)
         self.integrated = properties.is_integrated
         self._retention_scope = False
+        self._retained_pool = None
         self.DEVICE_BASE += rank * self.RESERVATION_BYTES
         self.cuda = _Cuda()
         from flare_heliopause import flare_heliopause as native
@@ -175,7 +176,11 @@ class PackageStorage:
 
     @contextmanager
     def retain_transient_backing(self):
-        """Keep transient physical allocations alive across compiled-forward warming."""
+        """Reuse drained warmup storage while retaining its backing through the catalog.
+
+        Live tensors keep their pool allocations; retired blocks are reusable by
+        subsequent warmups. Failed scopes retain the pool and physical handles.
+        """
         if self._retention_scope:
             raise RuntimeError("nested transient physical retention scope")
         self._retention_scope = True
@@ -186,6 +191,17 @@ class PackageStorage:
                 yield
                 if self.error is not None:
                     raise self.error
+                if self._retained_pool is not None:
+                    import torch
+
+                    torch.cuda.synchronize(self.device)
+                    # Retire the shared pool while native retention still protects
+                    # its freed segments; live tensor allocations remain mapped.
+                    self._retained_pool = None
+                    torch.cuda.empty_cache()
+                    self.seal_low_window()
+                    if self.error is not None:
+                        raise self.error
                 if self.library.flare_package_retention_finish():
                     raise self.error or RuntimeError("cannot release transient physical backing")
             except BaseException:
@@ -196,28 +212,33 @@ class PackageStorage:
 
     @contextmanager
     def transient(self):
-        """Route allocations to a package-backed pool whose free segments return to the device on exit.
+        """Use package-backed temporary storage and drain its work before reuse.
 
-        A live pool never releases cached segments, so work that frees most of
-        what it allocates, such as kernel tuning, would otherwise strand that
-        memory for the rest of preparation. Allocations still live on exit
-        stay valid, package-backed, and exported.
+        Compiled-warmup retention shares one caching pool across calls. Other
+        temporary work retires its pool on exit. Allocations still live when a
+        pool retires stay valid, package-backed, and exported.
         """
         import torch
 
-        allocator = (self._transient_allocator if self._retention_scope
-                     else self._allocator)
-        pool = torch.cuda.MemPool(allocator.allocator())
-        self._preparation_pools.add(pool.id)
+        retained = self._retention_scope
+        if retained:
+            if self._retained_pool is None:
+                self._retained_pool = torch.cuda.MemPool(self._transient_allocator.allocator())
+                self._preparation_pools.add(self._retained_pool.id)
+            pool = self._retained_pool
+        else:
+            pool = torch.cuda.MemPool(self._allocator.allocator())
+            self._preparation_pools.add(pool.id)
         try:
             with torch.cuda.use_mem_pool(pool, device=self.device):
                 yield
         finally:
             torch.cuda.synchronize(self.device)
-            del pool
-            torch.cuda.empty_cache()
-            # Returned segments may reopen low addresses that later library allocations would take.
-            self.seal_low_window()
+            if not retained:
+                del pool
+                torch.cuda.empty_cache()
+                # Returned segments may reopen low addresses that later library allocations would take.
+                self.seal_low_window()
 
     def scratch_pool(self):
         """Own zero-initialized scratch whose physical backing can be released during compilation."""

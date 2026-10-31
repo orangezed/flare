@@ -19,6 +19,7 @@ def test_retention_scope_completion_and_exception(fail):
         return 0
     storage = PackageStorage.__new__(PackageStorage)
     storage._retention_scope = False
+    storage._retained_pool = None
     storage.library = SimpleNamespace(
         flare_package_retention_begin=lambda: operation('begin'),
         flare_package_retention_finish=lambda: operation('finish'),
@@ -69,3 +70,50 @@ def test_capture_drains_after_prepare_and_sync_before_capture(monkeypatch):
         device='cuda:0', stream=stream, pool=None,
         warmup_storage=SimpleNamespace(transient=nullcontext, retain_transient_backing=retention))
     assert events[:5] == ['begin', 'prepare_many', 'sync', 'finish', 'prepare_capture']
+
+
+@pytest.mark.parametrize('failure', [None, 'body', 'drain', 'finish'])
+def test_scoped_pool_drains_before_release_and_survives_failed_warmup(monkeypatch, failure):
+    import torch
+
+    events = []
+    class Pool:
+        def __del__(self):
+            events.append('pool-retired')
+    storage = PackageStorage.__new__(PackageStorage)
+    storage.device = 0
+    storage._retention_scope = False
+    storage._retained_pool = Pool()
+    storage.seal_low_window = lambda: events.append('seal')
+    def drain(device):
+        events.append('drain')
+        if failure == 'drain':
+            raise RuntimeError('drain failed')
+    def finish():
+        events.append('finish')
+        return -1 if failure == 'finish' else 0
+    storage.library = SimpleNamespace(
+        flare_package_retention_begin=lambda: events.append('begin') or 0,
+        flare_package_retention_finish=finish,
+        flare_package_retention_abort=lambda: events.append('abort') or 0,
+        flare_package_error=lambda: None)
+    monkeypatch.setattr(torch.cuda, 'synchronize', drain)
+    monkeypatch.setattr(torch.cuda, 'empty_cache', lambda: events.append('empty-cache'))
+    try:
+        with storage.retain_transient_backing():
+            if failure == 'body':
+                raise RuntimeError('first warmup failure')
+    except RuntimeError as error:
+        assert failure is not None
+        assert str(error) == {'body': 'first warmup failure', 'drain': 'drain failed',
+                             'finish': 'cannot release transient physical backing'}[failure]
+    else:
+        assert failure is None
+    if failure in ('body', 'drain'):
+        assert storage._retained_pool is not None
+        assert 'pool-retired' not in events and 'finish' not in events
+    else:
+        assert storage._retained_pool is None
+        assert events[:5] == ['begin', 'drain', 'pool-retired', 'empty-cache', 'seal']
+    assert events[-1] == ('finish' if failure is None else 'abort')
+    assert not storage._retention_scope
