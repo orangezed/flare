@@ -30,7 +30,7 @@ FP8 = torch.float8_e4m3fn
 class PreparedMLA:
     def __init__(self, weights, source, metadata, cache, *, mode, session, name, workspace, buffers, latents=None,
                  coordinator=None, context=None, peers=None, allocator=None, index_cache=None,
-                 eps=1e-6, rotary=None, gated=True):
+                 eps=1e-6, rotary=None, gated=True, partial_budget_bytes=None):
         tokens, hidden = source.shape
         heads = weights["key"].shape[0]
         device = source.device
@@ -85,6 +85,13 @@ class PreparedMLA:
         world, width = self.shards.world, metadata.page_table.shape[1]
         common = dict(device=device, kv_dtype=FP8, page_size=PAGE_TOKENS, use_cuda_graph=True,
                       partial_dtype=torch.float32)
+        if partial_budget_bytes is not None:
+            if type(partial_budget_bytes) is not int or partial_budget_bytes < 0:
+                raise ValueError("MLA partial-output budget must be a nonnegative byte count")
+            # One partial row stores every participating head's FP32 latent output and LSE.
+            # The tuner still chooses the split count; every choice reads the full context.
+            common["budget"] = dense_mla.Budget(
+                max_partial_rows=partial_budget_bytes // (heads * world * (512 + 1) * 4))
         scale = 192 ** -.5
         self.sparse = None
         if index_cache is not None:

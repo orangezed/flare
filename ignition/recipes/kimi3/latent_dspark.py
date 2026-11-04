@@ -171,7 +171,9 @@ class DraftAttention(torch.nn.Module):
         self.attention = PreparedMLA(weights.attention, scratch.embedding, metadata, pool.draft_attention(index),
             mode="decode" if block == 1 else "verify", session=session, name=name, workspace=workspace,
             buffers=scratch.attention_buffers, latents=latents, coordinator=coordinator, context=context,
-            eps=config.draft.text["rms_norm_eps"], rotary=YarnRotary(config, scratch.embedding.device), gated=False)
+            eps=config.draft.text["rms_norm_eps"], rotary=YarnRotary(config, scratch.embedding.device), gated=False,
+            # Full-context drafts share a bounded partial-output arena across their five layers.
+            partial_budget_bytes=64 << 20)
         self.reduce = PreparedAllReduce(self.attention.projections["output"].output, scratch.output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".reduce")
 
