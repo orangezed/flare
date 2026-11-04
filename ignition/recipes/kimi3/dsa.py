@@ -61,7 +61,9 @@ class PreparedDSA:
         # Sequential slices and layers reuse the same selection buffers; each operator owns its binding.
         from ignition.preparation.scratch import GraphBufferPool
         if "index_workspace" not in buffers:
-            buffers["index_workspace"] = GraphBufferPool(device)
+            # Each slice has at most 32 rows. Large per-dtype chunks would reserve
+            # hundreds of MiB for query scales and other small intermediates.
+            buffers["index_workspace"] = GraphBufferPool(device, chunk_bytes=2 << 20)
         pool = buffers["index_workspace"]
         for begin in range(0, rows, capacity):
             end = min(begin + capacity, rows)

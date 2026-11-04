@@ -39,12 +39,15 @@ def test_dsa_selection_and_attention_replay(rows):
     m.page_table.copy_(torch.arange(records // 128, device=device, dtype=torch.int32)[None])
     m.positions.copy_(torch.arange(records - rows, records, device=device))
     arena, buffers = ScratchArena(device), GraphBufferPool(device)
+    selection_buffers = {}
     with RecordedPreparationSession(device=device, checkpoint="kimi-dsa-test", workload_schema="dsa-top2048",
             numerical_policy="fp8-index-unit-latent", compile_workers=16) as session:
         session.register_scratch(arena)
         op = PreparedDSA(weights, residual, key_input, head_weights, query, output, slots, m, latent,
             index_cache, context=None, session=session, coordinator=None, name="dsa", workspace=arena,
-            buffers={}, allocator=buffers.cursor())
+            buffers=selection_buffers, allocator=buffers.cursor())
+        # Sequential prefill slices must not multiply the selection workspace.
+        assert selection_buffers["index_workspace"].nbytes <= 16 << 20
         session.tune(show_progress=False)
         op.stages[0][2].write_keys(keys, torch.arange(records, device=device, dtype=torch.int64))
         compiled = compile_forward(op)
