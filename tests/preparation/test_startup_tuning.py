@@ -169,7 +169,8 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     producer = SimpleNamespace(specs=(SimpleNamespace(selector=selector),),
         status=torch.ones(1, dtype=torch.int32), run=lambda: events.append("run"))
     registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=2), capture=nullcontext,
-        benchmark_storage=SimpleNamespace(graph_pool=SimpleNamespace(id=(1, 7)))))
+        benchmark_storage=SimpleNamespace(graph_pool=SimpleNamespace(id=(1, 7)),
+                                          numeric_storage=SimpleNamespace(entries={}))))
     serving = object()
     registry.owners = [owner]
     registry.groups = {"key": producer}
@@ -233,3 +234,29 @@ def test_memory_report_deduplicates_shared_producer_allocations():
     registry = CollectiveStartupTuning(object())
     registry.groups = {"a": producer("a"), "b": producer("b")}
     assert registry.memory_report() == dict(startup_tuning_bytes=4352, startup_tuning_producers=2)
+
+
+def test_catalog_names_resident_weights_as_eviction_source_before_capture(monkeypatch):
+    import b12x.comm.pcie as pcie
+    from ignition.preparation import startup_tuning
+    from ignition.preparation.startup_tuning import CollectiveStartupTuning
+
+    events, weights = [], object()
+    monkeypatch.setattr(startup_tuning, "resident_numeric_storage", lambda numeric: weights)
+    monkeypatch.setattr(pcie, "use_startup_eviction", lambda source: events.append(("eviction", source)))
+    registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=0),
+        benchmark_storage=SimpleNamespace(numeric_storage=SimpleNamespace(entries={}))))
+    serving, owner = object(), SimpleNamespace()
+    producer = SimpleNamespace(specs=(SimpleNamespace(selector=torch.tensor([7], dtype=torch.uint32)),),
+                               status=torch.ones(1, dtype=torch.int32))
+    registry.owners, registry.groups = [owner], {"key": producer}
+    registry.owner_groups = {id(owner): "key"}
+    registry.captures[id(serving)] = {id(owner)}
+
+    def stop(*args, **kwargs):
+        raise RuntimeError("capture")
+    monkeypatch.setattr(torch.cuda, "device", stop)
+    with pytest.raises(RuntimeError, match="capture"):
+        registry.catalog({"decode": serving})
+    assert events == [("eviction", weights)]
+

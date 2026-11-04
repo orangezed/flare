@@ -84,6 +84,23 @@ def capture_consumers(session, graph):
         registry.captures[id(graph)] = consumers
 
 
+def resident_numeric_storage(numeric):
+    """The largest live device storage of checkpoint tensors, as bytes."""
+    import torch
+
+    best = None
+    for reference, address, nbytes, _ in numeric.entries.values():
+        storage = torch.UntypedStorage._new_with_weak_ptr(reference.cdata)
+        if (storage is None or storage.device.type != "cuda"
+                or (storage.data_ptr(), storage.nbytes()) != (address, nbytes)):
+            continue
+        if best is None or nbytes > best.nbytes():
+            best = storage
+    if best is None:
+        return None
+    return torch.empty(0, dtype=torch.uint8, device=best.device).set_(best, 0, (best.nbytes(),))
+
+
 class CollectiveStartupTuning:
     def __init__(self, session):
         self.session = session
@@ -126,6 +143,13 @@ class CollectiveStartupTuning:
         if needed and storage is None:
             raise RuntimeError("collective startup capture requires package storage")
         buffers, tuners, bindings, resources = {}, {}, {}, []
+        if needed:
+            from b12x.comm.pcie import use_startup_eviction
+
+            # Cold races only read their L2 eviction input; resident weights serve.
+            source = resident_numeric_storage(storage.numeric_storage)
+            if source is not None:
+                use_startup_eviction(source)
         for index, (key, producer) in enumerate(self.groups.items()):
             if key not in needed:
                 continue
