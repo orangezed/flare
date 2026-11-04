@@ -22,15 +22,18 @@ class AttentionBenchmarkInputs:
     seed_k: torch.Tensor
     seed_v: torch.Tensor
     cu_seqlens_q: torch.Tensor
+    output: torch.Tensor | None = None
 
     @property
     def nbytes(self):
-        return sum(value.untyped_storage().nbytes() for value in vars(self).values())
+        return sum(value.untyped_storage().nbytes() for value in vars(self).values() if value is not None)
 
     def produce(self):
-        self.q.copy_(self.seed_q)
-        self.k.copy_(self.seed_k)
-        self.v.copy_(self.seed_v)
+        for value, seed in ((self.q, self.seed_q), (self.k, self.seed_k), (self.v, self.seed_v)):
+            # Each tensor owns its full strided storage. Copy its contiguous backing
+            # so a host-to-device strided copy cannot allocate a device temporary.
+            size = value.untyped_storage().nbytes() // value.element_size()
+            value.as_strided((size,), (1,), 0).copy_(seed.as_strided((size,), (1,), 0), non_blocking=True)
 
 
 def attention_benchmark_inputs(arguments):
@@ -40,11 +43,20 @@ def attention_benchmark_inputs(arguments):
     result = {}
     for name in ("q", "k", "v"):
         source = arguments[name]
+        value = torch.empty_strided(source.shape, source.stride(), dtype=source.dtype,
+                                    device=source.device).normal_(generator=generator)
+        # Generate identical device samples, but retain their immutable backup in
+        # host memory. Producer copies precede the timed invocation on its stream.
         seed = torch.empty_strided(source.shape, source.stride(), dtype=source.dtype,
-                                   device=source.device).normal_(generator=generator)
+                                   device="cpu", pin_memory=source.is_cuda)
+        seed.copy_(value)
         result[f"seed_{name}"] = seed
-        result[name] = torch.empty_strided(source.shape, source.stride(),
-                                           dtype=source.dtype, device=source.device).copy_(seed)
+        result[name] = value
+    if "out" in arguments:
+        output = arguments["out"]
+        # Candidates run serially and fully overwrite the same private output.
+        result["output"] = torch.empty_strided(output.shape, output.stride(),
+                                               dtype=output.dtype, device=output.device)
     count = arguments["cu_seqlens_q"].numel()
     maximum = arguments["max_seqlen_q"]
     if (count - 1) * maximum < query.shape[0]:
@@ -66,7 +78,7 @@ def benchmark_call(state, *, arguments, inputs, workspace):
     arguments = {**arguments, **{key: getattr(inputs, key)
                                   for key in ("q", "k", "v", "cu_seqlens_q")}}
     if "out" in arguments:
-        arguments = {**arguments, "out": torch.empty_like(arguments["out"])}
+        arguments = {**arguments, "out": inputs.output}
     scratch = planned_scratch(state.scratch_plan.scratch_specs(), workspace)
     binding = state.bind(scratch=scratch, **arguments)
     return PreparedCall(run=lambda: state.run(binding), produce=inputs.produce,

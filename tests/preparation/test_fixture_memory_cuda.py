@@ -47,3 +47,86 @@ def test_projection_can_follow_expert_tuning_under_memory_pressure():
             del reserve
             torch.cuda.empty_cache()
         torch.testing.assert_close(operands.source, operands.seed, rtol=0, atol=0)
+
+
+@torch.no_grad()
+def test_attention_trials_share_output_and_restore_host_seeds_without_device_temporaries():
+    from b12x.preparation import PreparationSession
+    from ignition.components.varlen_attention import PreparedVarlenAttention
+    from ignition.preparation.fixtures import varlen_attention
+    from ignition.preparation.scratch import ScratchArena
+
+    device = torch.device("cuda:0")
+    rows = 65536
+    tensors = [torch.zeros(rows, 12, 128, device=device, dtype=torch.bfloat16) for _ in range(4)]
+    q, k, v, output = tensors
+    cu = torch.tensor([0, rows], dtype=torch.int32, device=device)
+    arena = ScratchArena(device)
+    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+        operation = PreparedVarlenAttention(q, k, v, cu, output, session=session,
+                                           workspace=arena, name="vision-attention")
+        arena.finalize()
+        arena.freeze()
+        arguments = dict(q=q, k=k, v=v, out=output, cu_seqlens_q=cu,
+                         max_seqlen_q=rows, max_seqlen_k=rows, causal=False, softmax_scale=128**-.5)
+        acquire = varlen_attention.input_factory(arguments)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        free = torch.cuda.mem_get_info(device)[0]
+        assert free > 1 << 30, "assign a GPU with at least 1 GiB free"
+        reserve = torch.empty(free - (900 << 20), dtype=torch.uint8, device=device)
+        baseline = torch.cuda.memory_allocated()
+        graph = None
+        try:
+            first, second = [varlen_attention.benchmark_call(operation.plan.prepared.state,
+                arguments=arguments, inputs=acquire, workspace=arena) for _ in range(2)]
+            fixture = first.owners[0]
+            assert fixture is second.owners[0]
+            assert torch.cuda.memory_allocated() - baseline < 770 << 20
+            first.produce()
+            first.invoke()
+            expected = fixture.output.cpu()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                first.produce()
+                first.invoke()
+            for value in (fixture.q, fixture.k, fixture.v, fixture.output):
+                value.fill_(float("nan"))
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+        finally:
+            if graph is not None:
+                graph.reset()
+            del reserve
+            torch.cuda.empty_cache()
+        torch.testing.assert_close(fixture.output.cpu(), expected, rtol=0, atol=0)
+        generator = torch.Generator(device=device).manual_seed(89017)
+        for name, template in zip(("q", "k", "v"), (q, k, v), strict=True):
+            reference = torch.empty_strided(template.shape, template.stride(), dtype=template.dtype,
+                                            device=device).normal_(generator=generator)
+            assert getattr(fixture, f"seed_{name}").is_pinned()
+            assert torch.equal(getattr(fixture, name), reference)
+        assert all(not value.count_nonzero() for value in tensors)
+
+
+@torch.no_grad()
+def test_strided_attention_fixture_restoration_needs_no_device_temporary():
+    from ignition.preparation.fixtures.varlen_attention import attention_benchmark_inputs
+
+    source = torch.zeros(64, 24, 128, dtype=torch.bfloat16, device="cuda:0")[:, :12]
+    inputs = attention_benchmark_inputs(dict(q=source, k=source, v=source,
+        cu_seqlens_q=torch.zeros(2, dtype=torch.int32, device=source.device),
+        max_seqlen_q=64, max_seqlen_k=64))
+    inputs.produce()
+    torch.cuda.synchronize()
+    for value in (inputs.q, inputs.k, inputs.v):
+        value.fill_(float("nan"))
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    inputs.produce()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+    for name in ("q", "k", "v"):
+        assert torch.equal(getattr(inputs, name).cpu(), getattr(inputs, f"seed_{name}"))
+    assert not source.count_nonzero()

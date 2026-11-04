@@ -119,7 +119,7 @@ def test_attention_fixture_releases_before_projection_tuning(mailbox_storage):
     assert first.nbytes == 6 * source.nbytes + 8
     first.q.fill_(float("nan"))
     second.produce()
-    assert torch.equal(second.q, second.seed_q)
+    assert torch.equal(second.q, second.seed_q.to(second.q.device))
     del first, second
     gc.collect()
     torch.cuda.synchronize()
