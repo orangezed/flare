@@ -43,7 +43,7 @@ from ignition.preparation.tuning import RecordedPreparationSession, with_autotun
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
-from .config import PAGE_TOKENS
+from .config import PAGE_TOKENS, LatentDSparkConfig
 from .contract import prepare as prepare_contract
 from .decoder import DecoderStorage, PreparedDecoder, Scratch
 from .pool import ContinuationPool, continuation_layout, page_bytes
@@ -171,6 +171,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, online_mxfp8=config.online_mxfp8,
                                     draft_checkpoint=config.draft_checkpoint, peers=peers,
                                     vision=config.vision)
+        if weights.config.model_type == "kimi_k31":
+            from ignition.recipes.kimi31.recipe import RECIPE
         del manifest
         release_unused()
     transient = contextlib.ExitStack()
@@ -224,13 +226,22 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         context = None
         if config.context_parallel and shard.world_size > 1:
             from .dcp import RECORD_BYTES, ContextParallel, ContextShards
+            from .dsa import SELECTION_ROWS, TOPK
 
             # Decode and verification gather every rank's absorbed E4M3 query heads and combine latent outputs.
             heads = weights.config.text["num_attention_heads"]
+            sparse = "dsa" in weights.config.layers
+            selection_rows = min(max_tokens, SELECTION_ROWS)
+            draft_rows = (request_capacity(config.max_active) * config.draft_tokens
+                          if isinstance(weights.config.draft, LatentDSparkConfig) and drafting else 0)
             context = ContextParallel(ContextShards.on(rank, shard.world_size, device),
-                heads=create_head_exchange(group, device, max_rows=config.decode_tokens, heads=heads, head_dim=512,
+                heads=create_head_exchange(group, device, max_rows=max(config.decode_tokens,
+                    selection_rows if sparse else 0, draft_rows), heads=heads, head_dim=512,
                                            query_head_dim=RECORD_BYTES, ipc=package_storage.peer_storage),
-                coordinator=coordinator, peers=pool.share_pages(package_storage, group), slab=None)
+                coordinator=coordinator,
+                peers=pool.share_pages(package_storage, group) if "mla" in weights.config.layers else {}, slab=None,
+                candidates=(create_all_gather_runtime(group, device, max_rows=selection_rows,
+                    columns=4 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None))
         # Every MLA step gathers each rank's query and KV latent rows, padded to 16 bytes: one exchange for up to
         # eight rows, as vLLM's b12x latent transport carries, and one that prefill steps use in chunks.
         text = weights.config.text
@@ -278,7 +289,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                               device, buffers=cursor)
             vision_inputs = VisionInputs.allocate(device) if patches else None
             vision_storage = {}
-            if context is not None:
+            if context is not None and "mla" in weights.config.layers:
                 from .dcp import CONTEXT_WINDOW, RECORD_BYTES
 
                 # Serial prefill layers gather their context one window at a time into one slab beside the chunk's
@@ -303,7 +314,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     forwards, signatures, metadata = {}, {}, {}
     decoder_buffers = DecoderStorage.allocate(weights.config, shard, device, allocator=cursor, scratch={
         "total": total, "kda": {"output": kda_output},
-        "mla": {"output": mla_output}, "moe": {"output": moe_output},
+        "mla": {"output": mla_output}, "dsa": {"output": mla_output}, "moe": {"output": moe_output},
         **({"auxiliary": auxiliary[0]} if drafting else {})})
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
@@ -426,6 +437,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     release_unused()
     from .tokenizer import convert, runtime_assets
     assets = runtime_assets(convert(snapshot))
+    if weights.config.model_type == "kimi_k31":
+        from ignition.recipes.kimi31 import recipe as kimi31_recipe
+
+        assets["chat_template"] = {"path": str(Path(kimi31_recipe.__file__).with_name("assets") / "chat_template.jinja")}
     eos = weights.config.text["eos_token_id"]
     eos_ids = list(dict.fromkeys([*(eos if isinstance(eos, list) else [eos]), 163586]))
     frontend = prepare_frontend(snapshot, eos_token_ids=eos_ids, image_profile="moonvit" if patches else None)

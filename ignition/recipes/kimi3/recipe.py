@@ -12,9 +12,20 @@ from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recip
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
             package_storage=None, ranks=None):
+    from . import bootstrap
+    from .config import DSPARK_REPOSITORY, DSPARK_REVISION
+
+    return prepare_variant(snapshot, plan, bootstrap=bootstrap, draft_repository=DSPARK_REPOSITORY,
+        draft_revision=DSPARK_REVISION, compile_forwards=compile_forwards, kernel_cache=kernel_cache,
+        progress=progress, retain_graphs=retain_graphs, package_storage=package_storage, ranks=ranks)
+
+
+def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revision, compile_forwards,
+                    kernel_cache, progress, retain_graphs=False, package_storage=None, ranks=None):
     from ignition.preparation.rank_group import prepare_group
-    from .bootstrap import PreparationConfig, prepare_rank
-    from .config import DRAFT_DIRECTORY, DSPARK_REPOSITORY, DSPARK_REVISION
+    from .config import DRAFT_DIRECTORY
+
+    PreparationConfig, prepare_rank = bootstrap.PreparationConfig, bootstrap.prepare_rank
 
     if ranks is not None:
         raise ValueError("Kimi K3 preparation requires GPUs on one host")
@@ -28,7 +39,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         else:
             from huggingface_hub import snapshot_download
 
-            drafting["draft_checkpoint"] = snapshot_download(DSPARK_REPOSITORY, revision=DSPARK_REVISION, cache_dir=plan.hub_cache,
+            drafting["draft_checkpoint"] = snapshot_download(draft_repository, revision=draft_revision, cache_dir=plan.hub_cache,
                                                              allow_patterns=("config.json", "model.safetensors"))
     config = PreparationConfig(collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,

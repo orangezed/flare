@@ -12,7 +12,7 @@ import torch
 from ignition.components.weights import (DirectWeightLoader, SharedColumnReads, fp4_down_staging_bytes,
                                          quantize_bf16_linear_as_mxfp8)
 
-from .config import DSparkConfig, ModelConfig
+from .config import DSparkConfig, LatentDSparkConfig, ModelConfig
 from .residual import score_weight
 
 PREFIX = "language_model.model"
@@ -39,13 +39,13 @@ class ModelWeights:
              peers=None, vision=True):
         """``peers``, a host's Gloo group and peer storage, reads column-sharded projections once per host.
 
-        ``draft_checkpoint`` loads Red Hat DSpark from its checkpoint directory.
+        ``draft_checkpoint`` loads the declared sliding-window or full-context MLA DSpark model.
         Without ``vision``, the vision encoder stays on disk.
         """
         before = torch.cuda.memory_allocated(device)
         with KimiWeightLoader(manifest, device, shard=shard, progress=progress, online_mxfp8=online_mxfp8,
                               peers=peers) as loader:
-            config = loader.config
+            config = replace(loader.config, draft=None)
             embedding = loader.linear(f"{PREFIX}.embed_tokens", columns=shard.partition(config.hidden, alignment=64))
             norm, res_norm, res_proj = loader.load_tensors(tuple(f"{PREFIX}.{n}.weight" for n in
                 ("norm", "output_attn_res_norm", "output_attn_res_proj")))
@@ -62,8 +62,13 @@ class ModelWeights:
             from .dspark_weights import DraftWeights
 
             config = replace(config, draft=DSparkConfig.load(draft_checkpoint, config))
+            extra = {}
+            if isinstance(config.draft, LatentDSparkConfig):
+                from .latent_dspark import DraftWeights
+
+                extra["target_embedding"] = embedding
             draft = DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
-                                      online_mxfp8=online_mxfp8)
+                                      online_mxfp8=online_mxfp8, **extra)
         return cls(config, shard, embedding, norm, head, score_weight(res_norm, res_proj), layers,
                    loader.scale_scratch, torch.cuda.memory_allocated(device) - before, vision=vision, draft=draft)
 
@@ -166,7 +171,15 @@ class KimiWeightLoader(DirectWeightLoader):
                                   rows=shard.partition(c["kv_lora_rank"] + c["qk_rope_head_dim"])))
             gate = self.linear(a + ".g_proj", rows=head_rows)
             width = sum(x.shape[0] for x in latent)
-            attention["latent_gate"] = torch.cat((*latent, gate.new_zeros((-width % 8, gate.shape[1])), gate))
+            suffix = ()
+            if self.config.layers[index] == "dsa":
+                # Index heads are replicated: each context rank scores its own keys with all heads.
+                # The key and head-weight projections share the layer input with the MLA projections.
+                suffix = (self.linear(a + ".indexer.wk"), self.linear(a + ".indexer.weights_proj"))
+                attention["index_query"] = self.linear(a + ".indexer.wq_b")
+                attention["index_norm"] = self.load_tensor(a + ".indexer.k_norm.weight")
+                attention["index_bias"] = self.load_tensor(a + ".indexer.k_norm.bias")
+            attention["latent_gate"] = torch.cat((*latent, gate.new_zeros((-width % 8, gate.shape[1])), gate, *suffix))
         attention["output"] = self.linear(a + ".o_proj", columns=head_rows)
         if self.online_mxfp8:
             for key in ("input", "forget", "latent_gate", "q_b", "output"):

@@ -1,0 +1,127 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Gated Kimi DSA: learned selection over context-sharded FP8 keys and latent records."""
+
+import torch
+from b12x.attention import dense_mla
+
+from ignition.components.collectives import PreparedAllGather, PreparedLseReduceScatter
+from ignition.components.dense_mla import PreparedDenseMLA
+from ignition.components.distributed_topk import PreparedDistributedTopK, selected_local_records
+from ignition.components.fp8_indexer import PreparedFP8Indexer
+
+from .config import PAGE_TOKENS
+from .dcp import ContextShards, RECORD_BYTES
+from .projections import prepare_projection
+
+# Slice selection and its cross-rank candidate exchange so prefill scratch is context-independent.
+SELECTION_ROWS = 32
+INDEX_HEADS, INDEX_DIM, TOPK = 32, 128, 2048
+
+
+class PreparedDSA:
+    def __init__(self, weights, query_residual, key_input, weight_input, query, output, slots,
+                 metadata, cache, index_cache, *, context, session, coordinator, name, workspace,
+                 buffers, allocator=None, eps=1e-5):
+        self.metadata, self.query, self.output, self.slots = metadata, query, output, slots
+        self.query_residual = query_residual
+        self.eps = eps
+        self.key_input, self.weight_input = key_input, weight_input
+        self.norm_weight, self.norm_bias = weights["index_norm"], weights["index_bias"]
+        self.shards = ContextShards() if context is None else context.shards
+        rows, heads, _ = query.shape
+        self.rows = rows
+        self.step = min(rows, SELECTION_ROWS)
+        device = query.device
+
+        def allocate(key, shape, dtype):
+            existing = buffers.get(key)
+            if existing is None or existing.shape[0] < shape[0]:
+                buffers[key] = (torch.zeros(shape, dtype=dtype, device=device) if allocator is None
+                                else allocator.zeros(shape, dtype))
+            return buffers[key][:shape[0]]
+
+        self.index_query = allocate("index_query", (rows, INDEX_HEADS, INDEX_DIM), torch.bfloat16)
+        self.key = allocate("index_key", (rows, INDEX_DIM), torch.bfloat16)
+        self.project = prepare_projection(query_residual, weights["index_query"], self.index_query.view(rows, -1),
+            session=session, name=name + ".index_query", workspace=workspace)
+        capacity = self.step
+        self.pages = allocate("index_pages", (capacity, metadata.token_page_table.shape[1] * 2), torch.int32)
+        self.lengths = allocate("index_lengths", (capacity,), torch.int32)
+        self.active = allocate("index_active", (1,), torch.int32)
+        self.local = allocate("index_local", (capacity, TOPK), torch.int32)
+        self.scores = allocate("index_scores", (capacity, TOPK), torch.float32)
+        self.selected = allocate("index_selected", (capacity, TOPK), torch.int32)
+        self.physical = allocate("index_physical", (capacity, TOPK), torch.int32)
+        self.counts = allocate("index_counts", (capacity,), torch.int32)
+        self.offsets = torch.arange(capacity + 1, device=device, dtype=torch.int32)
+        self.page_halves = torch.arange(2, device=device, dtype=torch.int32)
+        self.stages = []
+        # Sequential slices and layers reuse the same selection buffers; each operator owns its binding.
+        from ignition.preparation.scratch import GraphBufferPool
+        if "index_workspace" not in buffers:
+            buffers["index_workspace"] = GraphBufferPool(device)
+        pool = buffers["index_workspace"]
+        for begin in range(0, rows, capacity):
+            end = min(begin + capacity, rows)
+            count = end - begin
+            stage_name = name + f".rows{begin}"
+            cursor = pool.cursor()
+            selector = PreparedFP8Indexer(self.index_query[begin:end], weight_input[begin:end], index_cache,
+                self.pages[:count], self.lengths[:count], self.active, self.local[:count], mode="decode",
+                session=session, name=stage_name + ".index", workspace=workspace, buffers=cursor,
+                scores=self.scores[:count], rotation="none")
+            merge = None
+            if self.shards.world > 1:
+                merge = PreparedDistributedTopK(self.local[:count], self.scores[:count], self.selected[:count],
+                    world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
+                    session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor)
+            gather = combine = None
+            q, attended = query[begin:end], output[begin:end]
+            if context is not None:
+                quantized = cursor.zeros(q.shape, torch.float8_e4m3fn)
+                q = cursor.zeros((count, heads * self.shards.world, RECORD_BYTES), torch.float8_e4m3fn)
+                attended = cursor.zeros((count, heads * self.shards.world, 512), torch.bfloat16)
+                lse = cursor.zeros((count, heads * self.shards.world), torch.float32)
+                gather = PreparedAllGather(quantized.view(count, -1), q.view(count, -1), runtime=context.heads,
+                    coordinator=coordinator, session=session, name=stage_name + ".gather_heads")
+                combine = PreparedLseReduceScatter(attended, lse, output[begin:end], runtime=context.heads,
+                    session=session, coordinator=coordinator, name=stage_name + ".combine")
+            else:
+                quantized = lse = None
+            caps = dense_mla.Caps(device=device, mode="decode", q_dtype=q.dtype, kv_dtype=cache.dtype,
+                num_q_heads=q.shape[1], max_total_q=count, max_batch=count, page_size=1,
+                max_cache_tokens=TOPK, max_page_table_width=TOPK, num_cache_pages=cache.shape[0] * PAGE_TOKENS,
+                use_cuda_graph=True, partial_dtype=torch.float32)
+            attention = PreparedDenseMLA(q, cache.view(-1, 1, RECORD_BYTES), attended,
+                self.physical[:count], self.counts[:count], self.offsets[:count + 1], caps=caps,
+                scale=192**-.5, session=session, name=stage_name + ".sparse_attention", workspace=workspace, lse=lse)
+            self.stages.append((begin, end, selector, merge, quantized, gather, attention, combine, lse))
+
+    def __call__(self):
+        m, shards = self.metadata, self.shards
+        self.project(self.query_residual)
+        self.key.copy_(torch.nn.functional.layer_norm(self.key_input.float(), (INDEX_DIM,),
+            self.norm_weight.float(), self.norm_bias.float(), self.eps).to(self.key.dtype))
+        self.stages[0][2].write_keys(self.key, self.slots)
+        for begin, end, selector, merge, quantized, gather, attention, combine, lse in self.stages:
+            count = end - begin
+            positions, pages = m.positions[begin:end], m.token_page_table[begin:end]
+            expanded = pages[:, :, None] * 2 + self.page_halves
+            self.pages[:count].copy_(torch.where(pages[:, :, None] >= 0, expanded, -1).flatten(1))
+            self.lengths[:count].copy_(shards.local_tokens((positions + 1).clamp_min(0)).to(torch.int32))
+            self.active.copy_(self.lengths[:count].max().reshape(1))
+            selector()
+            selected = self.local[:count] if merge is None else merge()
+            physical, lengths = selected_local_records(selected, positions, pages, world=shards.world,
+                rank=shards.owner, page_size=PAGE_TOKENS)
+            self.physical[:count].copy_(physical)
+            self.counts[:count].copy_(lengths)
+            if gather is not None:
+                quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
+                gather(quantized.view(count, -1))
+            attention()
+            if combine is not None:
+                combine(attention.output, lse)
+        return self.output

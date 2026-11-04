@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Kimi K3 geometry and checkpoint quantization contracts."""
+"""Kimi hybrid decoder geometry, sparse selection and checkpoint quantization contracts."""
 
 from dataclasses import dataclass
 import json
@@ -16,6 +16,8 @@ PAGE_TOKENS = 128
 DRAFT_DIRECTORY = "dspark"
 DSPARK_REPOSITORY = "RedHatAI/Kimi-K3-speculator.dspark"
 DSPARK_REVISION = "38a88101e0d46bb22134b9da340f381b954d40d4"
+LATENT_DSPARK_REPOSITORY = "Inferact/Kimi-K3.1-Pro-DSpark-preview"
+LATENT_DSPARK_REVISION = "5e654fbe920278f228a89519b06b2680aa56480f"
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,8 @@ class DSparkConfig:
 
     @classmethod
     def from_dict(cls, raw, target):
+        if raw.get("model_type") == "k3_dspark":
+            return LatentDSparkConfig.from_dict(raw, target)
         layer = raw.get("transformer_layer_config", {})
         aux = raw.get("aux_hidden_state_layer_ids", ())
         rope = layer.get("rope_parameters", {})
@@ -63,6 +67,10 @@ class DSparkConfig:
     def auxiliary_layers(self):
         """Decoder layers whose AttnRes input the draft reads; each follows the preceding layer's output."""
         return tuple(self.raw["aux_hidden_state_layer_ids"])
+
+    @property
+    def auxiliary_source(self):
+        return "attention_input"
 
     @property
     def noise_token(self):
@@ -104,10 +112,82 @@ class DSparkConfig:
 
 
 @dataclass(frozen=True)
+class LatentDSparkConfig:
+    """Causal MLA DSpark with full target-derived context and a shared target vocabulary head."""
+
+    raw: dict
+
+    @classmethod
+    def from_dict(cls, raw, target):
+        if raw.get("architectures") != ["K3DSparkModel"] or raw.get("model_type") != "k3_dspark":
+            raise ValueError("latent DSpark requires K3DSparkModel")
+        for field, expected in dict(hidden_act="silu", attention_bias=False, sample_from_anchor=True,
+                markov_head_type="vanilla", full_attention_causal=True, rope_interleave=True,
+                kv_lora_rank=512, q_lora_rank=1536, qk_nope_head_dim=128, qk_rope_head_dim=64,
+                v_head_dim=128).items():
+            if raw.get(field) != expected:
+                raise ValueError(f"unsupported latent DSpark {field}: {raw.get(field)!r}")
+        layers = raw.get("target_layer_ids", ())
+        if (raw.get("hidden_size") != target["hidden_size"] or raw.get("target_hidden_size") != target["hidden_size"]
+                or raw.get("vocab_size") != target["vocab_size"] or raw.get("draft_vocab_size") != target["vocab_size"]
+                or raw.get("target_num_hidden_layers") != target["num_hidden_layers"]
+                or raw.get("num_attention_heads") != target["num_attention_heads"]
+                or raw.get("max_position_embeddings") != target["max_position_embeddings"]
+                or raw.get("num_target_layers") != len(layers) or not layers or list(layers) != sorted(set(layers))
+                or any(type(i) is not int or not 0 <= i < target["num_hidden_layers"] for i in layers)
+                or type(raw.get("num_hidden_layers")) is not int or raw["num_hidden_layers"] <= 0
+                or raw.get("layer_types") != ["full_attention"] * raw["num_hidden_layers"]
+                or raw.get("sliding_window") is not None or raw.get("use_sliding_window") is not False
+                or raw.get("markov_rank", 0) <= 0 or not 0 <= raw.get("mask_token_id", -1) < target["vocab_size"]):
+            raise ValueError("latent DSpark geometry or target feature mapping is incompatible")
+        rope = raw.get("rope_parameters", {})
+        if (rope.get("rope_type") != "yarn" or rope.get("factor", 0) <= 0
+                or rope.get("rope_theta", 0) <= 0 or rope.get("original_max_position_embeddings", 0) <= 0
+                or rope.get("mscale") != 1. or rope.get("mscale_all_dim") != 0.):
+            raise ValueError("latent DSpark requires a complete YaRN rotary configuration")
+        return cls(raw)
+
+    @property
+    def text(self):
+        return self.raw
+
+    @property
+    def auxiliary_layers(self):
+        return tuple(self.raw["target_layer_ids"])
+
+    @property
+    def auxiliary_source(self):
+        return "residual_output"
+
+    @property
+    def noise_token(self):
+        return self.raw["mask_token_id"]
+
+    @property
+    def markov_rank(self):
+        return self.raw["markov_rank"]
+
+    @property
+    def layers(self):
+        return self.raw["num_hidden_layers"]
+
+    @property
+    def heads(self):
+        return self.raw["num_attention_heads"]
+
+    def validate_shard(self, shard):
+        for extent, alignment in ((self.heads, 1), (self.raw["hidden_size"], 64),
+                (self.raw["intermediate_size"], 32), (self.raw["q_lora_rank"], 1),
+                (self.raw["kv_lora_rank"] + self.raw["qk_rope_head_dim"], 1)):
+            shard.partition(extent, alignment=alignment)
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     text: dict
     vision: dict
-    draft: DSparkConfig | None = None
+    draft: DSparkConfig | LatentDSparkConfig | None = None
+    model_type: str = "kimi_k3"
 
     @classmethod
     def load(cls, snapshot):
@@ -116,12 +196,16 @@ class ModelConfig:
         draft = snapshot / DRAFT_DIRECTORY / "config.json"
         if not draft.is_file():
             return config
-        return cls(config.text, config.vision, DSparkConfig.from_dict(json.loads(draft.read_text()), config.text))
+        return cls(config.text, config.vision, DSparkConfig.from_dict(json.loads(draft.read_text()), config.text),
+                   config.model_type)
 
     @classmethod
     def from_dict(cls, raw):
-        if raw.get("model_type") != "kimi_k3" or raw.get("architectures") != ["KimiK3ForConditionalGeneration"]:
-            raise ValueError("Kimi K3 requires KimiK3ForConditionalGeneration")
+        architectures = {"kimi_k3": "KimiK3ForConditionalGeneration",
+                         "kimi_k31": "KimiK31ForConditionalGeneration"}
+        model_type = raw.get("model_type")
+        if model_type not in architectures or raw.get("architectures") != [architectures[model_type]]:
+            raise ValueError("Kimi requires matching K3 or K3.1 model_type and architecture")
         c = raw["text_config"]
         required = dict(model_type="kimi_linear", hidden_act="situ", activation_situ_beta=4.0,
             activation_situ_linear_beta=25.0, mla_use_nope=True, mla_use_output_gate=True,
@@ -149,6 +233,17 @@ class ModelConfig:
         linear, full = kda["kda_layers"], kda["full_attn_layers"]
         if sorted(linear + full) != list(range(1, c["num_hidden_layers"] + 1)):
             raise ValueError("Kimi K3 attention layers must partition the one-based decoder indices")
+        dsa = c.get("dsa_config")
+        if model_type == "kimi_k31":
+            if not isinstance(dsa, dict) or dsa.get("dsa_layers") != full:
+                raise ValueError("Kimi K3.1 DSA layers must match the non-KDA layer indices")
+            for name, value in dict(index_topk=2048, index_head_dim=128, index_num_heads=32,
+                    index_rope_dim=0, index_k_norm_type="layernorm", index_topk_freq=1,
+                    index_skip_topk_offset=1).items():
+                if dsa.get(name) != value:
+                    raise ValueError(f"unsupported Kimi K3.1 {name}: {dsa.get(name)!r}")
+        elif dsa is not None:
+            raise ValueError("DSA configuration requires the Kimi K3.1 architecture")
         q = c["quantization_config"]
         if (q.get("quant_method") != "compressed-tensors" or q.get("format") != "mxfp4-pack-quantized"
                 or q.get("quantization_status") != "compressed" or q.get("kv_cache_scheme") is not None
@@ -176,7 +271,7 @@ class ModelConfig:
                 raise ValueError(f"unsupported Kimi K3 vision {name}: {vision.get(name)!r}")
         if raw.get("media_placeholder_token_id") != 163605 or raw.get("image_placeholder") != "<|kimi_image_placeholder|>":
             raise ValueError("unsupported Kimi K3 image placeholder")
-        return cls(c, vision)
+        return cls(c, vision, model_type=model_type)
 
     @property
     def hidden(self):
@@ -189,7 +284,9 @@ class ModelConfig:
     @property
     def layers(self):
         linear = set(self.text["linear_attn_config"]["kda_layers"])
-        return tuple("kda" if i + 1 in linear else "mla" for i in range(self.text["num_hidden_layers"]))
+        sparse = set((self.text.get("dsa_config") or {}).get("dsa_layers", ()))
+        return tuple("kda" if i + 1 in linear else "dsa" if i + 1 in sparse else "mla"
+                     for i in range(self.text["num_hidden_layers"]))
 
     def validate_shard(self, shard: TensorParallelShard):
         c = self.text

@@ -975,6 +975,63 @@ always enabled; requests to disable thinking are ignored without an error.
 Effort defaults to `max`; requests can select `low`, `high`, or `max` and
 override sampling defaults. Preserve assistant reasoning in conversation history.
 
+## Kimi K3.1 Pro
+
+Prepare `moonshotai/Kimi-K3.1-Pro` on sixteen RTX PRO 6000 Blackwell GPUs with
+96 GB each. The `kimi-k3.1-pro` alias includes MoonViT
+image support and the full-context MLA draft
+`Inferact/Kimi-K3.1-Pro-DSpark-preview`:
+
+Preparation requires FlashInfer's unrotated FP8 index-query support. For
+development with paired source checkouts, install the FlashInfer checkout
+containing `glm_pool.plan_queries(..., rotation="none")` after setting up the
+preparation environment:
+
+```sh
+uv pip install --python .venv/bin/python --no-deps -e ../flashinfer
+
+.venv/bin/ignition export kimi-k3.1-pro --gpus 0-15 \
+  --max-concurrency 32 --image-concurrency 4 --prefill-chunk-size 4096 \
+  --mtp-draft-tokens 7 --speculative-token-capacity 128 \
+  --speculative-graph-budget 64 --autotune-effort default --compile-workers 64
+
+./flare/target/release/flare run moonshotai/Kimi-K3.1-Pro --gpus 0-15 \
+  --host 127.0.0.1 --port 8000
+```
+
+This integration has been tested at component level; complete model export and
+serving remain untested.
+
+The decoder retains K3's KDA, attention residuals, latent MoE and image encoder.
+Its 24 sparse layers use 32 learned index heads to select 2,048 causal positions.
+Index queries and keys quantize directly to FP8 with power-of-two scales;
+they do not use Hadamard rotation. With context parallelism, every rank scores
+its own history, exchanges local top-k candidates and computes the global
+top-k before attending to its selected local records. Partial attention outputs
+combine using their log-sum-exp. Sparse prefill processes query slices with
+bounded selection scratch.
+
+Target and draft latent records use per-tensor FP8 E4M3 storage, matching the
+per-tensor FP8 path in the model's published serving implementation. Index
+keys carry independent FP32 power-of-two scales. Index pages, target latent
+pages, full draft history and KDA continuations participate in the same
+snapshot and restore operations. The draft consumes residual outputs from
+target layers 75, 79, 83, 87 and 91 (zero-based), and uses causal MLA with YaRN
+rotary embeddings. Its vocabulary embedding and head share the target's
+weights; its confidence head is not used by the shared proposal sampler.
+
+BF16 projections remain BF16 by default. Routed experts keep MXFP4 weights
+and losslessly compressed block scales. `--online-mxfp8` is off by default;
+use it only when explicitly choosing conversion of eligible dense weights.
+`--language-model-only` omits image preparation. `--no-mtp` omits draft weights
+and history; loading an existing package with `--mtp-draft-tokens 0` retains
+the prepared layout and selects ordinary execution.
+
+Sampling defaults are temperature 1 and top-p 0.95 with no top-k filter.
+Reasoning defaults to `max`. Preserve assistant reasoning and tool calls in
+conversation history. The checkpoint encoder also accepts `low`, `medium`
+and `high` reasoning effort and preserves whitespace-only reasoning content.
+
 ## MiniMax M3.1 Flash
 
 The `minimax-m3-1-flash` alias selects

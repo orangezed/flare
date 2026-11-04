@@ -294,7 +294,10 @@ class PreparedDecoder:
                 eps=config.text["rms_norm_eps"], records=kda_records.layer(index) if mode == "verify" else None,
                 **kwargs) if kind == "kda" else
                 PreparedMLA(w["attention"], source, metadata, pool.attention(index), context=context,
-                            peers=None if context is None else context.peers[index], coordinator=coordinator,
+                            index_cache=pool.index(index) if kind == "dsa" else None,
+                            eps=config.text["rms_norm_eps"],
+                            peers=context.peers[index] if context is not None and kind == "mla" else None,
+                            coordinator=coordinator,
                             # The smallest latent exchange that carries the step, else the largest in chunks.
                             latents=next((r for r in latent_runtimes if source.shape[0] <= r.max_batch_size),
                                          latent_runtimes[-1] if latent_runtimes else None),
@@ -380,7 +383,8 @@ class PreparedDecoder:
         for index, (w, attention, mlp, reduce) in enumerate(self.layers):
             committed, boundary = -(-index // size), index % size == 0
             mixture = None
-            if index in self.auxiliary_layers:
+            if (index in self.auxiliary_layers
+                    and self.weights.config.draft.auxiliary_source == "attention_input"):
                 column = self.auxiliary_layers.index(index) * self.residual.prefix.shape[1]
                 mixture = self.auxiliary[:, column:column + self.residual.prefix.shape[1]]
             hidden = self.residual.mix(delta, mode, sources=committed, write=index // size if boundary else -1,
@@ -390,6 +394,10 @@ class PreparedDecoder:
                 score=w["mlp_res_score"], norm=w["post_attention_layernorm"], eps=eps, output_eps=eps,
                 output=self.mlp_input)
             delta, mode = reduce(mlp(hidden)), ADD
+            if (index in self.auxiliary_layers
+                    and self.weights.config.draft.auxiliary_source == "residual_output"):
+                column = self.auxiliary_layers.index(index) * self.residual.prefix.shape[1]
+                self.auxiliary[:, column:column + self.residual.prefix.shape[1]].copy_(self.residual.prefix + delta)
         hidden = self.residual.mix(delta, mode, sources=-(-len(self.layers) // size), write=-1,
             score=self.weights.output_res_score, norm=self.weights.norm, eps=eps, output_eps=eps)
         if self.scoring is not None:

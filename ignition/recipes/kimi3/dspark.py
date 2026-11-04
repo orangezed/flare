@@ -252,7 +252,7 @@ class PreparedDraft:
     """Project and gather draft logits for sampled proposals."""
 
     def __init__(self, weights, scratch, metadata, pool, *, block, runtime, vocabulary_runtime, embedding_runtime,
-                 coordinator, session, name, workspace):
+                 coordinator, session, name, workspace, latent_runtimes=(), context=None):
         self.weights, self.scratch, self.metadata = weights, scratch, metadata
         config, draft = weights.config, weights.draft
         eps = config.draft.text["rms_norm_eps"]
@@ -260,12 +260,19 @@ class PreparedDraft:
             scratch.embedding, runtime=embedding_runtime, coordinator=coordinator,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")
         self.layers = []
+        from .config import LatentDSparkConfig
+
+        attention, attention_options = DraftAttention, {}
+        if isinstance(config.draft, LatentDSparkConfig):
+            from .latent_dspark import DraftAttention as attention
+
+            attention_options = dict(latent_runtimes=latent_runtimes, context=context)
         for index, layer_weights in enumerate(draft.layers):
             layer = Qwen3DecoderLayer.__new__(Qwen3DecoderLayer)
             torch.nn.Module.__init__(layer)
-            layer.self_attn = DraftAttention(index, layer_weights, config, scratch, metadata, pool, block,
+            layer.self_attn = attention(index, layer_weights, config, scratch, metadata, pool, block,
                 runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.layer{index}.attention",
-                workspace=workspace)
+                workspace=workspace, **attention_options)
             layer.mlp = DraftMLP(layer_weights.mlp, scratch, runtime=runtime, coordinator=coordinator,
                                  session=session, name=f"{name}.layer{index}.mlp", workspace=workspace)
             layer.input_layernorm = canonical_norm(layer_weights.input_norm, eps)
@@ -350,11 +357,21 @@ class SpeculativePreparation:
         # The anchor predicts the first draft, so a block holds one position per draft.
         self.block_size, self.logit_offset = max(1, draft_tokens), 0
         self.context_buffers = {}
+        from .config import LatentDSparkConfig
+
+        context_forward, scratch_type, context_options, draft_options = PreparedContext, DraftScratch, {}, {}
+        if isinstance(weights.config.draft, LatentDSparkConfig):
+            from .latent_dspark import PreparedContext as context_forward, DraftScratch as scratch_type
+
+            context_options = dict(context=collectives.get("context"))
+            draft_options = dict(latent_runtimes=collectives.get("latent_runtimes", ()), **context_options)
         self.forwards = DraftForwards(decoder,
-            partial(PreparedContext, runtime=context_runtime, coordinator=coordinator, buffers=self.context_buffers),
-            partial(PreparedDraft, block=self.block_size, embedding_runtime=collectives["embedding_runtime"]),
+            partial(context_forward, runtime=context_runtime, coordinator=coordinator, buffers=self.context_buffers,
+                    **context_options),
+            partial(PreparedDraft, block=self.block_size, embedding_runtime=collectives["embedding_runtime"],
+                    **draft_options),
             PreparedMarkov)
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = torch.zeros_like(requests.generation), torch.zeros_like(requests.generation)
-        self.draft_scratch = DraftScratch.allocate(weights.config, weights.shard,
+        self.draft_scratch = scratch_type.allocate(weights.config, weights.shard,
             requests.capacity * self.block_size, self.block_size, pool.backing.device)

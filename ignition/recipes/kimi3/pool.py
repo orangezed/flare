@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""KDA continuation rows and paged, unrotated E4M3 MLA latent records."""
+"""KDA continuation rows, E4M3 latent history and scaled FP8 index records."""
 
 import torch
 
@@ -10,16 +10,22 @@ from ignition.components.paged_state import PagedStateStorage
 from ignition.components.recurrent import DeltaState
 from ignition.components.state import StateLayout
 
-from .config import PAGE_TOKENS
+from .config import PAGE_TOKENS, LatentDSparkConfig
 from .dcp import RECORD_BYTES
 
 
 def page_specs(config):
-    """Per-rank storage for one page of target latent records."""
+    """Per-rank history regions with matching partial-page snapshots in continuation rows."""
     # E4M3 records with a unit scale, as vLLM's Kimi K3 serving stores its latent cache (--kv-cache-dtype fp8).
     for index, kind in enumerate(config.layers):
-        if kind == "mla":
+        if kind in ("mla", "dsa"):
             yield f"layer{index}.latent", (PAGE_TOKENS * RECORD_BYTES,)
+        if kind == "dsa":
+            # Each model page holds two planar index pages of 64 FP8 keys and FP32 scales.
+            yield f"layer{index}.index", (PAGE_TOKENS * 132,)
+    if isinstance(config.draft, LatentDSparkConfig):
+        for index in range(config.draft.layers):
+            yield f"draft{index}.latent", (PAGE_TOKENS * RECORD_BYTES,)
 
 
 def page_bytes(config):
@@ -37,7 +43,7 @@ def continuation_layout(config, world_size, *, speculative_tokens=0):
             regions.extend(((f"layer{index}.convolution", (3 * heads * 128, 3 + speculative_tokens), torch.bfloat16),
                             (f"layer{index}.recurrent", (heads, 128, 128), torch.float32)))
     regions.extend((name, shape, torch.uint8) for name, shape in page_specs(config))
-    if speculative_tokens and config.draft is not None:
+    if speculative_tokens and config.draft is not None and not isinstance(config.draft, LatentDSparkConfig):
         d = config.draft
         for layer in range(d.layers):
             for kind in ("key", "value"):
@@ -58,6 +64,12 @@ class ContinuationPool(PagedStateStorage):
 
     def attention(self, layer):
         return self.pages[f"layer{layer}.latent"].view(torch.float8_e4m3fn).view(-1, PAGE_TOKENS, RECORD_BYTES)
+
+    def index(self, layer):
+        return self.pages[f"layer{layer}.index"].view(-1, 64 * 132)
+
+    def draft_attention(self, layer):
+        return self.pages[f"draft{layer}.latent"].view(torch.float8_e4m3fn).view(-1, PAGE_TOKENS, RECORD_BYTES)
 
     def share_pages(self, storage, group):
         """Every rank's address of each MLA layer's page pool, {layer: [world] int64}, mapped through CUDA IPC.

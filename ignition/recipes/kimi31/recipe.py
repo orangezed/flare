@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Kimi K3.1 Pro: gated sparse attention, full-context MLA draft and MXFP4 experts."""
+
+from dataclasses import replace
+from types import MappingProxyType
+
+from ignition.recipes.declaration import Checkpoint, RankCosts, SamplingDefaults, SamplingRange
+from ignition.recipes.kimi3.config import LATENT_DSPARK_REPOSITORY, LATENT_DSPARK_REVISION
+from ignition.recipes.kimi3.recipe import RECIPE as KIMI3, prepare_variant
+
+
+def prepare(snapshot, plan, **kwargs):
+    from . import bootstrap
+
+    return prepare_variant(snapshot, plan, bootstrap=bootstrap, draft_repository=LATENT_DSPARK_REPOSITORY,
+                           draft_revision=LATENT_DSPARK_REVISION, **kwargs)
+
+
+RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepare=prepare,
+    # https://huggingface.co/moonshotai/Kimi-K3.1-Pro#3-evaluation-results
+    sampling_defaults=SamplingDefaults(temperature=1., top_p=.95, top_k=-1,
+                                      ranges={"top_p": SamplingRange(.95, 1.)}),
+    checkpoints=(Checkpoint(alias="kimi-k3.1-pro", repository="moonshotai/Kimi-K3.1-Pro",
+        revision="6d0a0202956796543364d666ab19c6ad1a494ee1", architecture="KimiK31ForConditionalGeneration",
+        stored_bytes=1_561_217_377_280, device_bytes=1_496_756_986_630, draft_bytes=5_373_504_512),),
+    online_mxfp8=False, language_model_only=False,
+    ranks=MappingProxyType({16: RankCosts(state_row_bytes=32_869_632, page_bytes=2_543_616,
+                                        graph_bytes=9 << 29, page_tokens=128 * 16)}),
+    plain_ranks=MappingProxyType({16: RankCosts(state_row_bytes=30_275_328, page_bytes=2_174_976,
+                                              graph_bytes=9 << 29, page_tokens=128 * 16)}))

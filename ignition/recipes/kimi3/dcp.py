@@ -137,10 +137,12 @@ def write_records(latent, indices, table):
 
 @dataclass(frozen=True)
 class ContextParallel:
-    """Decode context parallel resources shared by every MLA layer of a rank: its shards, the b12x head
-    exchange (DcpAllToAll), the collective coordinator, every rank's address of each layer's page pool
-    ({layer: [world] int64}) and the prefill slab [window + chunk, 576] E4M3 that serial prefill layers reuse:
-    one window of earlier context, then the chunk's own records."""
+    """Shared context placement and head/LSE exchanges for latent attention.
+
+    Dense prefill uses peer page addresses ({layer: [world] int64}) and an E4M3
+    context slab [window + chunk, 576]. Sparse attention exchanges selection
+    candidates and reads local records; its peer-address map is empty and it has no slab.
+    """
 
     shards: ContextShards
     heads: object
@@ -148,3 +150,4 @@ class ContextParallel:
     peers: dict
     slab: torch.Tensor
     window: int = CONTEXT_WINDOW
+    candidates: object = None

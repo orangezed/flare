@@ -29,7 +29,8 @@ FP8 = torch.float8_e4m3fn
 
 class PreparedMLA:
     def __init__(self, weights, source, metadata, cache, *, mode, session, name, workspace, buffers, latents=None,
-                 coordinator=None, context=None, peers=None, allocator=None):
+                 coordinator=None, context=None, peers=None, allocator=None, index_cache=None,
+                 eps=1e-6, rotary=None, gated=True):
         tokens, hidden = source.shape
         heads = weights["key"].shape[0]
         device = source.device
@@ -52,6 +53,7 @@ class PreparedMLA:
         self.attended = buffer("attended", heads, 512)
         self.expanded = buffer("expanded", heads * 128)
         self.weights, self.metadata, self.mode, self.cache = weights, metadata, mode, cache
+        self.eps, self.rotary, self.gated = eps, rotary, gated
         # Each rank projects only its query and KV latent rows beside its output gate, and the ranks gather the
         # latents, as vLLM's VLLM_KIMI_SHARD_QKV_A does: every rank keeps and reads a sixteenth of the latent
         # projection. A single rank (``latents`` None) projects every latent row itself.
@@ -61,12 +63,12 @@ class PreparedMLA:
         if latents is None:
             self.local = buffer("local", local_width)
             self.input = self.local[:, :latent_width]
-            self.gate = self.local[:, latent_width:]
+            self.gate = self.local[:, latent_width:latent_width + heads * 128]
         else:
             rows, width = latents.max_batch_size, latents.query_head_dim
             self.input = buffer("input", latent_width)
             self.local = buffer("local", local_width, rows=rows)
-            self.gate = self.local[:, width:]
+            self.gate = self.local[:, width:width + heads * 128]
             # The exchange reads contiguous rows, which a single row's latent columns already are.
             self.staged = tokens > 1
             self.send = buffer("send", width, rows=rows) if self.staged else self.local[:, :width]
@@ -84,7 +86,16 @@ class PreparedMLA:
         common = dict(device=device, kv_dtype=FP8, page_size=PAGE_TOKENS, use_cuda_graph=True,
                       partial_dtype=torch.float32)
         scale = 192 ** -.5
-        if world == 1:
+        self.sparse = None
+        if index_cache is not None:
+            from .dsa import PreparedDSA
+
+            index_begin = (latent_width if latents is None else latents.query_head_dim) + heads * 128
+            self.sparse = PreparedDSA(weights, self.query_norm, self.local[:, index_begin:index_begin + 128],
+                self.local[:, index_begin + 128:index_begin + 160], self.absorbed, self.attended, self.slots,
+                metadata, cache, index_cache, context=context, session=session, coordinator=coordinator,
+                name=name, workspace=workspace, buffers=buffers.setdefault("selection", {}), allocator=allocator, eps=eps)
+        elif world == 1:
             # Every rank holds every record: attend with this rank's heads; b12x quantizes the BF16 query.
             self.lengths = torch.zeros_like(metadata.lengths)
             caps = dense_mla.Caps(mode=mode if mode in ("decode", "verify") else "extend", q_dtype=torch.bfloat16,
@@ -133,16 +144,21 @@ class PreparedMLA:
             q, kv = query // world, RECORD_BYTES // world
             self.input[:, :query].view(tokens, world, q).copy_(gathered[:, :, :q])
             self.input[:, query:].view(tokens, world, kv).copy_(gathered[:, :, q:q + kv])
-        rms_norm_columns(self.input[:, :-RECORD_BYTES], self.weights["query_norm"], self.query_norm, 1e-6)
-        rms_norm_columns(self.input[:, -RECORD_BYTES:-64], self.weights["kv_norm"], self.latent[:, :512], 1e-6)
+        rms_norm_columns(self.input[:, :-RECORD_BYTES], self.weights["query_norm"], self.query_norm, self.eps)
+        rms_norm_columns(self.input[:, -RECORD_BYTES:-64], self.weights["kv_norm"], self.latent[:, :512], self.eps)
         self.latent[:, 512:].copy_(self.input[:, -64:])
         p["q_b"](self.query_norm)
+        if self.rotary is not None:
+            self.rotary.apply(self.query, m.positions)
+            self.rotary.apply(self.latent, m.positions)
         self.absorbed[:, :, :512].copy_(torch.bmm(self.query[:, :, :128].transpose(0, 1), self.weights["key"]).transpose(0, 1))
         self.absorbed[:, :, 512:].copy_(self.query[:, :, 128:])
         # Each rank stores the positions it owns; every position is owned when no ranks share the context.
         self.slots.copy_(shards.token_slots(m.positions, m.token_page_table))
         write_records(self.latent, self.slots, self.cache.view(-1, RECORD_BYTES))
-        if shards.world == 1:
+        if self.sparse is not None:
+            self.sparse()
+        elif shards.world == 1:
             self.lengths.copy_(torch.where(m.lengths > 0, m.starts + m.lengths, 0))
             self.attention()
         elif self.mode == "prefill":
@@ -156,7 +172,8 @@ class PreparedMLA:
             self.attention()
             self.combine(self.partial, self.lse)
         self.expanded.copy_(torch.bmm(self.attended.transpose(0, 1), self.weights["value"]).transpose(0, 1).flatten(1))
-        sigmoid_gate(self.expanded, self.gate)
+        if self.gated:
+            sigmoid_gate(self.expanded, self.gate)
         return p["output"](self.expanded)
 
 
