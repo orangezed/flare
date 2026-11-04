@@ -38,6 +38,10 @@ def test_manifest_has_separate_tuners_without_host_uploads(monkeypatch):
     assert manifest["tuning_graphs"] == [dict(name="choose", handle=12,
                                               outputs=["selector"], status_buffer="status")]
     assert manifest["graphs"][0]["tuned_bindings"] == [dict(buffer="selector", tuning_graph="choose")]
+    described = execution(tuning_graphs={"choose": TuningGraph(object(), ("selector",), "status",
+                                                               {"operation": "all_reduce", "bytes": 64})})
+    monkeypatch.setattr(described, "_validate_resources", lambda: (9, [11, 12], spans))
+    assert described.manifest()["tuning_graphs"][0]["description"] == '{"bytes":64,"operation":"all_reduce"}'
     assert {binding["buffer_name"] for binding in manifest["graphs"][0]["input_bindings"]} == {
         "frame_index", "submission_sequence", "tokens"}
 
@@ -175,6 +179,11 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     registry.groups = {"key": producer}
     registry.owner_groups = {id(owner): "key"}
     registry.captures[id(serving)] = {id(owner)}
+    producer.gather, producer.cache_policy = False, "cold"
+    producer.specs[0].profiles = ((2, 32), (4, 8))
+    producer.state = SimpleNamespace(query=SimpleNamespace(surface="PCIeAllReduce.all_reduce",
+        call=dict(transport="joint_bandwidth", threads=512, blocks=64)))
+    producer.inputs = SimpleNamespace(source=torch.empty((4, 5120), dtype=torch.bfloat16))
     buffers, tuners, bindings, resources = registry.catalog({"decode": serving})
     output = buffers[bindings["decode"][0].buffer]
     assert output.dtype == torch.int32 and output.data_ptr() == selector.data_ptr()
@@ -185,6 +194,29 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
         dict(name="collective-tuning-0", graph=11, executable=12)]
     assert events == ["device-enter", "wait", "capture-enter", "run", "capture-exit",
                       "instantiate", "drain", "device-exit"]
+    assert tuners["collective-tuning-0"].description == {
+        "operation": "all_reduce", "surface": "PCIeAllReduce.all_reduce", "transport": "joint_bandwidth",
+        "threads": 512, "blocks": 64, "cluster_size": 1, "dtype": "bfloat16", "shape": [4, 5120],
+        "bytes": 40960, "cache_policy": "cold", "consumers": 1,
+        "profiles": [{"value": (2 << 16) | 32, "mode": "bulk_push", "active_ctas": 32},
+                     {"value": (4 << 16) | 8, "mode": "pull", "active_ctas": 8}]}
+
+
+def test_startup_race_descriptions_name_modes_by_operation():
+    from ignition.preparation.startup_tuning import describe_startup_race
+
+    def race(gather, call):
+        return SimpleNamespace(gather=gather, cache_policy="warm", specs=(SimpleNamespace(profiles=((0, 4), (1, 16))),),
+            state=SimpleNamespace(query=SimpleNamespace(surface="surface", call=call)),
+            inputs=SimpleNamespace(source=torch.empty((2, 8), dtype=torch.uint8)))
+    reduce = describe_startup_race(race(False, dict(transport="joint_latency", threads=512, blocks=64)))
+    gather = describe_startup_race(race(True, dict(gather_transport="joint", block_limit=16)))
+    # Modes 0 and 1 mean different profiles for the two operations.
+    assert (reduce["operation"], gather["operation"]) == ("all_reduce", "all_gather")
+    assert [p["mode"] for p in reduce["profiles"]] == ["full", "payload_rsag"]
+    assert [p["mode"] for p in gather["profiles"]] == ["barrier", "word_exchange"]
+    assert [p["value"] for p in gather["profiles"]] == [4, (1 << 16) | 16]
+    assert (gather["blocks"], gather["threads"]) == (16, None)
 
 
 def test_storage_compiled_collective_records_actual_consumer(monkeypatch):

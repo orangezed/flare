@@ -152,7 +152,7 @@ class CollectiveStartupTuning:
                     producer.run()
                 graph.instantiate()
                 stream.synchronize()
-            tuners[name] = TuningGraph(graph, tuple(outputs), status)
+            tuners[name] = TuningGraph(graph, tuple(outputs), status, describe_startup_race(producer))
             resources.append(producer)
             for serving, owners in consumers.items():
                 selected = {id(owner): owner for owner in self.owners if id(owner) in owners
@@ -161,6 +161,33 @@ class CollectiveStartupTuning:
                 bindings.setdefault(serving, []).extend(TunedBinding(field, name) for field in sorted(fields))
         torch.cuda.synchronize(self.session.device.ordinal)
         return buffers, tuners, bindings, tuple(resources)
+
+
+def describe_startup_race(producer):
+    """Name the collective a startup race selects for and decode its candidate profiles.
+
+    Joint all-reduce and all-gather profiles share their encoding (mode << 16 |
+    active CTAs) but not their mode names, so the operation travels with them.
+    """
+    from b12x.comm.pcie._joint_profile import JOINT_MODES
+
+    state, spec = producer.state, producer.specs[0]
+    call, source = state.query.call, producer.inputs.source
+    if producer.gather:
+        operation, transport, blocks = "all_gather", call["gather_transport"], call["block_limit"]
+        modes = {0: "barrier", 1: "word_exchange"}
+    else:
+        operation, transport, blocks = "all_reduce", call["transport"], call["blocks"]
+        modes = {code: mode for mode, code in JOINT_MODES.items()}
+    return {
+        "operation": operation, "surface": getattr(state.query, "surface", None), "transport": transport,
+        "threads": call.get("threads"), "blocks": blocks, "cluster_size": call.get("joint_cluster_size", 1),
+        "dtype": str(source.dtype).removeprefix("torch."), "shape": list(source.shape),
+        "bytes": source.numel() * source.element_size(), "cache_policy": producer.cache_policy,
+        "consumers": len(producer.specs),
+        "profiles": [{"value": (mode << 16) | active, "mode": modes[mode], "active_ctas": active}
+                     for mode, active in spec.profiles],
+    }
 
 
 def register_collective(owner, session):

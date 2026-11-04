@@ -368,6 +368,23 @@ impl InputCopyBatches {
     }
 }
 
+/// Preparation's description of each tuning graph, keyed by the outputs it publishes.
+fn output_descriptions(manifest: &ExecutionManifest) -> std::collections::HashMap<&str, serde_json::Value> {
+    manifest.tuning_graphs.iter().filter_map(|graph| {
+        serde_json::from_str::<serde_json::Value>(&graph.description).ok().map(|value| (graph, value))
+    }).flat_map(|(graph, value)| graph.outputs.iter().map(move |output| (output.as_str(), value.clone())))
+        .collect()
+}
+
+/// The described profile a published value selects, if the description lists it.
+fn described_profile(description: &serde_json::Value, value: u32) -> Option<&serde_json::Value> {
+    description["profiles"].as_array()?.iter().find(|profile| profile["value"].as_u64() == Some(u64::from(value)))
+}
+
+fn selector_value(bytes: &[u8]) -> Option<u32> {
+    bytes.get(..4).and_then(|word| <[u8; 4]>::try_from(word).ok()).map(u32::from_ne_bytes)
+}
+
 pub(super) fn collective_choices_overview(
     manifest: &ExecutionManifest,
     choices: &[Vec<(String, Vec<u8>)>],
@@ -375,19 +392,29 @@ pub(super) fn collective_choices_overview(
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Write;
 
-    fn describe_value(bytes: &[u8]) -> String {
+    let descriptions = output_descriptions(manifest);
+    let describe_value = |buffer: &str, bytes: &[u8]| -> String {
         let Ok(word) = <[u8; 4]>::try_from(bytes) else {
             return format!("raw={bytes:02x?}");
         };
-        format!("0x{:08x}", u32::from_ne_bytes(word))
-    }
-    fn describe<'a>(values: impl Iterator<Item = &'a [u8]>) -> String {
-        values.map(describe_value).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(", ")
-    }
+        let value = u32::from_ne_bytes(word);
+        match descriptions.get(buffer).and_then(|description| {
+            described_profile(description, value).map(|profile| (description, profile))
+        }) {
+            Some((description, profile)) => format!("{} {}×{} (0x{value:08x})",
+                description["operation"].as_str().unwrap_or("collective"),
+                profile["mode"].as_str().unwrap_or("unknown"), profile["active_ctas"]),
+            None => format!("0x{value:08x}"),
+        }
+    };
+    let describe = |values: &mut dyn Iterator<Item = (&str, &[u8])>| -> String {
+        values.map(|(buffer, bytes)| describe_value(buffer, bytes)).collect::<BTreeSet<_>>()
+            .into_iter().collect::<Vec<_>>().join(", ")
+    };
     let mut totals = BTreeMap::new();
     let mut outputs = BTreeMap::new();
     for group in choices {
-        let name = describe(group.iter().map(|(_, bytes)| bytes.as_slice()));
+        let name = describe(&mut group.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
         *totals.entry(name).or_insert(0usize) += 1;
         outputs.extend(group.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
     }
@@ -400,14 +427,39 @@ pub(super) fn collective_choices_overview(
     graphs.sort_by_key(|graph| (graph.kind as u8, graph.batch_capacity, graph.token_capacity,
         graph.packed_tokens(), graph.prefill_capacity, graph.draft_tokens, graph.name.as_str()));
     for graph in graphs {
-        let values = graph.tuned_bindings.iter().filter_map(|binding| outputs.get(binding.buffer.as_str()).copied());
-        let selected = describe(values);
+        let mut values = graph.tuned_bindings.iter().filter_map(|binding| {
+            outputs.get(binding.buffer.as_str()).map(|bytes| (binding.buffer.as_str(), *bytes))
+        });
+        let selected = describe(&mut values);
         writeln!(text, "  {} · {:?} b={} t={} rows={} drafts={} prefill={} · {}",
             graph.name, graph.kind, graph.batch_capacity, graph.token_capacity,
             graph.packed_tokens(), graph.draft_tokens, graph.prefill_capacity,
             if selected.is_empty() { "unavailable" } else { &selected }).unwrap();
     }
     text
+}
+
+/// Each referenced tuning graph with preparation's description, the values it
+/// published and the serving graphs that bind them.
+pub(super) fn collective_choices_json(
+    manifest: &ExecutionManifest,
+    choices: &[Vec<(String, Vec<u8>)>],
+) -> serde_json::Value {
+    manifest.referenced_tuning_graphs().iter().zip(choices).map(|(&index, outputs)| {
+        let graph = &manifest.tuning_graphs[index];
+        let description = serde_json::from_str::<serde_json::Value>(&graph.description).ok();
+        let selected = outputs.iter().map(|(buffer, bytes)| {
+            let value = selector_value(bytes);
+            let profile = description.as_ref().zip(value)
+                .and_then(|(description, value)| described_profile(description, value)).cloned();
+            serde_json::json!({"buffer": buffer, "value": value, "profile": profile})
+        }).collect::<Vec<_>>();
+        let graphs = manifest.graphs.iter()
+            .filter(|serving| serving.tuned_bindings.iter().any(|binding| binding.tuning_graph == graph.name))
+            .map(|serving| serving.name.as_str()).collect::<Vec<_>>();
+        serde_json::json!({"tuning_graph": graph.name, "description": description,
+            "selected": selected, "graphs": graphs})
+    }).collect()
 }
 
 struct Resources {
@@ -608,6 +660,12 @@ impl GraphExecutor {
 
     fn report_collective_choices(&self) {
         eprint!("{}", collective_choices_overview(&self.manifest, &self.diagnostic_choices));
+    }
+
+    /// Startup tuning results for clients: each tuning graph with preparation's
+    /// description, the values it published and the serving graphs that use them.
+    pub(crate) fn collective_choices(&self) -> serde_json::Value {
+        collective_choices_json(&self.manifest, &self.diagnostic_choices)
     }
 
     pub(super) fn finish_startup(&mut self) -> Result<()> {

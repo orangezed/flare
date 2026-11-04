@@ -198,6 +198,11 @@ impl TensorParallelExecutor {
         self.local.manifest()
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn collective_choices(&self) -> serde_json::Value {
+        self.local.collective_choices()
+    }
+
     pub fn can_submit(&self, grammar: bool) -> bool {
         self.poison.is_none()
             && self.shutdown.is_none()

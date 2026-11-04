@@ -261,6 +261,10 @@ impl ThreadedExecutor {
     pub fn manifest(&self) -> &ExecutionManifest {
         self.local.manifest()
     }
+    #[cfg(feature = "server")]
+    pub(crate) fn collective_choices(&self) -> serde_json::Value {
+        self.local.collective_choices()
+    }
     pub fn outstanding(&self) -> usize {
         self.pending.len()
     }

@@ -245,6 +245,8 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
             handle: field!(graph, "handle", usize),
             outputs: field!(graph, "outputs", Vec<String>),
             status_buffer: field!(graph, "status_buffer", String),
+            description: graph.get_item("description").ok()
+                .map(|value| value.extract::<String>()).transpose()?.unwrap_or_default(),
         });
     }
     Ok(ExecutionManifest {

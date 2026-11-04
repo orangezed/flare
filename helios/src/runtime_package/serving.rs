@@ -93,6 +93,7 @@ impl NativeResources {
             Ok(TuningGraphDescriptor {
                 name: graph.name.clone(), handle: self.executables[index] as usize,
                 outputs: graph.outputs.clone(), status_buffer: graph.status_buffer.clone(),
+                description: graph.description.clone(),
             })
         }).collect::<Result<Vec<_>>>()?;
         let manifest = ExecutionManifest {

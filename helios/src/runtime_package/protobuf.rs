@@ -700,6 +700,7 @@ mod tests {
         let execution = wire::Execution {
             tuning_graphs: vec![wire::TuningGraph {
                 name: "tune".into(), outputs: vec!["winner".into()], status_buffer: "status".into(),
+                description: r#"{"operation":"all_reduce"}"#.into(),
             }],
             graphs: vec![wire::ExecutionGraph { tuned_bindings: vec![binding.clone()], ..Default::default() }],
             ..Default::default()

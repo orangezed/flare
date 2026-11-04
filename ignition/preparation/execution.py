@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -115,6 +116,8 @@ class TuningGraph:
     graph: Any
     outputs: tuple[str, ...]
     status_buffer: str
+    # What the graph measures and how its published values decode; exported as JSON.
+    description: Mapping[str, Any] | None = None
 
     def __post_init__(self):
         if not self.outputs or len(set(self.outputs)) != len(self.outputs):
@@ -245,7 +248,10 @@ class PreparedExecution(PreparedGraphBundle):
                 "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,
                 "buffers": descriptors, "graphs": graphs,
                 "tuning_graphs": [dict(name=name, handle=graph_handles[name], outputs=list(value.outputs),
-                                       status_buffer=value.status_buffer) for name, value in self.tuning_graphs.items()]}
+                                       status_buffer=value.status_buffer,
+                                       **({} if value.description is None else {"description": json.dumps(
+                                           value.description, sort_keys=True, separators=(",", ":"))}))
+                                  for name, value in self.tuning_graphs.items()]}
 
     def start_executor(self, *, peers=None):
         """Synchronize preparation and consume the bundle into the native executor."""

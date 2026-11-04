@@ -400,6 +400,8 @@ pub struct ModelRuntime {
     finished: Arc<(Mutex<bool>, Condvar)>,
     metrics: Arc<super::metrics::Metrics>,
     input_store: Option<flare_selene::input::InputStore>,
+    /// Startup collective tuning results, fixed once the executor is ready.
+    collectives: serde_json::Value,
 }
 
 impl ModelRuntime {
@@ -482,6 +484,7 @@ impl ModelRuntime {
                         };
                     }
                 };
+                let collectives = executor.collective_choices();
                 let mut scheduler = match crate::model::scheduler_capabilities_with_manifest(
                     &worker_config, executor.manifest(),
                 ).and_then(|capabilities| RequestScheduler::new(
@@ -607,7 +610,7 @@ impl ModelRuntime {
                 }
                 worker_metrics.scheduler(worker.scheduler.stats());
                 worker_health.store(true, Ordering::Release);
-                let _ = ready_tx.send(Ok(()));
+                let _ = ready_tx.send(Ok(collectives));
                 let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     worker.run(&mut executor)
                 }));
@@ -645,8 +648,9 @@ impl ModelRuntime {
                 )))
             })?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(collectives)) => Ok(Self {
                 sender,
+                collectives,
                 stop,
                 healthy,
                 config,
@@ -667,7 +671,7 @@ impl ModelRuntime {
                         disconnected,
                         returned,
                     ),
-                    Ok(Ok(())) => unreachable!("ready success handled above"),
+                    Ok(Ok(_)) => unreachable!("ready success handled above"),
                 })
             }
         }
@@ -685,6 +689,9 @@ impl ModelRuntime {
     }
     pub fn config(&self) -> &ModelConfig {
         &self.config
+    }
+    pub fn collectives(&self) -> &serde_json::Value {
+        &self.collectives
     }
     pub(super) fn metrics(&self) -> &super::metrics::Metrics {
         &self.metrics

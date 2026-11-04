@@ -700,6 +700,8 @@ message TuningGraph {
   string name = 1;
   repeated string outputs = 2;
   string status_buffer = 3;
+  // JSON: the collective the graph selects for and how its published values decode.
+  string description = 4;
 }
 message Buffer {
   string name = 1;

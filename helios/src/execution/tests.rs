@@ -130,6 +130,35 @@ use crate::cache::Fence;
 use crate::{Error, ExecutionError};
 
 #[test]
+fn described_collective_choices_name_their_profiles() {
+    let mut value = manifest();
+    value.graphs[0].tuned_bindings = vec![TunedBinding { buffer: "choice".into(), tuning_graph: "choose".into() }];
+    let selected = (2u32 << 16) | 36;
+    value.tuning_graphs.push(TuningGraphDescriptor {
+        name: "choose".into(), handle: 0x90000, outputs: vec!["choice".into()],
+        status_buffer: "tuning_status".into(),
+        description: serde_json::json!({"operation": "all_reduce", "bytes": 81920, "profiles": [
+            {"value": selected, "mode": "bulk_push", "active_ctas": 36},
+            {"value": 1, "mode": "payload_rsag", "active_ctas": 1},
+        ]}).to_string(),
+    });
+    let choices = vec![vec![("choice".into(), selected.to_ne_bytes().to_vec())]];
+    let text = super::transport::collective_choices_overview(&value, &choices);
+    assert!(text.contains("all_reduce bulk_push×36 (0x00020024): 1 group\n"), "{text}");
+    assert!(text.contains(" · all_reduce bulk_push×36 (0x00020024)\n"), "{text}");
+    let json = super::transport::collective_choices_json(&value, &choices);
+    assert_eq!(json[0]["tuning_graph"], "choose");
+    assert_eq!(json[0]["description"]["bytes"], 81920);
+    assert_eq!(json[0]["selected"][0]["value"], selected);
+    assert_eq!(json[0]["selected"][0]["profile"]["mode"], "bulk_push");
+    assert_eq!(json[0]["graphs"][0], value.graphs[0].name.as_str());
+    // A package without descriptions keeps the raw values.
+    value.tuning_graphs[0].description.clear();
+    assert!(super::transport::collective_choices_overview(&value, &choices).contains("0x00020024: 1 group\n"));
+    assert!(super::transport::collective_choices_json(&value, &choices)[0]["selected"][0]["profile"].is_null());
+}
+
+#[test]
 fn collective_overview_uses_graph_geometry_and_individual_bindings() {
     let mut value = manifest();
     let mut packed = value.graphs[0].clone();
@@ -1232,7 +1261,7 @@ pub(super) fn tuning_manifest() -> ExecutionManifest {
             shape: vec![1], strides: vec![1] });
     }
     value.tuning_graphs.push(TuningGraphDescriptor { name: "select".into(), handle: 0x90000,
-        outputs: vec!["choice".into()], status_buffer: "tuning_status".into() });
+        outputs: vec!["choice".into()], status_buffer: "tuning_status".into(), description: String::new() });
     value.graphs[0].tuned_bindings.push(TunedBinding { buffer: "choice".into(), tuning_graph: "select".into() });
     value
 }

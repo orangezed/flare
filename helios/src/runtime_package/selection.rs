@@ -508,8 +508,8 @@ mod tests {
             });
         }
         execution.tuning_graphs = vec![
-            wire::TuningGraph { name: "tune".into(), outputs: vec!["winner".into()], status_buffer: "status".into() },
-            wire::TuningGraph { name: "unused_tune".into(), outputs: vec!["unused_winner".into()], status_buffer: "unused_status".into() },
+            wire::TuningGraph { name: "tune".into(), outputs: vec!["winner".into()], status_buffer: "status".into(), ..Default::default() },
+            wire::TuningGraph { name: "unused_tune".into(), outputs: vec!["unused_winner".into()], status_buffer: "unused_status".into(), ..Default::default() },
         ];
         for graph in &mut execution.graphs {
             if graph.name == "decode1-no-mtp" {

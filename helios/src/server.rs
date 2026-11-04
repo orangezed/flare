@@ -405,8 +405,9 @@ impl Drop for Server {
     }
 }
 
-/// Routes generation and model discovery behind API-key authentication; health
-/// and metrics expose no request content and stay unauthenticated.
+/// Routes generation, model discovery and startup collective choices behind
+/// API-key authentication; health and metrics expose no request content and stay
+/// unauthenticated.
 fn router(state: Arc<HttpState>, served_names: &[String], max_body_bytes: usize) -> Router {
     Router::new()
         .merge(models::router(
@@ -421,11 +422,18 @@ fn router(state: Arc<HttpState>, served_names: &[String], max_body_bytes: usize)
         .route("/v1/responses", post(http::generate).get(http::no_websocket).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/systemone", post(protocol::decisions::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/decisions", post(protocol::decisions::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
+        .route("/v1/flare/collectives", get(collectives))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
+}
+
+/// Each startup tuning graph with its described collective, the profile it
+/// published and the serving graphs that replay it.
+async fn collectives(State(state): State<Arc<HttpState>>) -> Response {
+    Json(json!({"object": "list", "data": state.model.collectives()})).into_response()
 }
 
 async fn health(State(state): State<Arc<HttpState>>) -> Response {

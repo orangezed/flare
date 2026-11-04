@@ -82,6 +82,16 @@ impl RankExecutor {
         }
     }
 
+    /// Rank zero's startup tuning results; every rank publishes the same values.
+    #[cfg(feature = "server")]
+    pub(crate) fn collective_choices(&self) -> serde_json::Value {
+        match self {
+            Self::Local(executor) => executor.collective_choices(),
+            Self::Parallel(executor) => executor.collective_choices(),
+            Self::Threaded(executor) => executor.collective_choices(),
+        }
+    }
+
     #[cfg(feature = "server")]
     pub(crate) fn can_submit(&self, grammar: bool) -> bool {
         match self {

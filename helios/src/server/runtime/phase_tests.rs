@@ -3080,6 +3080,7 @@ fn group_runtime(
             finished: Arc::new((Mutex::new(false), Condvar::new())),
             metrics: fixture.metrics.clone(),
             input_store: None,
+            collectives: serde_json::Value::Array(Vec::new()),
         },
         receiver,
     )
@@ -3494,6 +3495,8 @@ fn http_state_for(
         finished: Arc::new((Mutex::new(true), Condvar::new())),
         metrics: fixture.metrics,
         input_store: None,
+        collectives: serde_json::json!([{"tuning_graph": "collective-tuning-0",
+            "description": {"operation": "all_gather"}, "selected": [], "graphs": ["decode1"]}]),
     });
     Arc::new(HttpState {
         model,
@@ -4008,6 +4011,41 @@ async fn ollama_discovery_uses_bearer_auth_without_generation_admission() {
     server.abort();
     drop(permits);
     result.unwrap();
+}
+
+#[tokio::test]
+async fn collectives_route_serves_startup_choices_behind_the_api_key() {
+    use std::io::{Read, Write};
+    let (sender, _receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, Some("serving-key".into()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = super::super::router(state, &[], 65536);
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let get = |authorization: &'static str| {
+        tokio::task::spawn_blocking(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            write!(
+                stream,
+                "GET /v1/flare/collectives HTTP/1.1\r\nHost: localhost\r\n{authorization}Connection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            let status: u16 = head.split(' ').nth(1).unwrap().parse().unwrap();
+            (status, body.to_owned())
+        })
+    };
+    assert_eq!(get("").await.unwrap().0, 401);
+    let (status, body) = get("Authorization: Bearer serving-key\r\n").await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["object"], "list");
+    assert_eq!(value["data"][0]["tuning_graph"], "collective-tuning-0");
+    assert_eq!(value["data"][0]["description"]["operation"], "all_gather");
+    assert_eq!(value["data"][0]["graphs"][0], "decode1");
+    server.abort();
 }
 
 #[tokio::test]

@@ -177,6 +177,8 @@ pub struct TuningGraphDescriptor {
     pub handle: usize,
     pub outputs: Vec<String>,
     pub status_buffer: String,
+    /// JSON written by preparation; empty for packages that carry none.
+    pub description: String,
 }
 
 #[derive(Clone, Debug)]
