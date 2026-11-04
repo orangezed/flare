@@ -25,9 +25,9 @@ class Inputs:
         self.source.copy_(self.seed)
 
 
-def input_factory(source, output, *, storage=None):
+def input_factory(source, output, *, storage=None, session=None):
     def allocate():
         with (nullcontext() if storage is None else storage.transient()):
             return Inputs(source, output)
 
-    return candidate_inputs(allocate)
+    return candidate_inputs(allocate, session=session)

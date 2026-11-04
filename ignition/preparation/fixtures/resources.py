@@ -6,7 +6,7 @@
 from weakref import ref
 
 
-def candidate_inputs(factory):
+def candidate_inputs(factory, *, session=None):
     """Acquire one fixture whose lifetime belongs to the live candidate calls.
 
     b12x runs each candidate's producer and invocation in stream order. Calls
@@ -19,6 +19,12 @@ def candidate_inputs(factory):
         nonlocal reference
         value = None if reference is None else reference()
         if value is None:
+            from ignition.preparation.tuning import RecordedPreparationSession
+
+            if isinstance(session, RecordedPreparationSession):
+                # A preceding operator can leave its fixture in the session cache.
+                # Live trials own their storage independently of that cache entry.
+                session.release_benchmark_cache()
             value = factory()
             reference = ref(value)
         return value

@@ -53,12 +53,12 @@ def attention_benchmark_inputs(arguments):
     return AttentionBenchmarkInputs(**result, cu_seqlens_q=lengths)
 
 
-def input_factory(arguments, *, storage=None):
+def input_factory(arguments, *, storage=None, session=None):
     def allocate():
         with (nullcontext() if storage is None else storage.transient()):
             return attention_benchmark_inputs(arguments)
 
-    return candidate_inputs(allocate)
+    return candidate_inputs(allocate, session=session)
 
 
 def benchmark_call(state, *, arguments, inputs, workspace):

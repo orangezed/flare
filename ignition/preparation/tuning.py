@@ -335,12 +335,19 @@ class RecordedPreparationSession(PreparationSession):
         if key not in self._benchmark_resources:
             # Calls own their operands until their trials drain. Cache only the active
             # fixture; keeping every completed shape's inputs can exhaust GPU memory.
-            self._benchmark_resources = {key: value for key, value in self._benchmark_resources.items()
-                                         if key in self._benchmark_restorers}
+            self.release_benchmark_cache()
             # Retired pools release fixture segments once their final trial owner drops them.
             with (nullcontext() if self.benchmark_storage is None else self.benchmark_storage.transient()):
                 self._benchmark_resources[key] = factory()
         return self._benchmark_resources[key]
+
+    def release_benchmark_cache(self):
+        """Drop cached fixtures; live trial calls and borrowed state retain their owners."""
+        self._check_thread()
+        if self._tune_status != "tuning":
+            raise RuntimeError("benchmark fixtures can only be retired during tuning")
+        self._benchmark_resources = {key: value for key, value in self._benchmark_resources.items()
+                                     if key in self._benchmark_restorers}
 
     def register_benchmark_resource(self, key: Hashable, resource, *, restore):
         """Borrow preparation-only storage until trial cleanup and restoration finish."""

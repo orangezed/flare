@@ -1350,6 +1350,38 @@ def test_operator_benchmark_owners_release_after_trial_close(backend, operator):
 GIB = 1 << 30
 
 
+@pytest.mark.parametrize("retain_call", [False, True])
+def test_candidate_inputs_retire_cached_fixtures_but_preserve_live_and_borrowed_owners(backend, retain_call):
+    from ignition.preparation.fixtures.resources import candidate_inputs
+
+    class Owner:
+        pass
+
+    session = make_session(device=0, checkpoint="fixture-lifetimes")
+    borrowed = Owner()
+    session.register_benchmark_resource("borrowed", borrowed, restore=lambda: None)
+    session._tune_status = "tuning"
+    preceding = session.benchmark_resource("previous", Owner)
+    reference = weakref.ref(preceding)
+    live_call_owner = preceding if retain_call else None
+    del preceding
+
+    def allocate():
+        assert (reference() is not None) == retain_call
+        assert session._benchmark_resources == {"borrowed": borrowed}
+        return Owner()
+
+    acquire = candidate_inputs(allocate, session=session)
+    active = acquire()
+    assert acquire() is active
+    active_ref = weakref.ref(active)
+    del active
+    assert active_ref() is None
+    del live_call_owner
+    assert reference() is None
+    session.close()
+
+
 def test_projection_candidates_share_private_strided_operands(backend):
     from ignition.preparation.fixtures.bf16_gemv import benchmark_call
     from ignition.preparation.fixtures.projection import input_factory
