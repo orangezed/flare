@@ -626,16 +626,33 @@ def _reads_across_mutations(nodes, keys, mutations):
                  for node, operands in mutations.items() if operands}
     mutable = set().union(*mutations.values()) if mutations else set()
     live, fresh, required = {}, set(), {}
+    fresh_by_storage = {}
+    expires = [[] for _ in range(len(nodes) + 1)]
+
+    def forget(value, pending):
+        if value in fresh:
+            for key in pending:
+                values = fresh_by_storage[key]
+                values.remove(value)
+                if not values:
+                    del fresh_by_storage[key]
+
     for index, node in enumerate(nodes):
         operands = node.all_input_nodes
         reads = set().union(*(live.get(arg, set()) for arg in operands)) if operands else set()
         reads.update(keys[arg] for arg in operands if keys.get(arg) in mutable)
         if node in mutations:
-            for previous, pending in live.items():
-                if previous in fresh and last_use[previous] > index and pending & mutations[node]:
+            affected = set().union(*(fresh_by_storage.get(key, ()) for key in mutations[node]))
+            for previous in affected:
+                if last_use[previous] > index:
                     required.setdefault(previous, []).append(node)
+                    pending = live.pop(previous)
+                    forget(previous, pending)
                     pending.clear()
-        live = {value: pending for value, pending in live.items() if pending and last_use[value] > index}
+        for value in expires[index]:
+            pending = live.pop(value, None)
+            if pending:
+                forget(value, pending)
         if (node in keys and node.op == 'call_function'
                 and isinstance(node.target, torch._ops.OpOverload) and node.target.namespace == 'aten'):
             if keys[node] not in {keys[arg] for arg in operands if arg in keys}:
@@ -643,4 +660,13 @@ def _reads_across_mutations(nodes, keys, mutations):
             live[node] = reads
         elif node in keys and keys[node] in mutable:
             live[node] = {keys[node]}
+        else:
+            continue
+        pending = live[node]
+        if node in fresh:
+            for key in pending:
+                fresh_by_storage.setdefault(key, set()).add(node)
+        # Values are read before expiry, including values inserted without users.
+        end = max(index + 1, last_use[node]) if pending else index + 1
+        expires[end].append(node)
     return {node: required[node] for node in nodes if node in required}
