@@ -81,7 +81,7 @@ def test_projection_fixture_pools_release_after_trial_owners(mailbox_storage):
         second = acquire()
         assert first is second
         first.produce()
-        assert torch.equal(first.source, first.seed)
+        assert torch.equal(first.source, first.seed.to(first.source.device))
         del first
         gc.collect()
         assert torch.cuda.memory_allocated() > baseline

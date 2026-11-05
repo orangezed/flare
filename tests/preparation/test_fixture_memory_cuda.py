@@ -46,7 +46,7 @@ def test_projection_can_follow_expert_tuning_under_memory_pressure():
         finally:
             del reserve
             torch.cuda.empty_cache()
-        torch.testing.assert_close(operands.source, operands.seed, rtol=0, atol=0)
+        torch.testing.assert_close(operands.source, operands.seed.to(operands.source.device), rtol=0, atol=0)
 
 
 @torch.no_grad()
@@ -130,3 +130,59 @@ def test_strided_attention_fixture_restoration_needs_no_device_temporary():
     for name in ("q", "k", "v"):
         assert torch.equal(getattr(inputs, name).cpu(), getattr(inputs, f"seed_{name}"))
     assert not source.count_nonzero()
+
+
+@pytest.mark.parametrize("rows,columns,outputs", [
+    (65536, 1024, 4608), (65536, 1024, 4096), (65536, 4096, 1024),
+    (16384, 4096, 7168), (4096, 35840, 448),
+])
+@torch.no_grad()
+def test_projection_trials_fit_bounded_memory_at_encoder_and_draft_capacities(rows, columns, outputs):
+    from b12x.preparation import PreparationSession
+    from ignition.components.linear import UnquantizedProjection
+    from ignition.preparation.fixtures.bf16_gemv import benchmark_call
+
+    device = torch.device("cuda:0")
+    source = torch.zeros(rows, columns, dtype=torch.bfloat16, device=device)
+    output = torch.zeros(rows, outputs, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(outputs, columns, dtype=torch.bfloat16, device=device).mul_(.01)
+    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+        operation = UnquantizedProjection(source, weight, output, session=session, name="projection")
+        acquire = input_factory(source, output)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        free = torch.cuda.mem_get_info(device)[0]
+        assert free > 1 << 30, "assign a GPU with at least 1 GiB free"
+        reserve = torch.empty(free - (900 << 20), dtype=torch.uint8, device=device)
+        baseline = torch.cuda.memory_allocated()
+        graph = None
+        try:
+            first, second = [benchmark_call(operation.plan.prepared.state,
+                inputs=acquire, weight=weight, bias=None) for _ in range(2)]
+            fixture = first.owners[0]
+            assert fixture is second.owners[0]
+            assert torch.cuda.memory_allocated() - baseline < source.nbytes + output.nbytes + (2 << 20)
+            first.produce()
+            first.invoke()
+            expected = fixture.output.cpu()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                second.produce()
+                second.invoke()
+            fixture.source.fill_(float("nan"))
+            fixture.output.fill_(float("nan"))
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+        finally:
+            if graph is not None:
+                graph.reset()
+            del reserve
+            torch.cuda.empty_cache()
+        torch.testing.assert_close(fixture.output.cpu(), expected, rtol=0, atol=0)
+        generator = torch.Generator(device=device).manual_seed(0xB12)
+        reference = torch.randn(source.shape, device=device, dtype=source.dtype, generator=generator).mul_(.125)
+        assert fixture.seed.is_pinned()
+        assert torch.equal(fixture.source, reference)
+        assert not source.count_nonzero() and not output.count_nonzero()

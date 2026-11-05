@@ -6,6 +6,12 @@
 from weakref import ref
 
 
+def restore_seed(value, seed):
+    """Restore matching private storage without a strided host-copy device temporary."""
+    size = value.untyped_storage().nbytes() // value.element_size()
+    value.as_strided((size,), (1,), 0).copy_(seed.as_strided((size,), (1,), 0), non_blocking=True)
+
+
 def candidate_inputs(factory, *, session=None):
     """Acquire one fixture whose lifetime belongs to the live candidate calls.
 

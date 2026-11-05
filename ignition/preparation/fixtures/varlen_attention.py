@@ -10,7 +10,7 @@ import torch
 from b12x.preparation import PreparedCall
 
 from ignition.preparation.scratch import planned_scratch
-from .resources import candidate_inputs
+from .resources import candidate_inputs, restore_seed
 
 
 @dataclass(frozen=True)
@@ -32,8 +32,7 @@ class AttentionBenchmarkInputs:
         for value, seed in ((self.q, self.seed_q), (self.k, self.seed_k), (self.v, self.seed_v)):
             # Each tensor owns its full strided storage. Copy its contiguous backing
             # so a host-to-device strided copy cannot allocate a device temporary.
-            size = value.untyped_storage().nbytes() // value.element_size()
-            value.as_strided((size,), (1,), 0).copy_(seed.as_strided((size,), (1,), 0), non_blocking=True)
+            restore_seed(value, seed)
 
 
 def attention_benchmark_inputs(arguments):
