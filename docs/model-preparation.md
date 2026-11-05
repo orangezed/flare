@@ -995,7 +995,8 @@ uv pip install --python .venv/bin/python --no-deps -e ../flashinfer
   --mtp-draft-tokens 7 --speculative-token-capacity 128 \
   --speculative-graph-budget 64 --autotune-effort default --compile-workers 64
 
-./flare/target/release/flare run moonshotai/Kimi-K3.1-Pro --gpus 0-15 \
+./flare/target/release/flare run moonshotai/Kimi-K3.1-Pro \
+  --gpus 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
   --host 127.0.0.1 --port 8000
 ```
 
@@ -1023,6 +1024,31 @@ weights; its confidence head is not used by the shared proposal sampler.
 BF16 projections remain BF16 by default. Routed experts keep MXFP4 weights
 and losslessly compressed block scales. `--online-mxfp8` is off by default;
 use it only when explicitly choosing conversion of eligible dense weights.
+Target conversion covers the K3 projection set described above. In sparse
+attention, the fused latent/gate projection also contains the index key and
+index head-weight projections (`indexer.wk` and `indexer.weights_proj`), so
+those weights convert together. The separate index query projection
+(`indexer.wq_b`) retains BF16. The full-context draft converts its context
+projection, fused query/KV input projection, query expansion, attention output,
+and MLP gate/up/down projections. Its separate target-feedback KV projection,
+batched key/value projections, normalization and Markov weights retain BF16.
+Activations remain BF16; embeddings, the shared target vocabulary head,
+routers and vision weights retain checkpoint precision.
+
+To request MXFP8 conversion with four concurrent requests and images, seven
+draft tokens and 4096-token prefill chunks:
+
+```sh
+.venv/bin/ignition export kimi-k3.1-pro --gpus 0-15 \
+  --max-concurrency 4 --image-concurrency 4 --prefill-chunk-size 4096 \
+  --mtp-draft-tokens 7 --speculative-token-capacity 128 \
+  --speculative-graph-budget 64 --online-mxfp8
+```
+
+Use ordinary export when changing from BF16 to MXFP8; `--reuse-weights`
+requires matching prepared weight layouts. Ordinary export reuses unchanged
+cached weight objects and writes the converted projections.
+
 `--language-model-only` omits image preparation. `--no-mtp` omits draft weights
 and history; loading an existing package with `--mtp-draft-tokens 0` retains
 the prepared layout and selects ordinary execution.

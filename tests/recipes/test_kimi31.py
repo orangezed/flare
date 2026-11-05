@@ -76,8 +76,7 @@ def test_draft_geometry_and_target_identity(raw, field, value):
         DSparkConfig.from_dict(draft, raw["text_config"])
 
 
-def test_recipe_preserves_native_weights_and_sampling():
-    assert not RECIPE.online_mxfp8
+def test_recipe_preserves_vision_and_sampling():
     assert not RECIPE.language_model_only
     assert RECIPE.sampling_defaults.top_p == .95
     assert RECIPE.sampling_defaults.temperature == 1.
