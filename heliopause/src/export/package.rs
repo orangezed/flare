@@ -1526,6 +1526,260 @@ impl StateFile {
             self.path,
         ))
     }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        use sha2::Digest;
+        let end = self.offset.checked_add(bytes.len() as u64)
+            .ok_or_else(|| invalid("initial-state length overflow"))?;
+        self.file.write_all(bytes)?;
+        self.hasher.update(bytes);
+        self.offset = end;
+        Ok(())
+    }
+}
+
+const STATE_GAP_BYTES: u64 = 64 << 10;
+
+fn merge_intervals(intervals: &mut Vec<(u64, u64)>) {
+    intervals.sort_unstable();
+    let mut count = 0usize;
+    for index in 0..intervals.len() {
+        let (start, end) = intervals[index];
+        if count > 0 && start <= intervals[count - 1].1 {
+            intervals[count - 1].1 = intervals[count - 1].1.max(end);
+        } else {
+            intervals[count] = (start, end);
+            count += 1;
+        }
+    }
+    intervals.truncate(count);
+}
+
+fn intersects(intervals: &[(u64, u64)], start: u64, end: u64) -> bool {
+    if start >= end {
+        return false;
+    }
+    let index = intervals.partition_point(|&(_, stop)| stop <= start);
+    index < intervals.len() && intervals[index].0 < end
+}
+
+/// Pack short implicit-zero gaps without changing fixed allocation coverage or weight owners.
+fn compact_initial_state(
+    rank: &mut helios_core::package::export::PublishRank,
+    staging: &Path,
+    rank_index: u32,
+) -> Result<()> {
+    use helios_core::package::{export as payload_export, schema, schema::wire as pwire};
+    let body = &rank.body;
+    let mut barriers: BTreeMap<&str, Vec<(u64, u64)>> = BTreeMap::new();
+    let allocations: BTreeMap<_, _> = body.allocations.iter()
+        .map(|allocation| (allocation.name.as_str(), allocation)).collect();
+    for allocation in &body.allocations {
+        let ranges = barriers.entry(allocation.name.as_str()).or_default();
+        for relocation in &allocation.relocations {
+            let width = match wire::RelocationKind::try_from(relocation.kind) {
+                Ok(wire::RelocationKind::Pointer) => 8,
+                Ok(wire::RelocationKind::TensorMap) => 128,
+                _ => return Err(invalid("unknown initial-state relocation kind")),
+            };
+            let end = relocation.offset.checked_add(width)
+                .ok_or_else(|| invalid("initial-state relocation overflow"))?;
+            ranges.push((relocation.offset, end));
+        }
+    }
+    // Zero-elided weight owners remain weights even where no initializer writes them.
+    if let Some(catalog) = schema::prepared_weights(body)? {
+        for view in &catalog.views {
+            let allocation = body.allocations.get(view.allocation as usize)
+                .ok_or_else(|| invalid("weight view names an absent allocation"))?;
+            let end = view.offset.checked_add(view.nbytes)
+                .ok_or_else(|| invalid("prepared weight view overflow"))?;
+            barriers.entry(allocation.name.as_str()).or_default().push((view.offset, end));
+        }
+    }
+    for intervals in barriers.values_mut() {
+        merge_intervals(intervals);
+    }
+    let mut global_ranges: BTreeMap<&[u8], Vec<(u64, u64)>> = BTreeMap::new();
+    for global in body.modules.iter().flat_map(|module| &module.globals) {
+        if let Some(slice) = global.contents.as_ref().and_then(|value| value.slice.as_ref()) {
+            let end = slice.offset.checked_add(slice.nbytes)
+                .ok_or_else(|| invalid("module global source overflow"))?;
+            global_ranges.entry(&slice.payload_id).or_default().push((slice.offset, end));
+        }
+    }
+    for intervals in global_ranges.values_mut() {
+        merge_intervals(intervals);
+    }
+    let sources: BTreeMap<_, _> = rank.payloads.iter()
+        .filter(|payload| payload.role == pwire::PayloadRole::InitialState)
+        .map(|payload| (payload.id.as_bytes().as_slice(), &payload.source)).collect();
+    let slice = |index: usize| body.initializers[index].source.as_ref()
+        .filter(|value| value.role == pwire::PayloadRole::InitialState as i32)
+        .and_then(|value| value.slice.as_ref());
+    let can_join = |left: usize, right: usize| -> Result<Option<u64>> {
+        let first = &body.initializers[left];
+        let second = &body.initializers[right];
+        if first.allocation != second.allocation {
+            return Ok(None);
+        }
+        let Some(allocation) = allocations.get(first.allocation.as_str()) else { return Ok(None) };
+        // Managed ranges can map fewer physical pages than their virtual extent. Fixed device
+        // allocations map allocation.nbytes regardless of which bytes have initializers.
+        if allocation.sizing.is_some() || allocation.memory != wire::Memory::Device as i32 {
+            return Ok(None);
+        }
+        let (Some(first_slice), Some(second_slice)) = (slice(left), slice(right)) else { return Ok(None) };
+        if first_slice.nbytes == 0 || second_slice.nbytes == 0
+            || first_slice.payload_id != second_slice.payload_id
+            || !sources.contains_key(first_slice.payload_id.as_slice())
+        {
+            return Ok(None);
+        }
+        let first_end = first.destination_offset.checked_add(first_slice.nbytes)
+            .ok_or_else(|| invalid("initial-state destination overflow"))?;
+        let second_end = second.destination_offset.checked_add(second_slice.nbytes)
+            .ok_or_else(|| invalid("initial-state destination overflow"))?;
+        let Some(gap) = second.destination_offset.checked_sub(first_end) else { return Ok(None) };
+        let source_end = first_slice.offset.checked_add(first_slice.nbytes)
+            .ok_or_else(|| invalid("initial-state source overflow"))?;
+        let next_source_end = second_slice.offset.checked_add(second_slice.nbytes)
+            .ok_or_else(|| invalid("initial-state source overflow"))?;
+        if gap > STATE_GAP_BYTES || source_end != second_slice.offset
+            || second_end > allocation.nbytes
+            || barriers.get(first.allocation.as_str())
+                .is_some_and(|ranges| intersects(ranges, first_end, second.destination_offset))
+            || global_ranges.get(first_slice.payload_id.as_slice())
+                .is_some_and(|ranges| intersects(ranges, first_slice.offset, next_source_end))
+        {
+            return Ok(None);
+        }
+        Ok(Some(gap))
+    };
+    // Neighbors in this order include every role, so a weight or pointer initializer is a barrier.
+    let mut order: Vec<_> = (0..body.initializers.len()).collect();
+    order.sort_by(|&left, &right| {
+        let left = &body.initializers[left];
+        let right = &body.initializers[right];
+        (&left.allocation, left.destination_offset).cmp(&(&right.allocation, right.destination_offset))
+    });
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    let mut active = Vec::new();
+    let mut has_gap = false;
+    for index in order {
+        if let Some(&previous) = active.last() {
+            if let Some(gap) = can_join(previous, index)? {
+                active.push(index);
+                has_gap |= gap != 0;
+                continue;
+            }
+            if has_gap {
+                runs.push(std::mem::take(&mut active));
+            } else {
+                active.clear();
+            }
+        }
+        active.push(index);
+        has_gap = false;
+    }
+    if has_gap {
+        runs.push(active);
+    }
+    if runs.is_empty() {
+        return Ok(());
+    }
+    let relative = format!("deployments/{}/rank-{rank_index}/initial-state-compacted.safetensors", body.deployment_id);
+    if rank.payloads.iter().any(|payload| payload.relative == relative) {
+        return Err(invalid("compacted initial-state payload path is already occupied"));
+    }
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut verified = BTreeMap::new();
+    for run in &runs {
+        let id = &slice(run[0]).expect("planned initial-state source").payload_id;
+        if verified.contains_key(id) {
+            continue;
+        }
+        let source = sources[id.as_slice()];
+        let checked = super::io::Source::from_file(source.file().clone(), source.offset(), source.len())?;
+        let mut hash = sha2::Sha256::new();
+        let mut offset = 0u64;
+        while offset < source.len() {
+            use sha2::Digest;
+            let count = (source.len() - offset).min(buffer.len() as u64) as usize;
+            checked.read_at(offset, &mut buffer[..count])?;
+            hash.update(&buffer[..count]);
+            offset += count as u64;
+        }
+        use sha2::Digest;
+        if hash.finalize().as_slice() != id.as_slice() {
+            return Err(invalid("initial-state source differs from its payload identity"));
+        }
+        checked.check_unchanged()?;
+        verified.insert(id.clone(), checked);
+    }
+    let mut output = StateFile::new(staging.join(format!("rank-{rank_index}-compacted-state.payload")))?;
+    let mut removed = vec![false; body.initializers.len()];
+    let mut replacements = BTreeMap::new();
+    for run in runs {
+        let first = &body.initializers[run[0]];
+        let start = output.offset;
+        let mut destination = first.destination_offset;
+        for &index in &run {
+            let initializer = &body.initializers[index];
+            let span = slice(index).expect("planned initial-state source");
+            let gap = initializer.destination_offset - destination;
+            buffer[..gap as usize].fill(0);
+            output.write(&buffer[..gap as usize])?;
+            let source = &verified[span.payload_id.as_slice()];
+            let mut read = 0u64;
+            while read < span.nbytes {
+                let count = (span.nbytes - read).min(buffer.len() as u64) as usize;
+                source.read_at(span.offset + read, &mut buffer[..count])?;
+                output.write(&buffer[..count])?;
+                read += count as u64;
+            }
+            destination = initializer.destination_offset + span.nbytes;
+            removed[index] = true;
+        }
+        replacements.insert(*run.iter().min().unwrap(), pwire::Initializer {
+            allocation: first.allocation.clone(),
+            destination_offset: first.destination_offset,
+            source: Some(pwire::PayloadUse {
+                role: pwire::PayloadRole::InitialState as i32,
+                slice: Some(pwire::PayloadSlice {
+                    payload_id: Vec::new(), offset: start, nbytes: output.offset - start,
+                }),
+            }),
+        });
+    }
+    for source in verified.values() {
+        source.check_unchanged()?;
+    }
+    let (id, nbytes, path) = output.finish()?;
+    for initializer in replacements.values_mut() {
+        initializer.source.as_mut().unwrap().slice.as_mut().unwrap().payload_id = id.as_bytes().to_vec();
+    }
+    let mut initializers = Vec::with_capacity(body.initializers.len());
+    for (index, initializer) in rank.body.initializers.drain(..).enumerate() {
+        if let Some(replacement) = replacements.remove(&index) {
+            initializers.push(replacement);
+        } else if !removed[index] {
+            initializers.push(initializer);
+        }
+    }
+    rank.body.initializers = initializers;
+    let mut used: BTreeSet<_> = rank.body.initializers.iter().filter_map(|value| value.source.as_ref())
+        .chain(rank.body.modules.iter().flat_map(|module| &module.globals).filter_map(|value| value.contents.as_ref()))
+        .filter_map(|value| value.slice.as_ref()).map(|slice| slice.payload_id.clone()).collect();
+    used.extend(rank.body.resources.iter().filter_map(|resource| resource.stored.as_ref())
+        .map(|slice| slice.payload_id.clone()));
+    rank.payloads.retain(|payload| payload.role != pwire::PayloadRole::InitialState
+        || used.contains(payload.id.as_bytes().as_slice()));
+    rank.payloads.push(payload_export::PublishPayload {
+        role: pwire::PayloadRole::InitialState, relative,
+        source: payload_export::pin_file(&path, nbytes)?, id, tensor: None,
+    });
+    Ok(())
 }
 
 /// Convert one captured rank into a package rank plan.
@@ -1925,7 +2179,7 @@ fn rank_plan(
             attributes: function.attributes.clone(),
         })
         .collect();
-    Ok(payload_export::PublishRank {
+    let mut plan = payload_export::PublishRank {
         body: pwire::RankBody {
             rank: rank_index,
             deployment_id: deployment_id.to_string(),
@@ -1947,7 +2201,9 @@ fn rank_plan(
         },
         payloads,
         resources,
-    })
+    };
+    compact_initial_state(&mut plan, staging, rank_index)?;
+    Ok(plan)
 }
 
 /// Select peer records the rank owns or reads.
@@ -2533,6 +2789,45 @@ mod payload_export_tests {
             staging: None,
             weight_payload: None,
         }
+    }
+
+    #[test]
+    fn rank_plan_compacts_sparse_initial_state_without_changing_executables_or_allocation_geometry() {
+        let root = tempfile::tempdir().unwrap();
+        let mut source = staged_rank(root.path());
+        source.index.ranks[0].allocations[0].nbytes = 80;
+        source.index.ranks[0].allocations[0].data_spans = vec![
+            wire::Span { offset: 0, nbytes: 32, filename: String::new() },
+            wire::Span { offset: 48, nbytes: 32, filename: String::new() },
+        ];
+        let mut leases = Vec::new();
+        let plan = rank_plan(&source, 0, 1, &[], root.path(), "test", None, &mut leases).unwrap();
+        assert_eq!(plan.body.initializers.len(), 1);
+        assert_eq!(plan.body.initializers[0].source.as_ref().unwrap().slice.as_ref().unwrap().nbytes, 80);
+        assert_eq!(plan.body.allocations[0].nbytes, 80);
+        assert_eq!(plan.body.allocations[0].address, Some(0x1000));
+        assert_eq!(plan.body.functions.len(), 1);
+        assert_eq!(plan.body.graphs.len(), 1);
+        assert_eq!(plan.resources.len(), 2);
+        let mut bytes = vec![0; 80];
+        plan.payloads[0].source.read_at(0, &mut bytes).unwrap();
+        assert_eq!(&bytes[..32], &[0x11; 32]);
+        assert_eq!(&bytes[32..48], &[0; 16]);
+        assert_eq!(&bytes[48..], &[0x11; 32]);
+        let destination = root.path().join("published");
+        publish_payload(&destination, &[source], vec![], None, &publisher(), None, false, "directory").unwrap();
+        let metadata = Metadata::open(&destination).unwrap();
+        let envelope = helios_core::package::protection::envelope(&metadata.envelope).unwrap();
+        let body = helios_core::package::schema::wire::RankBody::decode(envelope.ranks[0].body.as_slice()).unwrap();
+        assert_eq!(body.initializers.len(), 1);
+        let mut catalog = helios_core::package::schema::Catalog::new();
+        catalog.insert_all(&body.payloads).unwrap();
+        let span = body.initializers[0].source.as_ref().unwrap().slice.as_ref().unwrap();
+        let files = metadata.payloads(&catalog, [span.payload_id.as_slice()]).unwrap();
+        files.verify().unwrap();
+        let mut restored = vec![0; 80];
+        files.get(&span.payload_id).unwrap().read_at(span.offset, &mut restored).unwrap();
+        assert_eq!(restored, bytes);
     }
 
     fn binding(owner: u32, readers: Vec<u32>) -> wire::PeerMemory {
@@ -4878,5 +5173,373 @@ mod packing_metadata_tests {
         };
         let (_, packing, _) = super::prepared_provenance(&absent);
         assert!(packing.is_none());
+    }
+}
+
+#[cfg(test)]
+mod state_compaction_tests {
+    use super::*;
+    use helios_core::package::{export as producer, schema, schema::wire as p};
+    use sha2::{Digest, Sha256};
+
+    fn payload(root: &Path, name: &str, role: p::PayloadRole, bytes: &[u8]) -> producer::PublishPayload {
+        let path = root.join(name);
+        fs::write(&path, bytes).unwrap();
+        producer::PublishPayload {
+            role, relative: name.into(), source: producer::pin_file(&path, bytes.len() as u64).unwrap(),
+            id: helios_core::package::PayloadId::from_bytes(Sha256::digest(bytes).into()), tensor: None,
+        }
+    }
+
+    fn initializer(name: &str, offset: u64, source: &producer::PublishPayload,
+                   source_offset: u64, nbytes: u64) -> p::Initializer {
+        p::Initializer {
+            allocation: name.into(), destination_offset: offset,
+            source: Some(p::PayloadUse { role: source.role as i32, slice: Some(p::PayloadSlice {
+                payload_id: source.id.as_bytes().to_vec(), offset: source_offset, nbytes,
+            }) }),
+        }
+    }
+
+    fn fixed(name: &str, nbytes: u64) -> p::Allocation {
+        p::Allocation { name: name.into(), nbytes, alignment: 1, memory: wire::Memory::Device as i32,
+            ..Default::default() }
+    }
+
+    fn image(rank: &producer::PublishRank) -> BTreeMap<String, Vec<u8>> {
+        let mut result: BTreeMap<_, _> = rank.body.allocations.iter()
+            .map(|allocation| (allocation.name.clone(), vec![0; allocation.nbytes as usize])).collect();
+        for initializer in &rank.body.initializers {
+            let span = initializer.source.as_ref().unwrap().slice.as_ref().unwrap();
+            let source = rank.payloads.iter().find(|payload| payload.id.as_bytes() == span.payload_id.as_slice()).unwrap();
+            source.source.read_at(span.offset, &mut result.get_mut(&initializer.allocation).unwrap()
+                [initializer.destination_offset as usize..(initializer.destination_offset + span.nbytes) as usize]).unwrap();
+        }
+        result
+    }
+
+    fn two_spans(root: &Path, gap: u64) -> producer::PublishRank {
+        let source = payload(root, "state", p::PayloadRole::InitialState, &[90, 1, 2, 3, 4, 91]);
+        producer::PublishRank {
+            body: p::RankBody { deployment_id: "test".into(), allocations: vec![fixed("data", gap + 4)],
+                initializers: vec![initializer("data", 0, &source, 1, 2), initializer("data", gap + 2, &source, 3, 2)],
+                ..Default::default() }, payloads: vec![source], resources: vec![],
+        }
+    }
+
+    #[test]
+    fn state_compaction_preserves_zero_gap_boundaries_and_source_offsets() {
+        for (gap, count) in [(0, 2), (1, 1), (65536, 1), (65537, 2)] {
+            let root = tempfile::tempdir().unwrap();
+            let mut rank = two_spans(root.path(), gap);
+            let expected = image(&rank);
+            let geometry = rank.body.allocations.clone();
+            compact_initial_state(&mut rank, root.path(), 0).unwrap();
+            assert_eq!(rank.body.initializers.len(), count);
+            assert_eq!(image(&rank), expected);
+            assert_eq!(rank.body.allocations, geometry);
+            assert_eq!(rank.payloads.len(), 1);
+        }
+    }
+
+    #[test]
+    fn state_compaction_excludes_managed_peer_and_host_allocations() {
+        for kind in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let mut rank = two_spans(root.path(), 16);
+            let allocation = &mut rank.body.allocations[0];
+            if kind == 0 {
+                allocation.sizing = Some(wire::Sizing { capacity: 1, unit_bytes: 1, maximum: 20 });
+            } else {
+                allocation.memory = if kind == 1 { wire::Memory::Peer as i32 } else { wire::Memory::MappedHost as i32 };
+            }
+            let expected = rank.body.clone();
+            compact_initial_state(&mut rank, root.path(), 0).unwrap();
+            assert_eq!(rank.body, expected);
+            assert!(!root.path().join("rank-0-compacted-state.payload").exists());
+        }
+    }
+
+    #[test]
+    fn state_compaction_keeps_interleaved_weights_and_zero_elided_owners_as_barriers() {
+        for declared in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut rank = two_spans(root.path(), 16);
+            if declared {
+                rank.body.compressed_prepared_weights = Some(schema::compress_prepared_weights(&p::PreparedWeightCatalog {
+                    version: 1, views: vec![p::PreparedWeightView {
+                        name: "zero-weight".into(), dtype: "uint8".into(), element_bytes: 1,
+                        shape: vec![1], stride: vec![1], allocation: 0, offset: 8, nbytes: 1,
+                        ..Default::default()
+                    }], unavailable: vec![],
+                }).unwrap());
+            } else {
+                let weights = payload(root.path(), "weights", p::PayloadRole::Weights, &[7, 8]);
+                rank.body.initializers.push(initializer("data", 8, &weights, 0, 2));
+                rank.payloads.push(weights);
+            }
+            let expected = rank.body.clone();
+            compact_initial_state(&mut rank, root.path(), 0).unwrap();
+            assert_eq!(rank.body, expected);
+        }
+    }
+
+    #[test]
+    fn state_compaction_respects_full_relocation_width_and_gap_endpoints() {
+        for (kind, width) in [(wire::RelocationKind::Pointer, 8), (wire::RelocationKind::TensorMap, 128)] {
+            for intersects_gap in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let gap_start = width + 2;
+                let source = payload(root.path(), "state", p::PayloadRole::InitialState, &[1, 2, 3, 4]);
+                let mut rank = producer::PublishRank {
+                    body: p::RankBody { deployment_id: "test".into(), allocations: vec![fixed("data", gap_start + 32)],
+                        initializers: vec![initializer("data", gap_start - 2, &source, 0, 2),
+                                           initializer("data", gap_start + 8, &source, 2, 2)], ..Default::default() },
+                    payloads: vec![source], resources: vec![],
+                };
+                rank.body.allocations[0].relocations.push(wire::Relocation {
+                    offset: if intersects_gap { gap_start - width + 1 } else { gap_start - width },
+                    target: Some(wire::Reference { allocation: "data".into(), offset: 0 }), kind: kind as i32,
+                });
+                let expected = image(&rank);
+                let geometry = rank.body.allocations.clone();
+                compact_initial_state(&mut rank, root.path(), 0).unwrap();
+                assert_eq!(rank.body.initializers.len(), if intersects_gap { 2 } else { 1 });
+                assert_eq!(image(&rank), expected);
+                assert_eq!(rank.body.allocations, geometry);
+            }
+        }
+    }
+
+    #[test]
+    fn state_compaction_keeps_global_sources_and_cross_payload_boundaries() {
+        for global in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut rank = two_spans(root.path(), 8);
+            if global {
+                rank.body.modules.push(p::Module { name: "module".into(), cubin: 0,
+                    globals: vec![p::ModuleGlobal { symbol: "global".into(), nbytes: 1,
+                        contents: Some(p::PayloadUse { role: p::PayloadRole::InitialState as i32,
+                            slice: Some(p::PayloadSlice { payload_id: rank.payloads[0].id.as_bytes().to_vec(), offset: 2, nbytes: 1 }) }),
+                        relocations: vec![], }], });
+            } else {
+                let other = payload(root.path(), "other", p::PayloadRole::InitialState, &[9, 10]);
+                rank.body.initializers[1] = initializer("data", 10, &other, 0, 2);
+                rank.payloads.push(other);
+            }
+            let expected = rank.body.clone();
+            compact_initial_state(&mut rank, root.path(), 0).unwrap();
+            assert_eq!(rank.body, expected);
+        }
+    }
+
+    #[test]
+    fn state_compaction_retains_an_old_payload_used_by_a_global_outside_the_copied_window() {
+        let root = tempfile::tempdir().unwrap();
+        let mut rank = two_spans(root.path(), 8);
+        let original_id = rank.payloads[0].id;
+        rank.body.modules.push(p::Module { name: "module".into(), cubin: 0,
+            globals: vec![p::ModuleGlobal { symbol: "global".into(), nbytes: 1,
+                contents: Some(p::PayloadUse { role: p::PayloadRole::InitialState as i32,
+                    slice: Some(p::PayloadSlice { payload_id: original_id.as_bytes().to_vec(), offset: 5, nbytes: 1 }) }),
+                relocations: vec![], }], });
+        let modules = rank.body.modules.clone();
+        let expected = image(&rank);
+        compact_initial_state(&mut rank, root.path(), 0).unwrap();
+        assert_eq!(rank.body.initializers.len(), 1);
+        assert_eq!(rank.payloads.len(), 2);
+        assert_eq!(rank.body.modules, modules);
+        assert_eq!(image(&rank), expected);
+        let source = rank.payloads.iter().find(|payload| payload.id == original_id).unwrap();
+        let mut value = [0];
+        source.source.read_at(5, &mut value).unwrap();
+        assert_eq!(value, [91]);
+    }
+
+    #[test]
+    fn state_compaction_preserves_empty_members_and_discontinuous_source_boundaries() {
+        for empty in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut rank = two_spans(root.path(), 8);
+            if empty {
+                rank.body.initializers[0].source.as_mut().unwrap().slice.as_mut().unwrap().nbytes = 0;
+                rank.body.initializers[1].source.as_mut().unwrap().slice.as_mut().unwrap().offset = 1;
+            } else {
+                rank.body.initializers[1].source.as_mut().unwrap().slice.as_mut().unwrap().offset = 4;
+            }
+            let expected = rank.body.clone();
+            compact_initial_state(&mut rank, root.path(), 0).unwrap();
+            assert_eq!(rank.body, expected);
+        }
+    }
+
+    #[test]
+    fn state_compaction_verifies_unused_source_bytes_before_replacing_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let mut rank = two_spans(root.path(), 8);
+        let expected = rank.body.clone();
+        fs::write(root.path().join("state"), [99, 1, 2, 3, 4, 91]).unwrap();
+        let error = compact_initial_state(&mut rank, root.path(), 0).unwrap_err();
+        assert!(error.to_string().contains("payload identity"), "{error}");
+        assert_eq!(rank.body, expected);
+        assert!(!root.path().join("rank-0-compacted-state.payload").exists());
+    }
+
+    #[test]
+    fn state_compaction_rejects_source_overflow_without_mutating_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let mut rank = two_spans(root.path(), 8);
+        rank.body.initializers[0].source.as_mut().unwrap().slice.as_mut().unwrap().offset = u64::MAX;
+        let expected = rank.body.clone();
+        assert!(compact_initial_state(&mut rank, root.path(), 0).unwrap_err().to_string().contains("overflow"));
+        assert_eq!(rank.body, expected);
+    }
+
+    #[test]
+    fn state_compaction_random_layouts_match_complete_allocation_images() {
+        let mut reduced = 0;
+        for seed in 0u64..256 {
+            let root = tempfile::tempdir().unwrap();
+            let mut random = seed + 1;
+            let mut next = || { random = random.wrapping_mul(6364136223846793005).wrapping_add(1); random >> 32 };
+            let mut state = vec![33, 44, 55];
+            let mut weights = vec![66, 77];
+            let mut records = Vec::new();
+            for allocation in 0..2 {
+                let mut destination = 0;
+                for _ in 0..20 {
+                    let length = 1 + next() % 8;
+                    let role = if next() % 5 == 0 { p::PayloadRole::Weights } else { p::PayloadRole::InitialState };
+                    let data = if role == p::PayloadRole::Weights { &mut weights } else { &mut state };
+                    let source = data.len() as u64;
+                    data.extend((0..length).map(|_| next() as u8));
+                    records.push((allocation, destination, role, source, length));
+                    destination += length + next() % 12;
+                }
+            }
+            let state = payload(root.path(), "state", p::PayloadRole::InitialState, &state);
+            let weights = payload(root.path(), "weights", p::PayloadRole::Weights, &weights);
+            let mut initializers: Vec<_> = records.into_iter().map(|(allocation, destination, role, source, length)|
+                initializer(&format!("data-{allocation}"), destination,
+                    if role == p::PayloadRole::Weights { &weights } else { &state }, source, length)).collect();
+            for index in (1..initializers.len()).rev() {
+                initializers.swap(index, next() as usize % (index + 1));
+            }
+            let mut rank = producer::PublishRank {
+                body: p::RankBody { deployment_id: "test".into(),
+                    allocations: vec![fixed("data-0", 512), fixed("data-1", 512)], initializers, ..Default::default() },
+                payloads: vec![state, weights], resources: vec![],
+            };
+            let expected = image(&rank);
+            let geometry = rank.body.allocations.clone();
+            let weight_records: Vec<_> = rank.body.initializers.iter().filter(|value|
+                value.source.as_ref().unwrap().role == p::PayloadRole::Weights as i32).cloned().collect();
+            let count = rank.body.initializers.len();
+            compact_initial_state(&mut rank, root.path(), 0).unwrap();
+            assert_eq!(image(&rank), expected, "seed {seed}");
+            assert_eq!(rank.body.allocations, geometry);
+            assert_eq!(rank.body.initializers.iter().filter(|value|
+                value.source.as_ref().unwrap().role == p::PayloadRole::Weights as i32).cloned().collect::<Vec<_>>(), weight_records);
+            assert!(rank.body.initializers.len() <= count);
+            reduced += count - rank.body.initializers.len();
+        }
+        assert!(reduced > 1000);
+    }
+
+    #[test]
+    #[ignore = "reads the package supplied by FLARE_STATE_COMPACTION_PACKAGE; no CUDA or weight data reads"]
+    fn measure_stored_package_state_compaction() {
+        use helios_core::package::{protection, reader::Metadata};
+        let path = std::env::var_os("FLARE_STATE_COMPACTION_PACKAGE").expect("package path is required");
+        let metadata = Metadata::open(Path::new(&path)).unwrap();
+        let mut envelope = protection::envelope(&metadata.envelope).unwrap();
+        let before_envelope = envelope.encoded_len();
+        let mut total_before = 0;
+        let mut total_after = 0;
+        let mut total_padding = 0u64;
+        let mut total_copied = 0u64;
+        let mut total_verified = 0u64;
+        let mut total_writes = 0u64;
+        let started = std::time::Instant::now();
+        for signed in &mut envelope.ranks {
+            let body = p::RankBody::decode(signed.body.as_slice()).unwrap();
+            let mut catalog = schema::Catalog::new();
+            catalog.insert_all(&body.payloads).unwrap();
+            let state_ids: BTreeSet<_> = body.initializers.iter().filter_map(|value| value.source.as_ref())
+                .chain(body.modules.iter().flat_map(|module| &module.globals).filter_map(|value| value.contents.as_ref()))
+                .filter(|value| value.role == p::PayloadRole::InitialState as i32)
+                .map(|value| value.slice.as_ref().unwrap().payload_id.clone()).collect();
+            let files = metadata.payloads(&catalog, state_ids.iter().map(Vec::as_slice)).unwrap();
+            let payloads = state_ids.iter().map(|id| producer::PublishPayload {
+                id: helios_core::package::PayloadId::from_bytes(id.as_slice().try_into().unwrap()),
+                role: p::PayloadRole::InitialState,
+                relative: metadata.locations.locations.iter().find(|location| &location.payload_id == id).unwrap().file.clone(),
+                source: files.get(id).unwrap().clone(), tensor: None,
+            }).collect();
+            let original = body.initializers.clone();
+            let modules = body.modules.clone();
+            let allocations = body.allocations.clone();
+            let before_bytes = body.encoded_len();
+            let mut rank = producer::PublishRank { body, payloads, resources: vec![] };
+            let scratch = tempfile::Builder::new().prefix("state-compaction-measure-")
+                .tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            compact_initial_state(&mut rank, scratch.path(), signed.rank).unwrap();
+            assert_eq!(rank.body.allocations, allocations);
+            assert_eq!(rank.body.modules, modules);
+            let mut copied = 0u64;
+            let mut padding = 0u64;
+            let mut affected = BTreeSet::new();
+            for initializer in &rank.body.initializers {
+                let source = initializer.source.as_ref().unwrap().slice.as_ref().unwrap();
+                if state_ids.contains(&source.payload_id) || initializer.source.as_ref().unwrap().role != p::PayloadRole::InitialState as i32 {
+                    continue;
+                }
+                let end = initializer.destination_offset + source.nbytes;
+                let mut source_bytes = 0u64;
+                for old in &original {
+                    let slice = old.source.as_ref().unwrap().slice.as_ref().unwrap();
+                    if old.allocation == initializer.allocation && old.destination_offset >= initializer.destination_offset
+                        && old.destination_offset + slice.nbytes <= end
+                    {
+                        assert_eq!(old.source.as_ref().unwrap().role, p::PayloadRole::InitialState as i32);
+                        source_bytes += slice.nbytes;
+                        affected.insert(slice.payload_id.clone());
+                    }
+                }
+                copied += source_bytes;
+                padding += source.nbytes - source_bytes;
+            }
+            let writes = rank.payloads.iter().filter(|payload| !state_ids.contains(payload.id.as_bytes().as_slice()))
+                .map(|payload| payload.source.len()).sum::<u64>();
+            let verified = affected.iter().map(|id| files.get(id).unwrap().len()).sum::<u64>();
+            let retained: BTreeSet<_> = rank.payloads.iter().map(|payload| payload.id.as_bytes().to_vec()).collect();
+            rank.body.payloads.retain(|descriptor| !state_ids.contains(&descriptor.id) || retained.contains(&descriptor.id));
+            for payload in &rank.payloads {
+                if !state_ids.contains(payload.id.as_bytes().as_slice()) {
+                    let descriptor = p::PayloadDescriptor { id: payload.id.as_bytes().to_vec(), nbytes: payload.source.len() };
+                    catalog.insert(&descriptor).unwrap();
+                    rank.body.payloads.push(descriptor);
+                }
+            }
+            let after_bytes = rank.body.encoded_len();
+            total_before += original.len();
+            total_after += rank.body.initializers.len();
+            total_padding += padding;
+            total_copied += copied;
+            total_verified += verified;
+            total_writes += writes;
+            println!("{}", serde_json::json!({"rank": signed.rank,
+                "initializers_before": original.len(), "initializers_after": rank.body.initializers.len(),
+                "rank_wire_bytes_before": before_bytes, "rank_wire_bytes_after": after_bytes,
+                "zero_padding_bytes": padding, "state_source_bytes_copied": copied,
+                "state_source_bytes_verified": verified, "new_state_payload_bytes": writes}));
+            signed.body = rank.body.encode_to_vec();
+        }
+        println!("{}", serde_json::json!({"scope": "unsigned wire-size measurement; no package publication or signature changes",
+            "envelope_bytes_before": before_envelope, "envelope_bytes_after": envelope.encoded_len(),
+            "initializers_before": total_before, "initializers_after": total_after,
+            "zero_padding_bytes": total_padding, "state_source_bytes_copied": total_copied,
+            "state_source_bytes_verified": total_verified, "new_state_payload_bytes": total_writes,
+            "elapsed_seconds": started.elapsed().as_secs_f64()}));
     }
 }

@@ -299,6 +299,50 @@ pub struct PublishRequest {
     pub no_weights: bool,
 }
 
+#[derive(Default)]
+struct MetadataSections {
+    sections: BTreeMap<&'static str, (usize, usize)>,
+}
+
+impl MetadataSections {
+    fn messages<'a, T: Message + 'a>(
+        &mut self, name: &'static str, tag: u32, values: impl IntoIterator<Item = &'a T>,
+    ) {
+        let section = self.sections.entry(name).or_default();
+        for value in values {
+            section.0 += 1;
+            section.1 += prost::encoding::message::encoded_len(tag, value);
+        }
+    }
+
+    fn rank(&mut self, body: &wire::RankBody) {
+        self.messages("contexts", 3, body.context.iter());
+        self.messages("reservations", 4, &body.reservations);
+        self.messages("allocations", 5, &body.allocations);
+        self.messages("initializers", 6, &body.initializers);
+        self.messages("payloads", 7, &body.payloads);
+        self.messages("resources", 8, &body.resources);
+        self.messages("modules", 9, &body.modules);
+        self.messages("functions", 10, &body.functions);
+        self.messages("graphs", 11, &body.graphs);
+        let events = self.sections.entry("events").or_default();
+        events.0 += body.events.len();
+        events.1 += body.events.iter().map(|name| prost::encoding::string::encoded_len(12, name)).sum::<usize>();
+        self.messages("peers", 13, &body.peers);
+        self.messages("execution", 14, body.execution.iter());
+        self.messages("transport", 15, body.roce.iter());
+        self.messages("prepared_weights", 16, body.prepared_weights.iter());
+        self.messages("compressed_prepared_weights", 17, body.compressed_prepared_weights.iter());
+    }
+
+    fn describe(&self) -> String {
+        let mut sections: Vec<_> = self.sections.iter().filter(|(_, (count, _))| *count > 0).collect();
+        sections.sort_by_key(|(_, (_, nbytes))| std::cmp::Reverse(*nbytes));
+        format!("rank metadata sections: {}", sections.into_iter().map(|(name, (count, nbytes))|
+            format!("{name}={count} records/{nbytes} bytes")).collect::<Vec<_>>().join(", "))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishedPayload {
     pub id: PayloadId,
@@ -428,6 +472,7 @@ fn publish_inner(
     frontend_phase.finish(format!("{frontend_bytes} bytes"));
     let mut resource_id = 1u64;
     let mut resource_ids = std::collections::BTreeSet::new();
+    let mut metadata_sections = MetadataSections::default();
     let mut deployments = Vec::new();
     let mut ranks = Vec::new();
     for (index, deployment) in request.deployments.iter().enumerate() {
@@ -653,6 +698,7 @@ fn publish_inner(
                 u32::try_from(deployment.ranks.len()).map_err(|_| invalid("too many ranks"))?;
             schema::validate_rank(&rank_body, ranks_count, &mut catalog, &mut resource_ids)?;
             coalesce_initializers(&mut rank_body.initializers)?;
+            metadata_sections.rank(&rank_body);
             let encoded = wire::RankBody::encode_to_vec(&rank_body);
             body.ranks.push(wire::RankCommitment {
                 rank: rank_body.rank,
@@ -717,7 +763,8 @@ fn publish_inner(
     for (index, rank, body) in ranks {
         builder.rank(index, rank, body)?;
     }
-    let manifest = builder.sign(key)?;
+    let manifest = builder.sign(key).map_err(|error|
+        invalid(format!("{error}; {}", metadata_sections.describe())))?;
     let publisher = crate::runtime_package::Publisher {
         name: request
             .package
@@ -1459,6 +1506,25 @@ impl Sha256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_sections_report_record_counts_and_encoded_wire_bytes() {
+        let body = wire::RankBody {
+            initializers: vec![wire::Initializer { allocation: "data".into(), destination_offset: 9, source: None }],
+            functions: vec![wire::Function { module: "module".into(), symbol: "entry".repeat(10), ..Default::default() }],
+            events: vec!["ready".into(), "done".into()],
+            ..Default::default()
+        };
+        let mut sections = MetadataSections::default();
+        sections.rank(&body);
+        let report = sections.describe();
+        assert!(report.contains(&format!("initializers=1 records/{} bytes",
+            prost::encoding::message::encoded_len(6, &body.initializers[0]))));
+        assert!(report.contains(&format!("functions=1 records/{} bytes",
+            prost::encoding::message::encoded_len(10, &body.functions[0]))));
+        assert!(report.contains("events=2 records/13 bytes"));
+        assert!(!report.contains("modules="));
+    }
 
     fn scratch(name: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
