@@ -982,26 +982,32 @@ Prepare `moonshotai/Kimi-K3.1-Pro` on sixteen RTX PRO 6000 Blackwell GPUs with
 image support and the full-context MLA draft
 `Inferact/Kimi-K3.1-Pro-DSpark-preview`:
 
-Preparation requires FlashInfer's unrotated FP8 index-query support. For
-development with paired source checkouts, install the FlashInfer checkout
-containing `glm_pool.plan_queries(..., rotation="none")` after setting up the
-preparation environment:
+Preparation requires FlashInfer's unrotated FP8 index-query support and TP16
+gather preparation. The preparation dependency pins the matching FlashInfer
+revision. For development, an editable sibling checkout must contain those
+changes:
 
 ```sh
 uv pip install --python .venv/bin/python --no-deps -e ../flashinfer
 
 .venv/bin/ignition export kimi-k3.1-pro --gpus 0-15 \
-  --max-concurrency 32 --image-concurrency 4 --prefill-chunk-size 4096 \
+  --max-concurrency 4 --image-concurrency 4 --prefill-chunk-size 4096 \
   --mtp-draft-tokens 7 --speculative-token-capacity 128 \
-  --speculative-graph-budget 64 --autotune-effort default --compile-workers 64
+  --speculative-graph-budget 64 --online-mxfp8 \
+  --collective-tuning static --autotune-effort default --compile-workers 16
 
 ./flare/target/release/flare run moonshotai/Kimi-K3.1-Pro \
   --gpus 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
   --host 127.0.0.1 --port 8000
 ```
 
-This integration has been tested at component level; complete model export and
-serving remain untested.
+Native text, image, concurrent-request and 32K recall checks passed with a
+TP16/C4/K7 package using BF16 dense projections, CSF experts and 1024-token
+prefill chunks. The MXFP8/4096 configuration above has not completed export
+qualification. Large forward compilers have exceeded 100 GiB RAM per process;
+the worker-count limit is not a reliable RAM estimate for these graphs. See
+[Kimi K3.1 preparation handoff](kimi-k3.1-preparation.md) for the compiler patch,
+component checks and the remaining qualification work.
 
 The decoder retains K3's KDA, attention residuals, latent MoE and image encoder.
 Its 24 sparse layers use 32 learned index heads to select 2,048 causal positions.

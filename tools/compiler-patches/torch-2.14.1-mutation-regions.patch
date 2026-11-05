@@ -1,0 +1,86 @@
+--- a/torch/_inductor/pattern_matcher.py
++++ b/torch/_inductor/pattern_matcher.py
+@@ -2606,8 +2606,17 @@
+     def __getitem__(self, item: tuple[str, torch.fx.node.Target]) -> list[PatternEntry]:
+         return self.patterns[item]
+ 
+-    def apply(self, gm: torch.fx.GraphModule | torch.fx.Graph) -> int:
+-        """Apply all registered patterns to the graph, returning the number of matches."""
++    def apply(
++        self, gm: torch.fx.GraphModule | torch.fx.Graph, *,
++        defer_mutation_region_refresh: bool = False,
++    ) -> int:
++        """Apply registered patterns, returning the number of matches.
++
++        Deferred mutation-region refresh requires singleton matches. Handlers,
++        extra checks, and graph hooks must not inspect mutation-region IDs during
++        the pass. IDs are rebuilt once before a successful return. Other passes
++        retain mutation-boundary checks and refresh after each relevant rewrite.
++        """
+         if not self.patterns:
+             return 0
+         if isinstance(gm, torch.fx.GraphModule):
+@@ -2619,7 +2628,7 @@
+             raise RuntimeError(
+                 f"The input to PatternMatcherPass must be a GraphModule or a Graph, but got {type(gm)}"
+             )
+-        if should_compute_mutation_region_ids(graph):
++        if not defer_mutation_region_refresh and should_compute_mutation_region_ids(graph):
+             compute_mutation_region_ids(graph)
+         get_mutation_region_id_partial = functools.partial(
+             get_mutation_region_id, graph
+@@ -2654,9 +2663,12 @@
+                     if node._erased:
+                         break
+                     m = entry.pattern.match(node)
++                    if defer_mutation_region_refresh and is_match(m) and len(m.nodes) != 1:
++                        raise AssertionError("deferred mutation-region refresh requires singleton matches")
+                     # pattern match crosses mutation barrier - discard
+                     if (
+-                        is_match(m)
++                        not defer_mutation_region_refresh
++                        and is_match(m)
+                         and len(
+                             OrderedSet(map(get_mutation_region_id_partial, m.nodes))
+                         )
+@@ -2684,7 +2696,9 @@
+ 
+                     if is_match(m) and guard_or_false(entry.extra_check(m)):
+                         count += 1
+-                        if isinstance(entry, ReplacementPatternEntry):
++                        if defer_mutation_region_refresh:
++                            mutation_region_refresh = None
++                        elif isinstance(entry, ReplacementPatternEntry):
+                             mutation_region_refresh = (
+                                 _mutation_region_refresh(graph, m.nodes)
+                                 if _replacement_changes_mutation_regions(entry, m)
+@@ -2701,7 +2715,7 @@
+                                 graph, _common_custom_context(m.nodes)
+                             ) as mutation_tracker:
+                                 entry.apply(m, graph, node)
+-                            if mutation_tracker.changed_mutation_regions():
++                            if not defer_mutation_region_refresh and mutation_tracker.changed_mutation_regions():
+                                 compute_mutation_region_ids(graph)
+                         elif mutation_region_refresh is not None:
+                             entry.apply(m, graph, node)
+@@ -2723,6 +2737,8 @@
+ 
+                             pattern_key = f"{backend}_pattern_matcher_per_pattern"
+                             counters[pattern_key][pattern_name] += 1
++        if defer_mutation_region_refresh:
++            compute_mutation_region_ids(graph)
+         return count
+ 
+     def clear(self) -> None:
+--- a/torch/_inductor/fx_passes/post_grad.py
++++ b/torch/_inductor/fx_passes/post_grad.py
+@@ -1651,7 +1651,8 @@
+         # pyrefly: ignore [bad-argument-type]
+         match.replace_by_example(decomp, flat_args, run_functional_passes=False)
+ 
+-    graph_pass.apply(graph)
++    # Each auto-functionalized pattern matches one node and does not read region IDs.
++    graph_pass.apply(graph, defer_mutation_region_refresh=True)
+ 
+     # Remove unused get_attr nodes and their corresponding attributes from the graph module.
+     # When auto_functionalizing a hop, we need to clean up get_attr nodes for _constant_schema

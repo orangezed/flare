@@ -4,3 +4,6 @@ packaging/license-supplements/** -text
 
 # Preserve the bytes used by chat-template digests and embedded template parsing.
 ignition/recipes/*/assets/*.jinja text eol=lf
+
+# Unified diffs represent an empty context line with one literal space.
+tools/compiler-patches/*.patch whitespace=-blank-at-eol
