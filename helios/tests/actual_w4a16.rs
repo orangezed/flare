@@ -22,7 +22,7 @@ use std::{
 
 use flare_helios::package::{
     cache, container, conversion, derivation, protection, reader,
-    schema::wire, PayloadId,
+    schema::{self, wire}, PayloadId,
 };
 use flare_helios::runtime_package::Publisher;
 use prost::Message as _;
@@ -219,10 +219,13 @@ fn actual_w4a16_combine_preserves_all_initializers_and_globals() {
     let tp2_selection = tp_selection(&tp2_metadata, &profiles, 2);
     let tp2_verified =
         protection::verify(&tp2_metadata.envelope, &profiles, tp2_selection).unwrap();
-    let (expected_reusable_weight_bytes, expected_exception_bytes) = tp2_verified
+    let tp2_catalogs: Vec<_> = tp2_verified
         .ranks()
         .iter()
-        .filter_map(|rank| rank.prepared_weights.as_ref())
+        .filter_map(|rank| schema::prepared_weights(rank).unwrap())
+        .collect();
+    let (expected_reusable_weight_bytes, expected_exception_bytes) = tp2_catalogs
+        .iter()
         .flat_map(|catalog| &catalog.views)
         .fold((0u64, 0u64), |(weights, exceptions), view| {
             if view.sources.iter().any(|source| !source.pieces.is_empty()) {
@@ -238,10 +241,8 @@ fn actual_w4a16_combine_preserves_all_initializers_and_globals() {
         "fixture contains no rank bytes to compare"
     );
     assert!(
-        tp2_verified
-            .ranks()
+        tp2_catalogs
             .iter()
-            .filter_map(|rank| rank.prepared_weights.as_ref())
             .flat_map(|catalog| &catalog.views)
             .flat_map(|view| &view.sources)
             .any(|source| !source.pieces.is_empty() || !source.piece_encoding.is_empty()),
@@ -283,13 +284,11 @@ fn actual_w4a16_combine_preserves_all_initializers_and_globals() {
             .find(|rank| rank.rank == expected.rank)
             .expect("combined TP2 rank missing");
         assert_eq!(
-            expected
-                .prepared_weights
-                .as_ref()
+            schema::prepared_weights(expected)
+                .unwrap()
                 .map(|catalog| catalog.encode_to_vec()),
-            actual
-                .prepared_weights
-                .as_ref()
+            schema::prepared_weights(actual)
+                .unwrap()
                 .map(|catalog| catalog.encode_to_vec()),
             "rank {} prepared weight catalog changed",
             expected.rank

@@ -10,10 +10,13 @@
 //! [`wire::LocationSet`]. Every validator here is bounded: it checks sizes, identifier shapes,
 //! arithmetic, and cross-references before any consumer allocates from the data.
 
-use super::invalid;
+use super::{invalid, protection};
 use crate::Result;
 use crate::runtime_package::wire as runtime;
+use prost::Message;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Cursor, Read};
 
 pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/flare.package.rs"));
@@ -610,7 +613,7 @@ pub fn validate_rank(
             return Err(invalid("invalid peer memory reader"));
         }
     }
-    if let Some(weights) = &body.prepared_weights {
+    if let Some(weights) = prepared_weights(body)? {
         let ordered: Vec<(&str, u64)> = body
             .allocations
             .iter()
@@ -621,7 +624,7 @@ pub fn validate_rank(
                 )
             })
             .collect();
-        validate_prepared_weights(weights, &ordered)?;
+        validate_prepared_weights(&weights, &ordered)?;
     }
     Ok(())
 }
@@ -715,6 +718,77 @@ fn validate_resource(resource: &wire::ExecutableResource, catalog: &Catalog) -> 
     };
     catalog.check_use(&use_, &[role])?;
     Ok(())
+}
+
+/// Encode preparation provenance as one bounded frame inside the signed rank body.
+pub fn compress_prepared_weights(
+    catalog: &wire::PreparedWeightCatalog,
+) -> Result<wire::CompressedPreparedWeightCatalog> {
+    let decoded_nbytes = catalog.encoded_len();
+    if decoded_nbytes == 0 || decoded_nbytes > MAX_BODY {
+        return Err(invalid(
+            "prepared weight catalog exceeds its decoded size bound",
+        ));
+    }
+    let (zstd, _) = protection::compress(&catalog.encode_to_vec())?;
+    if zstd.len() > MAX_BODY {
+        return Err(invalid(
+            "prepared weight catalog exceeds its stored size bound",
+        ));
+    }
+    Ok(wire::CompressedPreparedWeightCatalog {
+        decoded_nbytes: decoded_nbytes as u64,
+        zstd,
+    })
+}
+
+/// Read either catalog representation without cloning an inline catalog.
+///
+/// The enclosing rank signature covers the exact stored frame; callers remain responsible
+/// for publisher authentication. Semantic validation remains part of [`validate_rank`].
+pub fn prepared_weights(
+    body: &wire::RankBody,
+) -> Result<Option<Cow<'_, wire::PreparedWeightCatalog>>> {
+    let compressed = match (&body.prepared_weights, &body.compressed_prepared_weights) {
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "rank declares both inline and compressed prepared weights",
+            ));
+        }
+        (Some(catalog), None) => return Ok(Some(Cow::Borrowed(catalog))),
+        (None, None) => return Ok(None),
+        (None, Some(compressed)) => compressed,
+    };
+    if compressed.decoded_nbytes == 0 || compressed.decoded_nbytes > MAX_BODY as u64 {
+        return Err(invalid(
+            "prepared weight catalog exceeds its decoded size bound",
+        ));
+    }
+    if compressed.zstd.is_empty() || compressed.zstd.len() > MAX_BODY {
+        return Err(invalid(
+            "prepared weight catalog exceeds its stored size bound",
+        ));
+    }
+    // The enclosing rank signature authenticates these bytes. Derive chunk commitments
+    // locally to reuse the executable decoder's exact-length, window, and frame checks.
+    let chunks: Vec<_> = compressed
+        .zstd
+        .chunks(protection::CHUNK)
+        .map(|chunk| protection::sha256(chunk).to_vec())
+        .collect();
+    let mut reader = protection::open_compressed_reader(
+        Cursor::new(&compressed.zstd),
+        compressed.zstd.len() as u64,
+        compressed.decoded_nbytes,
+        &chunks,
+    )?;
+    let mut decoded = Vec::with_capacity(compressed.decoded_nbytes as usize);
+    reader
+        .read_to_end(&mut decoded)
+        .map_err(|error| invalid(format!("decode prepared weight catalog: {error}")))?;
+    let catalog = wire::PreparedWeightCatalog::decode(decoded.as_slice())
+        .map_err(|error| invalid(format!("parse prepared weight catalog: {error}")))?;
+    Ok(Some(Cow::Owned(catalog)))
 }
 
 fn validate_prepared_weights(
@@ -1295,6 +1369,175 @@ mod tests {
         let mut no_dtype = view(0, 64);
         no_dtype.dtype.clear();
         assert!(validate_prepared_weights(&catalog(no_dtype), &extents).is_err());
+    }
+
+    fn weight_catalog() -> wire::PreparedWeightCatalog {
+        wire::PreparedWeightCatalog {
+            version: 1,
+            views: vec![wire::PreparedWeightView {
+                name: "layer.0.weight".into(),
+                group: "layer-000".into(),
+                dtype: "uint8".into(),
+                element_bytes: 1,
+                shape: vec![2, 8],
+                stride: vec![8, 1],
+                nbytes: 16,
+                sources: vec![wire::WeightSource {
+                    tensor: "model.layers.0.weight".into(),
+                    ranges: vec![
+                        wire::TensorRange { begin: 0, end: 2 },
+                        wire::TensorRange { begin: 0, end: 8 },
+                    ],
+                    pieces: vec![wire::WeightPiece {
+                        contiguous_bytes: 8,
+                        extents: vec![2],
+                        source_strides: vec![8],
+                        destination_strides: vec![8],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            unavailable: vec!["unmapped.scalar".into()],
+        }
+    }
+
+    #[test]
+    fn prepared_weight_representations_preserve_geometry_validation() {
+        let original = weight_catalog();
+        for compressed in [false, true] {
+            for fault in [
+                "none",
+                "range",
+                "allocation",
+                "stride",
+                "piece",
+                "encoding",
+                "version",
+            ] {
+                let mut weights = original.clone();
+                match fault {
+                    "range" => weights.views[0].sources[0].ranges[0].end = 0,
+                    "allocation" => weights.views[0].allocation = 1,
+                    "stride" => weights.views[0].stride[0] = 16,
+                    "piece" => weights.views[0].sources[0].pieces[0].destination_offset = 1,
+                    "encoding" => {
+                        weights.views[0].sources[0].piece_encoding = "bad encoding".into()
+                    }
+                    "version" => weights.version = 0,
+                    _ => {}
+                }
+                let (mut rank, mut payloads) = module_rank();
+                if compressed {
+                    rank.compressed_prepared_weights =
+                        Some(compress_prepared_weights(&weights).unwrap());
+                } else {
+                    rank.prepared_weights = Some(weights.clone());
+                }
+                assert_eq!(prepared_weights(&rank).unwrap().unwrap().as_ref(), &weights);
+                let result = validate_rank(&rank, 1, &mut payloads, &mut BTreeSet::new());
+                assert_eq!(
+                    result.is_ok(),
+                    fault == "none",
+                    "compressed={compressed}, fault={fault}: {result:?}"
+                );
+            }
+        }
+        let (mut rank, mut payloads) = module_rank();
+        assert!(prepared_weights(&rank).unwrap().is_none());
+        rank.prepared_weights = Some(original.clone());
+        assert!(matches!(
+            prepared_weights(&rank).unwrap(),
+            Some(Cow::Borrowed(_))
+        ));
+        rank.compressed_prepared_weights = Some(compress_prepared_weights(&original).unwrap());
+        assert!(
+            validate_rank(&rank, 1, &mut payloads, &mut BTreeSet::new())
+                .unwrap_err()
+                .to_string()
+                .contains("both inline and compressed")
+        );
+    }
+
+    #[test]
+    fn compressed_prepared_weights_reject_corruption_lengths_and_trailing_data() {
+        let original = compress_prepared_weights(&weight_catalog()).unwrap();
+        for fault in [
+            "checksum",
+            "truncated",
+            "trailing",
+            "second-frame",
+            "short",
+            "long",
+            "zero",
+            "decoded-limit",
+            "empty",
+            "stored-limit",
+            "protobuf",
+        ] {
+            let mut compressed = original.clone();
+            match fault {
+                "checksum" => *compressed.zstd.last_mut().unwrap() ^= 1,
+                "truncated" => {
+                    compressed.zstd.pop();
+                }
+                "trailing" => compressed.zstd.push(0),
+                "second-frame" => compressed.zstd.extend_from_slice(&original.zstd),
+                "short" => compressed.decoded_nbytes -= 1,
+                "long" => compressed.decoded_nbytes += 1,
+                "zero" => compressed.decoded_nbytes = 0,
+                "decoded-limit" => compressed.decoded_nbytes = MAX_BODY as u64 + 1,
+                "empty" => compressed.zstd.clear(),
+                "stored-limit" => compressed.zstd.resize(MAX_BODY + 1, 0),
+                "protobuf" => {
+                    compressed.zstd = protection::compress(&[0xff]).unwrap().0;
+                    compressed.decoded_nbytes = 1;
+                }
+                _ => unreachable!(),
+            }
+            let rank = wire::RankBody {
+                compressed_prepared_weights: Some(compressed),
+                ..Default::default()
+            };
+            assert!(prepared_weights(&rank).is_err(), "fault={fault}");
+        }
+        let oversized = wire::PreparedWeightCatalog {
+            version: 1,
+            unavailable: vec!["x".repeat(MAX_BODY)],
+            ..Default::default()
+        };
+        assert!(
+            compress_prepared_weights(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("decoded size bound")
+        );
+    }
+
+    #[test]
+    fn compressed_prepared_weights_enforce_the_decoder_window_bound() {
+        use std::io::Write;
+        let catalog = wire::PreparedWeightCatalog {
+            version: 1,
+            unavailable: vec!["x".repeat((1 << 23) + 1)],
+            ..Default::default()
+        };
+        let bytes = catalog.encode_to_vec();
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        encoder
+            .set_pledged_src_size(Some(bytes.len() as u64))
+            .unwrap();
+        encoder.window_log(24).unwrap();
+        encoder.write_all(&bytes).unwrap();
+        let rank = wire::RankBody {
+            compressed_prepared_weights: Some(wire::CompressedPreparedWeightCatalog {
+                decoded_nbytes: bytes.len() as u64,
+                zstd: encoder.finish().unwrap(),
+            }),
+            ..Default::default()
+        };
+        assert!(prepared_weights(&rank).is_err());
     }
 
     #[test]

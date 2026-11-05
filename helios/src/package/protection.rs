@@ -1230,10 +1230,17 @@ mod tests {
             execution: Some(runtime::Execution::default()),
             roce: None,
             prepared_weights: None,
+            compressed_prepared_weights: None,
         }
     }
 
     fn fixture() -> Fixture {
+        fixture_for_ranks((0..2).map(rank_body).collect())
+    }
+
+    fn fixture_for_ranks(rank_bodies: Vec<wire::RankBody>) -> Fixture {
+        let tensor_parallel = rank_bodies.len() as u32;
+        let deployment_id = rank_bodies[0].deployment_id.clone();
         let rng = SystemRandom::new();
         let pkcs8 = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
         let signing_key = signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
@@ -1263,13 +1270,14 @@ mod tests {
             payloads: vec![payload(1, fixture_executable_nbytes())],
             assets: vec![],
             deployments: vec![wire::DeploymentCommitment {
-                deployment_id: "sm120-tp2".into(),
+                deployment_id: deployment_id.clone(),
                 body_digest: vec![0; 32],
             }],
         };
         let mut body = package_body.clone();
-        let ranks: Vec<(u32, Vec<u8>)> = (0..2)
-            .map(|rank| (rank, wire::RankBody::encode_to_vec(&rank_body(rank))))
+        let ranks: Vec<(u32, Vec<u8>)> = rank_bodies
+            .into_iter()
+            .map(|body| (body.rank, body.encode_to_vec()))
             .collect();
         let deployment_ranks: Vec<wire::RankCommitment> = ranks
             .iter()
@@ -1279,9 +1287,9 @@ mod tests {
             })
             .collect();
         let deployment = wire::DeploymentBody {
-            deployment_id: "sm120-tp2".into(),
+            deployment_id,
             architecture: vec![12, 0],
-            tensor_parallel: 2,
+            tensor_parallel,
             contract: Some(runtime::ServingContract::default()),
             cluster: None,
             rebuild: None,
@@ -1309,6 +1317,140 @@ mod tests {
             signing_key,
             package_id,
         }
+    }
+
+    #[test]
+    fn signatures_cover_compressed_prepared_weights_and_legacy_catalogs_still_load() {
+        let catalog = wire::PreparedWeightCatalog {
+            version: 1,
+            views: vec![wire::PreparedWeightView {
+                name: "weight".into(),
+                dtype: "uint8".into(),
+                element_bytes: 1,
+                shape: vec![16],
+                stride: vec![1],
+                nbytes: 16,
+                ..Default::default()
+            }],
+            unavailable: vec!["unmapped.scalar".into()],
+        };
+        let mut legacy = rank_body(0);
+        legacy.prepared_weights = Some(catalog.clone());
+        let mut compressed = rank_body(1);
+        compressed.compressed_prepared_weights =
+            Some(schema::compress_prepared_weights(&catalog).unwrap());
+        let fixture = fixture_for_ranks(vec![legacy, compressed]);
+        let selection = Selection::Deployment {
+            deployment: 0,
+            rank: None,
+        };
+        let verified = verify(&fixture.envelope, &fixture.publishers, selection).unwrap();
+        for rank in verified.ranks() {
+            assert_eq!(
+                schema::prepared_weights(rank).unwrap().unwrap().as_ref(),
+                &catalog
+            );
+        }
+        let mut changed = envelope(&fixture.envelope).unwrap();
+        let mut rank = wire::RankBody::decode(changed.ranks[1].body.as_slice()).unwrap();
+        *rank
+            .compressed_prepared_weights
+            .as_mut()
+            .unwrap()
+            .zstd
+            .last_mut()
+            .unwrap() ^= 1;
+        changed.ranks[1].body = rank.encode_to_vec();
+        assert!(verify(&changed.encode_to_vec(), &fixture.publishers, selection).is_err());
+    }
+
+    #[test]
+    #[ignore = "CPU stress test: 247296 checkpoint source names per rank across 16 signed ranks"]
+    fn compressed_prepared_weights_bound_a_sixteen_rank_expert_catalog() {
+        const SOURCES: usize = 247_296;
+        const RANKS: u32 = 16;
+        let sources: Vec<_> = (0..SOURCES)
+            .map(|index| wire::WeightSource {
+                tensor: format!(
+                    "model.language_model.layers.{}.mlp.experts.{}.gate_up_proj.weight_scale_inv",
+                    index / 4096,
+                    index % 4096,
+                ),
+                ranges: vec![
+                    wire::TensorRange { begin: 0, end: 2 },
+                    wire::TensorRange { begin: 0, end: 8 },
+                ],
+                pieces: vec![wire::WeightPiece {
+                    destination_offset: index as u64 * 16,
+                    contiguous_bytes: 8,
+                    extents: vec![2],
+                    source_strides: vec![8],
+                    destination_strides: vec![8],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect();
+        let names_nbytes = sources
+            .iter()
+            .map(|source| source.tensor.len())
+            .sum::<usize>()
+            * RANKS as usize;
+        assert!(names_nbytes > 300_000_000);
+        let catalog = wire::PreparedWeightCatalog {
+            version: 1,
+            views: vec![wire::PreparedWeightView {
+                name: "experts.weight".into(),
+                dtype: "uint8".into(),
+                element_bytes: 1,
+                shape: vec![SOURCES as u64 * 16],
+                stride: vec![1],
+                nbytes: SOURCES as u64 * 16,
+                sources,
+                ..Default::default()
+            }],
+            unavailable: vec![],
+        };
+        let mut legacy = rank_body(0);
+        legacy.prepared_weights = Some(catalog);
+        let inline_rank_nbytes = legacy.encoded_len();
+        assert!(inline_rank_nbytes < schema::MAX_BODY);
+        assert!(inline_rank_nbytes * RANKS as usize > schema::MAX_ENVELOPE);
+        let encoded =
+            schema::compress_prepared_weights(legacy.prepared_weights.as_ref().unwrap()).unwrap();
+        let decoded_nbytes = encoded.decoded_nbytes;
+        let stored_nbytes = encoded.zstd.len();
+        let expected = sha256(&legacy.prepared_weights.take().unwrap().encode_to_vec());
+        let ranks = (0..RANKS)
+            .map(|rank| {
+                let mut body = rank_body(rank);
+                body.deployment_id = "sm120-tp16".into();
+                body.allocations[0].nbytes = (SOURCES as u64 * 16).div_ceil(4096) * 4096;
+                body.compressed_prepared_weights = Some(encoded.clone());
+                body
+            })
+            .collect();
+        let fixture = fixture_for_ranks(ranks);
+        assert!(fixture.envelope.len() < schema::MAX_ENVELOPE);
+        let verified = verify(
+            &fixture.envelope,
+            &fixture.publishers,
+            Selection::Deployment {
+                deployment: 0,
+                rank: None,
+            },
+        )
+        .unwrap();
+        for rank in verified.ranks() {
+            let decoded = schema::prepared_weights(rank).unwrap().unwrap();
+            assert_eq!(decoded.views[0].sources.len(), SOURCES);
+            assert_eq!(sha256(&decoded.encode_to_vec()), expected);
+        }
+        eprintln!(
+            "sources_per_rank={SOURCES} ranks={RANKS} source_name_bytes={names_nbytes} inline_rank_bytes={inline_rank_nbytes} inline_rank_total_bytes={} decoded_catalog_bytes={decoded_nbytes} stored_catalog_bytes={stored_nbytes} signed_envelope_bytes={}",
+            inline_rank_nbytes * RANKS as usize,
+            fixture.envelope.len(),
+        );
     }
 
     #[test]

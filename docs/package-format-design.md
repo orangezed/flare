@@ -216,6 +216,17 @@ statistics declare their tensor, expert, or shard domain. These records describe
 how to match byte regions; Helios serving does not interpret them. Exact target
 byte comparison remains required even when these declarations agree.
 
+Exporters store each rank's catalog as a Zstd-compressed Protobuf frame in
+`RankBody.compressed_prepared_weights`. Both its stored and decoded lengths are
+bounded by 128 MiB, and the complete envelope retains its 128 MiB limit. The
+rank signature covers the exact compressed bytes. Decoding accepts one complete
+frame with an 8 MiB maximum window, checks the declared decoded length, rejects
+trailing bytes, and applies the same source-range and view validation as an
+inline catalog. Readers also accept `RankBody.prepared_weights` from existing
+packages; declaring both representations is invalid. Serving validates and
+discards decoded provenance, while weight reuse and offline repacking consume
+the typed catalog.
+
 An unchanged checkpoint tensor may contribute several affine byte pieces to a
 retained owner, including expert concatenation and scale swizzles:
 

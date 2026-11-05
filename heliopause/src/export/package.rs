@@ -1910,10 +1910,8 @@ fn rank_plan(
         })
         .collect();
     let prepared = match bundle.rebuild_weights.as_ref() {
-        Some(catalog) => Some(convert_prepared(
-            catalog,
-            bundle,
-            rank.weight_payload.as_ref(),
+        Some(catalog) => Some(helios_core::package::schema::compress_prepared_weights(
+            &convert_prepared(catalog, bundle, rank.weight_payload.as_ref())?,
         )?),
         None => None,
     };
@@ -1944,7 +1942,8 @@ fn rank_plan(
             peers,
             execution: bundle.execution.clone(),
             roce: bundle.roce.clone(),
-            prepared_weights: prepared,
+            prepared_weights: None,
+            compressed_prepared_weights: prepared,
         },
         payloads,
         resources,
@@ -2995,6 +2994,21 @@ mod payload_export_tests {
         )?;
         let first_meta = Metadata::open(first_entry.directory())?;
         let second_meta = Metadata::open(second_entry.directory())?;
+        let profiles: Vec<helios_core::runtime_package::Publisher> = serde_json::from_str(&profiles)?;
+        for metadata in [&first_meta, &second_meta] {
+            let verified = helios_core::package::protection::verify(
+                &metadata.envelope,
+                &profiles,
+                helios_core::package::protection::Selection::Deployment {
+                    deployment: 0,
+                    rank: None,
+                },
+            )?;
+            let body = &verified.ranks()[0];
+            assert!(body.prepared_weights.is_none());
+            assert!(body.compressed_prepared_weights.is_some());
+            assert_eq!(helios_core::package::schema::prepared_weights(body)?.unwrap().views.len(), 4);
+        }
         for group in &groups {
             let locate = |metadata: &Metadata| {
                 metadata

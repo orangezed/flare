@@ -810,7 +810,7 @@ pub fn prepared_ranks(source: &Path, deployment: usize) -> Result<Vec<PreparedRa
             entries.sort_by_key(|entry| entry.0);
         }
         let mut owners = Vec::new();
-        if let Some(catalog) = &body.prepared_weights {
+        if let Some(catalog) = schema::prepared_weights(body)? {
             for view in &catalog.views {
                 let allocation = body
                     .allocations
@@ -3420,6 +3420,12 @@ fn publish_rank(
     use crate::package::export::{PublishPayload, PublishRank, PublishResource};
 
     let mut body = rank.clone();
+    if let Some(catalog) = body.prepared_weights.take() {
+        if body.compressed_prepared_weights.is_some() {
+            return Err(invalid("rank declares both inline and compressed prepared weights"));
+        }
+        body.compressed_prepared_weights = Some(schema::compress_prepared_weights(&catalog)?);
+    }
     body.resources.clear();
     let mut roles: BTreeMap<Vec<u8>, i32> = BTreeMap::new();
     for initializer in &body.initializers {
@@ -5209,6 +5215,53 @@ mod tests {
         )
         .unwrap();
         let authorized = verified.authorize("example").unwrap();
+        let before_rank = wire::RankBody::decode(before_envelope.ranks[0].body.as_slice()).unwrap();
+        let after_rank = &authorized.verified().ranks()[0];
+        assert!(before_rank.prepared_weights.is_some());
+        assert!(after_rank.prepared_weights.is_none());
+        assert!(after_rank.compressed_prepared_weights.is_some());
+        assert_eq!(
+            schema::prepared_weights(&before_rank).unwrap().unwrap(),
+            schema::prepared_weights(after_rank).unwrap().unwrap(),
+        );
+        let canonical_owners = prepared_ranks(&source, 0).unwrap();
+        let promoted_owners = prepared_ranks(&output, 0).unwrap();
+        assert!(!canonical_owners[0].owners.is_empty());
+        let plan = plan_rank(
+            &canonical_owners[0],
+            &promoted_owners[0],
+            &derivation::Limits::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.owners
+                .values()
+                .all(|owner| matches!(owner, OwnerShare::Identical { .. }))
+        );
+        let packed = scratch.join("promoted.safetensors");
+        pack(&output, &packed).unwrap();
+        let unpacked = scratch.join("promoted-unpacked");
+        unpack(&packed, &unpacked).unwrap();
+        for path in [&packed, &unpacked] {
+            let copied = Metadata::open(path).unwrap();
+            assert_eq!(copied.envelope, after.envelope);
+            let verified = protect::verify(
+                &copied.envelope,
+                std::slice::from_ref(&publisher),
+                Selection::Deployment {
+                    deployment: 0,
+                    rank: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                schema::prepared_weights(&verified.ranks()[0])
+                    .unwrap()
+                    .unwrap(),
+                schema::prepared_weights(after_rank).unwrap().unwrap(),
+            );
+        }
+
         // Payload bytes survive promotion unchanged.
         let canonical = PayloadId::of(&full);
         let catalog = authorized.verified().catalog().clone();
