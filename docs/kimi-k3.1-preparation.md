@@ -162,8 +162,10 @@ payloads including 184.55 MB of zero padding; weights were untouched.
 The compaction export succeeded with 41,627,807 metadata bytes (39.70 MiB),
 below the unchanged limit. Its cache entry is
 `/data/kimi31-support/package-cache/models/moonshotai_2FKimi-K3.1-Pro/gb202-tp16-202611052232`.
-Native serving remains unqualified: the initial target-only load ran out of
-GPU memory during graph instantiation.
+The initial unrestricted-catalog native load ran out of GPU memory during
+graph instantiation. With the explicit sparse prefill selection described
+below, native target-only serving passed all 13 functional checks. Decode,
+prefill and draft comparisons remain in measurement.
 
 Failed-export cleanup removed the per-rank source records and staging indexes.
 Immutable payload blobs remain in the cache, but they do not contain the graph
@@ -193,11 +195,25 @@ finished export and stopped after the native startup failure. Its export source
 is the detached worktree
 `/data/kimi31-support/flare-envelope-validation` at `9b4c7257`; its native
 extension is in `/data/kimi31-support/state-compaction-native-python`.
-No Kimi server is running on port 8170. The failed native process used
+The unrestricted-catalog native process used
 `--mtp-draft-tokens 0`; the draft was not executing. It loaded 1385.8 GiB
 weights in 241.4 seconds and 7360 kernels in 2.4 seconds, then failed at
 `cuGraphInstantiateWithFlags` with CUDA out-of-memory. KV/continuation physical
 cache backing occurs after graph preparation and was not the cause.
+An instrumentation-only retry identified accumulation of prefill executables:
+the 4096-row variant succeeds and consumes 852 MiB per rank, the 3584-row
+variant succeeds and adds 746 MiB, then the 3072-row variant fails with about
+315 MiB free. All five vision executables together consume only 4 MiB.
+Building the raw 319,681-node template consumes no observed GPU memory;
+module loading adds 152 MiB. These are measured driver-allocation deltas,
+not inference timings. The generic load-time `--prefill-graph-capacities 128,4096` selector preserves
+the maximum chunk size and omits unused intermediate prefill executables.
+Omission retains the complete catalog. CPU selection, scored-family, peer-rank
+and padding/live-page tests pass; the same Kimi package loads successfully
+with this flag. Graph preparation took 29.7 seconds, followed by 524,288 KV
+tokens and a 0.81–0.88 GiB cache budget per GPU. Thirteen native functional
+checks pass, including text, images, four concurrent images, conversation
+continuation, long-context recall and concurrent arithmetic.
 The package remains intact for native-only diagnosis; no re-export is needed
 to inspect its selected graphs and fixed allocations.
 Preparation has an 850 GiB service memory limit; an independent watcher stops
@@ -207,7 +223,15 @@ Tetris. The separate `astra-kimi31-state-compaction-k7-followup` unit then loads
 the same package with seven drafts, repeats checks and benchmarks, and leaves
 K7 serving. Its script is `/data/kimi31-support/after-target-first-benchmarks.py`.
 The followup stopped on the initial native failure without taking GPU action.
-These checks and measurements remain pending. Loading with zero drafts retains
+The replacement target-only service is `astra-kimi31-sparse-prefill-d0-c4`,
+PID 2860184 at publication, on port 8170. Its binary is
+`/data/kimi31-support/compile-study/native-prefill-selection-target/release/flare`;
+it uses the retained package with `--max-concurrency 4 --mtp-draft-tokens 0
+--no-mtp-adaptive-verification --prefill-graph-capacities 128,4096`.
+`astra-kimi31-sparse-target-validation` runs checks and C1/C4 decode, 32K prefill and Tetris
+measurements; inspect `/data/kimi31-support/execution-state.json` and
+`/data/kimi31-support/sparse-target-validation.log`. K7 has not yet been
+revalidated with the selector. Loading with zero drafts retains
 the package's prepared weights and cache layout; a package exported without
 drafts is required to measure the storage saved by excluding them.
 

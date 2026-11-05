@@ -188,7 +188,24 @@ continuations into existing graph inputs; it does not change the captured graphs
 record no history preference. Package defaults fill omitted settings; explicit
 startup settings win. Execution ABI labels do not gate loading; engine upgrades
 preserve previously supported model packages. Omitted capacity flags use package
-defaults. Only selected graphs and required kernels load. Continuation rows and KV pages receive physical
+defaults. `--prefill-graph-capacities 128,4096` selects a smaller dedicated
+prefill catalog when both capacities were captured. The list must retain the
+prepared maximum chunk size. Ordinary and scored prefill use the same selected
+capacities; prompts between them use padding or multiple steps. This reduces
+executable graph memory but can increase prefill time for intermediate prompt
+sizes. Omission loads every captured capacity.
+
+For a package captured through 4096 tokens with 128- and 4096-token prefill
+graphs, a complete native launch is:
+
+```sh
+./flare/target/release/flare run /data/flare/models/model.safetensors \
+  --gpus 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --max-concurrency 4 --mtp-draft-tokens 0 \
+  --prefill-graph-capacities 128,4096 --host 127.0.0.1 --port 8000
+```
+
+Only selected graphs and required kernels load. Continuation rows and KV pages receive physical
 storage according to those selections and available GPU memory.
 
 ### GPU graph latency benchmark
@@ -649,6 +666,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--served-model-name ALIAS` | Replace the package's serving aliases with this nonblank alias | Package aliases |
 | `--api-key-file PATH` | File containing the serving API key; an empty file disables authentication | `[server] api_key`, otherwise no authentication |
 | `--max-concurrency N` | Reduce concurrency within captured batch capacities | Model/default configuration, otherwise package default |
+| `--prefill-graph-capacities N[,N...]` | Load only these captured dedicated prefill capacities for ordinary and scored prefill. Values must be distinct positive multiples of 64 and retain the prepared maximum chunk. Command line only. Start with `128,4096` on graph-memory constrained hosts when both were captured. | All captured capacities |
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
 | `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise package serving reserve |
 | `--mtp-draft-tokens N` | Reduce the maximum draft count; zero selects ordinary execution without draft generation, absorption, or draft-state maintenance | Package default |
