@@ -158,8 +158,12 @@ excludes managed, host and peer allocations, weight-owner ranges, relocations
 and conflicting globals. Source payloads remain fully hash-checked. On the
 qualified BF16/1024 package, a CPU wire-size replay reduced 68,084,668 to
 49,553,379 bytes and 327,834 to 47,868 initializers. It wrote 3.86 GB of state
-payloads including 184.55 MB of zero padding; weights were untouched. The
-MXFP8/4096 fit remains unqualified until its export succeeds.
+payloads including 184.55 MB of zero padding; weights were untouched.
+The compaction export succeeded with 41,627,807 metadata bytes (39.70 MiB),
+below the unchanged limit. Its cache entry is
+`/data/kimi31-support/package-cache/models/moonshotai_2FKimi-K3.1-Pro/gb202-tp16-202611052232`.
+Native serving remains unqualified: the initial target-only load ran out of
+GPU memory during graph instantiation.
 
 Failed-export cleanup removed the per-rank source records and staging indexes.
 Immutable payload blobs remain in the cache, but they do not contain the graph
@@ -184,18 +188,26 @@ tail -n 30 /data/kimi31-support/export-mxfp8-prefill4096-state-compaction.log
 cat /data/kimi31-support/execution-state.json
 ```
 
-The running controller is `/data/kimi31-support/after-mxfp8-state-compaction-export.py`
-(PID 788723 at publication). Its export source is the detached worktree
+The controller `/data/kimi31-support/after-mxfp8-state-compaction-export.py`
+finished export and stopped after the native startup failure. Its export source
+is the detached worktree
 `/data/kimi31-support/flare-envelope-validation` at `9b4c7257`; its native
 extension is in `/data/kimi31-support/state-compaction-native-python`.
-No Kimi server is ready on port 8170 yet.
+No Kimi server is running on port 8170. The failed native process used
+`--mtp-draft-tokens 0`; the draft was not executing. It loaded 1385.8 GiB
+weights in 241.4 seconds and 7360 kernels in 2.4 seconds, then failed at
+`cuGraphInstantiateWithFlags` with CUDA out-of-memory. KV/continuation physical
+cache backing occurs after graph preparation and was not the cause.
+The package remains intact for native-only diagnosis; no re-export is needed
+to inspect its selected graphs and fixed allocations.
 Preparation has an 850 GiB service memory limit; an independent watcher stops
 only its owned controller below 128 GiB host `MemAvailable`. The first native launch selects `--mtp-draft-tokens 0` from the K7 package.
 It validates target-only text/images and measures C1/C4 decode, 32K prefill and
 Tetris. The separate `astra-kimi31-state-compaction-k7-followup` unit then loads
 the same package with seven drafts, repeats checks and benchmarks, and leaves
 K7 serving. Its script is `/data/kimi31-support/after-target-first-benchmarks.py`.
-These steps remain pending native validation. Loading with zero drafts retains
+The followup stopped on the initial native failure without taking GPU action.
+These checks and measurements remain pending. Loading with zero drafts retains
 the package's prepared weights and cache layout; a package exported without
 drafts is required to measure the storage saved by excluding them.
 
@@ -264,3 +276,24 @@ lengths, shared embeddings/head and sequential Markov conditioning. vLLM's
 76/80/84/88/92 capture slots account for its embedding entry. Extracted YaRN
 frequencies and scaling matched bitwise. This is a source-contract check;
 K3.1 native acceptance and end-to-end speed remain unqualified for MXFP8/4096.
+
+## DSA staging investigation
+
+The recipe currently slices selection/attention into 32 query rows. A 4096-row
+prefill therefore contains 128 stages for each of 24 DSA layers, or 3072 stage
+bodies; this is a scratch/channel policy, not a model-math requirement. A
+128-row capacity would use 768 stage bodies. The isolated prototype is at
+`/data/kimi31-support/compile-study/dsa-selection-cap-worktree`; it is not
+part of this branch's default preparation. It carries an ordinary
+`--dsa-selection-rows` configuration through planning and preparation-only
+rebuild metadata. CPU tests pass; GPU qualification is pending.
+
+The captured 32-row shared arena is 519.374 MiB, dominated by MoE, while selected
+DSA dense attention uses 2 splits. At 128 rows, that same split choice fits within
+the existing arena; declared additional pools/channels require about 113.57 MiB
+per rank. Unrestricted tuning can consider 32 splits and require an additional
+250.17 MiB arena. These are allocation-plan estimates; captured temporaries,
+CUDA granularity, actual plan choices and native graph-executable memory still
+require GPU measurement. The native failed package's largest prefill graph has
+319,681 nodes and is identical when loading concurrency 1 or 4, so concurrency
+reduction alone is not established as a remedy.
