@@ -92,6 +92,9 @@ class Checkpoint:
     # contract without the value, and dashboards then show no weight bandwidth.
     decode_weight_bytes: int = 0
     plain_ranks: Mapping[int, "RankCosts"] | None = None
+    # Conservative aggregate weight savings for the recipe's explicit online MXFP8 conversion.
+    # Zero keeps the checkpoint-precision estimate; it never enables conversion.
+    online_mxfp8_savings_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -288,11 +291,13 @@ class Recipe:
         return ranks[world_size] if method is None else method.ranks[world_size]
 
     def weights_bytes(self, checkpoint: Checkpoint, world_size: int, speculation: Speculation | None,
-                      expert_scale_compression: str | None = None) -> int:
+                      expert_scale_compression: str | None = None, *, online_mxfp8: bool = False) -> int:
         """Estimate one rank's device weights from the checkpoint's stored tensors and their expansion."""
         learned = speculation is not None
         device_bytes = (checkpoint.device_bytes if expert_scale_compression is None else
                         checkpoint.scale_compressed_device_bytes[expert_scale_compression])
+        if online_mxfp8:
+            device_bytes -= checkpoint.online_mxfp8_savings_bytes
         draft_bytes = checkpoint.draft_bytes
         method = None if speculation is None else self.speculative_methods.get(speculation.method)
         if method is not None and method.draft_bytes is not None:

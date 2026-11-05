@@ -151,6 +151,28 @@ def defer_planning(monkeypatch, module, planner):
     return plan
 
 
+def test_trellis_side_tables_are_numeric_but_execution_scratch_is_opaque(monkeypatch):
+    from ignition.components import moe
+
+    defer_planning(monkeypatch, moe, (moe.fused_moe, "plan_execution"))
+    def tensor():
+        return torch.ones(128, dtype=torch.float16)
+    names = ("w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale", "w1_alphas",
+             "w2_alphas", "a1_gscale", "a2_gscale")
+    planes = {name: tensor() for name in names}
+    sides = {name: tensor() for name in ("gate_suh", "up_suh", "intermediate_rotations", "down_svh")}
+    scratch = torch.zeros(128, dtype=torch.uint8)
+    experts = SimpleNamespace(num_experts=2, has_csf_blocks=False,
+        plan=SimpleNamespace(activation=SimpleNamespace(outer_scale="expert")),
+        _impl=SimpleNamespace(**planes, nvfp4_csf=None,
+            representation=SimpleNamespace(value=SimpleNamespace(**sides, workspace=scratch))))
+    source = torch.zeros((1, 16), dtype=torch.bfloat16)
+    with NumericStorage() as numeric:
+        moe.PreparedRoutedExperts(source, experts, torch.zeros((1, 1), dtype=torch.int32),
+            torch.ones((1, 1)), torch.empty_like(source), session=None, name="experts")
+    assert_numeric(numeric, (*planes.values(), *sides.values()), opaque=(scratch,))
+
+
 @pytest.mark.parametrize("format", ["slab", "nvfp4", "mxfp4"])
 def test_compressed_expert_records_are_numeric_but_program_storage_is_opaque(monkeypatch, format):
     from b12x._lib.quant.csf_blocks import CsfBlockPayload, CsfBlockScales, Nvfp4CompactBlockPlane
@@ -174,7 +196,8 @@ def test_compressed_expert_records_are_numeric_but_program_storage_is_opaque(mon
     alternate = bytes()
     implementation = SimpleNamespace(**planes, nvfp4_csf=decoder,
         representation=SimpleNamespace(value=SimpleNamespace(micro_w13_scale=alternate, workspace=opaque)))
-    experts = SimpleNamespace(_impl=implementation, has_csf_blocks=True)
+    experts = SimpleNamespace(_impl=implementation, has_csf_blocks=True, num_experts=2,
+        plan=SimpleNamespace(activation=SimpleNamespace(outer_scale="expert")))
     source = torch.zeros((1, 16), dtype=torch.bfloat16)
     with NumericStorage() as numeric:
         moe.PreparedRoutedExperts(source, experts, torch.zeros((1, 1), dtype=torch.int32),

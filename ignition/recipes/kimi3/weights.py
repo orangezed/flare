@@ -16,7 +16,7 @@ from .config import DSparkConfig, LatentDSparkConfig, ModelConfig
 from .residual import score_weight
 
 PREFIX = "language_model.model"
-# Routed experts keep BF16 activations; MXFP4 weights expand in the expert kernels.
+# MXFP4 and Trellis routed experts retain BF16 activations.
 EXPERT_ACTIVATION = "a16"
 
 
@@ -29,7 +29,7 @@ class ModelWeights:
     head: torch.Tensor
     output_res_score: torch.Tensor
     layers: tuple[dict, ...]
-    scale_scratch: tuple[torch.Tensor, ...]
+    scale_scratch: tuple[torch.Tensor, ...] | None
     allocated_bytes: int
     vision: object = None
     draft: object = None
@@ -83,6 +83,11 @@ class KimiWeightLoader(DirectWeightLoader):
         self.online_mxfp8 = online_mxfp8
         self.config.validate_shard(shard)
         self.scale_scratch = None
+        if self.config.text["quantization_config"].get("quant_method") == "exl3":
+            expected = tuple(range(self.config.text["first_k_dense_replace"],
+                                   self.config.text["num_hidden_layers"]))
+            if self.exl3_manifest.geometry.moe_layer_indices != expected:
+                raise ValueError("EXL3 manifest must cover every routed-expert layer")
 
     def _selected_names(self):
         return {n for n in super()._selected_names() if n.startswith("language_model.")}
@@ -217,6 +222,13 @@ class KimiWeightLoader(DirectWeightLoader):
                                                  extent=slice(*shard.partition(c["routed_expert_hidden_size"])))
         prefixes = [f"{m}.experts.{i}" for i in range(c["num_experts"])]
         formats = {self.config.projection_format(f"{p}.{projection}") for p in prefixes for projection in ("w1", "w2", "w3")}
+        if formats == {"exl3"}:
+            result["experts"], result["expert_trellis"] = self.load_exl3_experts(index,
+                num_experts=c["num_experts"], hidden_size=c["routed_expert_hidden_size"],
+                intermediate_size=c["moe_intermediate_size"],
+                intermediate_range=shard.partition(c["moe_intermediate_size"], alignment=128),
+                activation="situ")
+            return result
         if len(formats) != 1 or not formats <= {"mxfp4", "mxfp4_csf"}:
             raise ValueError(f"{m}: expert storage disagrees with quantization configuration")
         hidden, intermediate = c["routed_expert_hidden_size"], c["moe_intermediate_size"] // shard.world_size

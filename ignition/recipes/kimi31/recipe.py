@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Kimi K3.1 Pro: gated sparse attention, full-context MLA draft and MXFP4 experts."""
+"""Kimi K3.1 Pro: gated sparse attention and full-context MLA drafting."""
 
 from dataclasses import replace
 from types import MappingProxyType
@@ -28,7 +28,11 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
     online_mxfp8=True, language_model_only=True,
     # Gather threads are tuned independently; the attention components declare LSE's 512-thread geometry.
     b12x_environment=MappingProxyType({**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0"}),
-    ranks=MappingProxyType({16: RankCosts(state_row_bytes=32_869_632, page_bytes=2_543_616,
+    ranks=MappingProxyType({8: RankCosts(state_row_bytes=63_181_056, page_bytes=2_543_616,
+                                       graph_bytes=9 << 29, page_tokens=128 * 8),
+                           16: RankCosts(state_row_bytes=32_869_632, page_bytes=2_543_616,
                                         graph_bytes=9 << 29, page_tokens=128 * 16)}),
-    plain_ranks=MappingProxyType({16: RankCosts(state_row_bytes=30_275_328, page_bytes=2_174_976,
+    plain_ranks=MappingProxyType({8: RankCosts(state_row_bytes=58_361_088, page_bytes=2_174_976,
+                                             graph_bytes=9 << 29, page_tokens=128 * 8),
+                                 16: RankCosts(state_row_bytes=30_275_328, page_bytes=2_174_976,
                                               graph_bytes=9 << 29, page_tokens=128 * 16)}))

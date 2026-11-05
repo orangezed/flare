@@ -450,7 +450,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
     costs = recipe.costs(len(gpus), speculation, checkpoint)
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,
-                recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
+                recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression,
+                                     online_mxfp8=online_mxfp8), costs.graph_bytes,
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,

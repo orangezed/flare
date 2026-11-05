@@ -70,19 +70,62 @@ def _csf_stored_bytes(container, snapshot):
     return stored
 
 
+def _exl3_quantization(snapshot):
+    config = snapshot / "config.json"
+    if not config.is_file():
+        return None
+    raw = json.loads(config.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError("checkpoint configuration must be an object")
+    text = raw.get("text_config", {})
+    quant = raw.get("quantization_config") or (text.get("quantization_config") if isinstance(text, dict) else None)
+    if not isinstance(quant, dict) or quant.get("quant_method") != "exl3":
+        return None
+    if (not isinstance(quant.get("exl3"), dict)
+            or quant["exl3"].get("manifest") != "exl3-manifest.json"):
+        raise ValueError("EXL3 requires exl3-manifest.json")
+    return quant
+
+
+def _exl3_files(snapshot):
+    quant = _exl3_quantization(snapshot)
+    if quant is None:
+        return ()
+    path = quant.get("exl3", {}).get("manifest")
+    if path != "exl3-manifest.json":
+        raise ValueError("EXL3 requires exl3-manifest.json")
+    manifest = json.loads((snapshot / path).read_text())
+    if (not isinstance(manifest, dict) or manifest.get("schema") != "exl3-v1"
+            or manifest.get("kind") != "exl3-manifest"):
+        raise ValueError("unsupported EXL3 expert manifest")
+    layers = manifest.get("layers")
+    if not isinstance(layers, dict) or not layers:
+        raise ValueError("EXL3 manifest has no expert layers")
+    if not all(isinstance(ref, dict) for ref in layers.values()):
+        raise ValueError("EXL3 layer references must be objects")
+    files = tuple(ref.get("file") for ref in layers.values())
+    if any(not isinstance(name, str) or not name.endswith(".safetensors") or Path(name).name != name for name in files):
+        raise ValueError("EXL3 expert filenames must be local safetensors basenames")
+    if len(set(files)) != len(files):
+        raise ValueError("EXL3 expert layer files must be distinct")
+    return files
+
+
 def _snapshot_cached(snapshot: Path) -> bool:
-    """Report whether the index and every tensor file it names are present."""
+    """Report whether indexed tensors and any declared EXL3 expert files are present."""
     try:
         if _csf_container(snapshot) is not None:
             from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 
             inspect_indexed_checkpoint(snapshot)
             return True
+        experts = _exl3_files(snapshot)
         index_path = snapshot / "model.safetensors.index.json"
         if not index_path.exists() and (snapshot / "model.safetensors").is_file():
             return (snapshot / "model.safetensors").stat().st_size > 0
         index = json.loads(index_path.read_text())
-        return all((snapshot / shard).is_file() for shard in set(index["weight_map"].values()))
+        return all((snapshot / shard).is_file()
+                   for shard in set(index["weight_map"].values()) | set(experts))
     except (OSError, ValueError, KeyError, AttributeError, TypeError):
         return False
 
@@ -168,18 +211,60 @@ def _stored_bytes(index_path: Path, source: str) -> int:
         raise UsageError(f"{source} has no readable model.safetensors.index.json total_size") from error
     if type(stored) is not int or stored <= 0:
         raise UsageError(f"{source} has an invalid safetensors total_size: {stored!r}")
+    try:
+        quant = _exl3_quantization(index_path.parent)
+    except (OSError, ValueError, TypeError) as error:
+        raise UsageError(f"{source} has invalid EXL3 metadata: {error}") from error
+    if quant is not None:
+        total = quant.get("exl3", {}).get("weight_file_bytes")
+        if total is not None:
+            if type(total) is not int or total <= stored:
+                raise UsageError(f"{source} has an invalid EXL3 weight_file_bytes")
+            return total
+        try:
+            index = json.loads(index_path.read_text())
+            files = set(index["weight_map"].values()) | set(_exl3_files(index_path.parent))
+            return sum((index_path.parent / name).stat().st_size for name in files)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise UsageError(f"{source} requires complete expert files or EXL3 weight_file_bytes") from error
     return stored
 
 
-def _replacement(qualified: Checkpoint, repository: str, revision: str, stored_bytes: int) -> Checkpoint:
+def _replacement(qualified: Checkpoint, repository: str, revision: str, stored_bytes: int,
+                 *, device_bytes=None, online_mxfp8_savings_bytes=0) -> Checkpoint:
     """Describe another checkpoint of a recipe's model, scaling placement from the qualified checkpoint."""
     scale = stored_bytes / qualified.stored_bytes
     return replace(qualified, repository=repository, revision=revision, stored_bytes=stored_bytes,
-                   device_bytes=round(qualified.device_bytes * scale),
+                   device_bytes=round(qualified.device_bytes * scale) if device_bytes is None else device_bytes,
+                   online_mxfp8_savings_bytes=online_mxfp8_savings_bytes,
                    scale_compressed_device_bytes={encoding: round(size * scale)
                        for encoding, size in qualified.scale_compressed_device_bytes.items()},
                    mapped_host_bytes=round(qualified.mapped_host_bytes * scale),
                    expansion_bytes=round(qualified.expansion_bytes * scale))
+
+
+def _exl3_mxfp8_savings(metadata):
+    """Estimate Kimi's aligned KDA/attention/shared projection savings, excluding routed experts."""
+    if _exl3_quantization(metadata) is None:
+        return 0
+    raw = json.loads((metadata / "config.json").read_text())
+    if raw.get("model_type") not in ("kimi_k3", "kimi_k31"):
+        return 0
+    c = raw["text_config"]
+    hidden, layers = c["hidden_size"], c["num_hidden_layers"]
+    linear = c["linear_attn_config"]
+    kda_columns = linear["num_heads"] * 128
+    attention_columns = c["num_attention_heads"] * 128
+    kda_layers = len(linear["kda_layers"])
+    # Count only large, aligned projections: Q/K/V in KDA, attention gate/output,
+    # and shared experts. Other converted projections provide uncounted headroom.
+    elements = hidden * (3 * kda_layers * kda_columns
+        + 2 * (kda_layers * kda_columns + (layers - kda_layers) * attention_columns)
+        + 3 * (layers - c["first_k_dense_replace"]) * c["num_shared_experts"] * c["moe_intermediate_size"])
+    # Use 37.5% of BF16 bytes rather than the ideal 48.4% reduction. The remainder
+    # covers scale layouts, alignment, and replicated retained tensors. Actual KV
+    # allocation is still derived from measured free memory after preparation.
+    return 2 * elements * 3 // 8
 
 
 def _hub_metadata(repository: str, revision: str | None, hub_cache: Path | None) -> tuple[Path, Path]:
@@ -224,7 +309,9 @@ def resolve(model: str, hub_cache: Path | None = None) -> ResolvedModel:
         stored = (_csf_stored_bytes(container, directory) if container is not None else
                   _stored_bytes(index, str(directory)) if index.exists() else
                   single.stat().st_size if single.is_file() else qualified.stored_bytes)
-        return ResolvedModel(recipe, _replacement(qualified, str(directory), revision, stored), directory)
+        device_bytes = stored + qualified.draft_bytes if _exl3_quantization(metadata) is not None else None
+        return ResolvedModel(recipe, _replacement(qualified, str(directory), revision, stored,
+            device_bytes=device_bytes, online_mxfp8_savings_bytes=_exl3_mxfp8_savings(metadata)), directory)
     repository, _, revision = model.partition("@")
     if "/" not in repository:
         for recipe in recipes():
@@ -247,5 +334,8 @@ def resolve(model: str, hub_cache: Path | None = None) -> ResolvedModel:
     config_path, index_path = _hub_metadata(repository, revision or None, hub_cache)
     recipe, qualified = _supporting(config_path, model)
     # The hub cache stores each file under its commit hash.
-    replacement = _replacement(qualified, repository, config_path.parent.name, _stored_bytes(index_path, model))
+    stored = _stored_bytes(index_path, model)
+    device_bytes = stored + qualified.draft_bytes if _exl3_quantization(config_path.parent) is not None else None
+    replacement = _replacement(qualified, repository, config_path.parent.name, stored,
+        device_bytes=device_bytes, online_mxfp8_savings_bytes=_exl3_mxfp8_savings(config_path.parent))
     return ResolvedModel(recipe, replacement)

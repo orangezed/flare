@@ -106,8 +106,9 @@ class PreparationConfig:
                 raise ValueError("image concurrency must be zero or omitted when vision is disabled")
             images = 0
         object.__setattr__(self, "image_concurrency", images)
-        if len(self.devices) != 16 or len(set(self.devices)) != 16 or any(d < 0 for d in self.devices):
-            raise ValueError("Kimi K3 preparation requires sixteen distinct GPUs")
+        if (len(self.devices) not in (8, 16) or len(set(self.devices)) != len(self.devices)
+                or any(d < 0 for d in self.devices)):
+            raise ValueError("Kimi preparation requires eight or sixteen distinct GPUs")
         request_capacity(self.max_active)
         if self.drafting:
             if not self.speculative_widths or not set(self.speculative_widths) <= set(range(1, 9)):

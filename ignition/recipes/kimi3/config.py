@@ -245,19 +245,25 @@ class ModelConfig:
         elif dsa is not None:
             raise ValueError("DSA configuration requires the Kimi K3.1 architecture")
         q = c["quantization_config"]
-        if (q.get("quant_method") != "compressed-tensors" or q.get("format") != "mxfp4-pack-quantized"
-                or q.get("quantization_status") != "compressed" or q.get("kv_cache_scheme") is not None
-                or q.get("weight_scale_encoding") not in (None, "csf_32x2_v1")):
-            raise ValueError("Kimi K3 requires compressed-tensors MXFP4 with native or csf_32x2_v1 scales")
-        groups = list(q.get("config_groups", {}).values())
-        if len(groups) != 1:
-            raise ValueError("Kimi K3 requires one MXFP4 quantization group")
-        group, w = groups[0], groups[0].get("weights", {})
-        if (group.get("targets") != ["Linear"] or group.get("format") != q["format"]
-                or group.get("input_activations") is not None or group.get("output_activations") is not None
-                or any(w.get(k) != v for k, v in dict(num_bits=4, group_size=32, strategy="group",
-                    type="float", symmetric=True, dynamic=False, scale_dtype="torch.uint8").items())):
-            raise ValueError("unsupported Kimi K3 MXFP4 group")
+        if q.get("quant_method") == "exl3":
+            exl3 = q.get("exl3")
+            if (q.get("dense_format") != "bf16" or not isinstance(exl3, dict)
+                    or exl3.get("manifest") != "exl3-manifest.json"):
+                raise ValueError("Kimi EXL3 requires exl3-manifest.json and BF16 retained projections")
+        else:
+            if (q.get("quant_method") != "compressed-tensors" or q.get("format") != "mxfp4-pack-quantized"
+                    or q.get("quantization_status") != "compressed" or q.get("kv_cache_scheme") is not None
+                    or q.get("weight_scale_encoding") not in (None, "csf_32x2_v1")):
+                raise ValueError("Kimi K3 requires MXFP4 with native/CSF scales or EXL3 experts")
+            groups = list(q.get("config_groups", {}).values())
+            if len(groups) != 1:
+                raise ValueError("Kimi K3 requires one MXFP4 quantization group")
+            group, w = groups[0], groups[0].get("weights", {})
+            if (group.get("targets") != ["Linear"] or group.get("format") != q["format"]
+                    or group.get("input_activations") is not None or group.get("output_activations") is not None
+                    or any(w.get(k) != v for k, v in dict(num_bits=4, group_size=32, strategy="group",
+                        type="float", symmetric=True, dynamic=False, scale_dtype="torch.uint8").items())):
+                raise ValueError("unsupported Kimi K3 MXFP4 group")
         vision = raw["vision_config"]
         expected = dict(vt_hidden_size=1024, vt_intermediate_size=4096, vt_num_attention_heads=12,
             vt_num_hidden_layers=27, qkv_hidden_size=1536, patch_size=14, norm_type="rmsnorm",
@@ -290,6 +296,9 @@ class ModelConfig:
 
     def validate_shard(self, shard: TensorParallelShard):
         c = self.text
+        if c["quantization_config"].get("quant_method") == "exl3":
+            # Every rank owns complete 128-channel intermediate Hadamard blocks.
+            shard.partition(c["moe_intermediate_size"], alignment=128)
         for extent, alignment in ((c["num_attention_heads"], 1),
                 (c["linear_attn_config"]["num_heads"], 1), (c["hidden_size"], 8),
                 (c["routed_expert_hidden_size"], 8), (c["moe_intermediate_size"], 32),
@@ -300,6 +309,8 @@ class ModelConfig:
 
     def projection_format(self, name):
         q = self.text["quantization_config"]
+        if q.get("quant_method") == "exl3":
+            return "exl3" if re.search(r"\.block_sparse_moe\.experts\.\d+\.w[123]$", name) else "bf16"
         if any(re.search(pattern[3:], name) if pattern.startswith("re:") else pattern == name for pattern in q["ignore"]):
             return "bf16"
         return "mxfp4" if q.get("weight_scale_encoding") is None else "mxfp4_csf"

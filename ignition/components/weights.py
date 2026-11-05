@@ -38,6 +38,9 @@ for _container, _fields in (
      ('a1_gscale', 'w1_fp4', 'w1_blockscale', 'w1_alphas',
       'a2_gscale', 'w2_fp4', 'w2_blockscale', 'w2_alphas')),
     ('b12x.moe.fused_moe.weights.PreparedExperts', ('_impl',)),
+    ('b12x.moe._shared.kernels.w4a16.prepare.TrellisWeightState',
+     ('gate_suh', 'up_suh', 'intermediate_rotations', 'down_svh',
+      'fc1_pair_modes', 'fc2_pair_modes')),
     # Shared Ignition weight containers: only these fields hold stored weights.
     ('ignition.components.weights.MLPWeights', ('gate_up', 'down')),
     ('ignition.components.weights.GroupedLinearWeights', ('parts',)),
@@ -741,6 +744,43 @@ class DirectWeightLoader:
     @cached_property
     def quantization(self):
         return quantized_layers(json.loads((self.manifest.metadata_path / "config.json").read_text()))
+
+    @cached_property
+    def exl3_manifest(self):
+        from b12x.moe.checkpoints.exl3 import read_exl3_manifest
+
+        return read_exl3_manifest(self.manifest.snapshot)
+
+    def load_exl3_experts(self, layer_index, *, num_experts, hidden_size, intermediate_size,
+                         intermediate_range=None, activation="silu"):
+        """Prepare an EXL3 extent and return its experts and persistent Trellis side tables."""
+        import torch
+        from b12x.moe import fused_moe as moe
+        from b12x.moe.checkpoints.exl3 import read_exl3_layer, trellis_from_exl3
+
+        self._require_open()
+        manifest = self.exl3_manifest
+        geometry = manifest.geometry
+        if (geometry.num_experts, geometry.hidden_size, geometry.intermediate_size) != (
+                num_experts, hidden_size, intermediate_size):
+            raise ValueError("EXL3 expert geometry differs from the model configuration")
+        first, last = _aligned_range(intermediate_range, intermediate_size, 32)
+        manifest.validate_extent(first // 32, (last - first) // 32)
+        with phase(self.progress, f"Load EXL3 expert layer {layer_index}"):
+            layer = read_exl3_layer(self.manifest.snapshot, manifest, layer_index,
+                first_slot=first // 32, slot_count=(last - first) // 32)
+            source, weights = trellis_from_exl3(layer)
+            self._session.flush()
+            plan = moe.plan_weights(source=source,
+                activation=moe.ActivationSpec(mode="a16", nonlinearity=activation,
+                    io_dtype=torch.bfloat16, rotation_dtype=torch.float16),
+                geometry=moe.MoEGeometry(num_experts=num_experts, hidden_size=hidden_size,
+                    intermediate_size=last - first))
+            prepared = moe.prepare_weights(plan=plan, weights=weights, device=self.device)
+        representation = prepared._impl.representation
+        if representation is None or representation.value.trellis is None:
+            raise ValueError("EXL3 preparation did not retain its Trellis scale tables")
+        return prepared, representation.value.trellis
 
     def load_linear(self, prefix, *, rows=None, columns=None):
         """Load one projection using its checkpoint quantization declaration."""

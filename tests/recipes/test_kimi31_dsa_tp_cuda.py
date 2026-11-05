@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-pytestmark = pytest.mark.skipif(os.getenv("FLARE_RUN_TP_CUDA_TESTS") != "1", reason="requires four or sixteen assigned GPUs")
+pytestmark = pytest.mark.skipif(os.getenv("FLARE_RUN_TP_CUDA_TESTS") != "1", reason="requires four, eight, or sixteen assigned GPUs")
 
 
 def _rank(rank, rendezvous, world, records):
@@ -117,5 +117,5 @@ def _rank(rank, rendezvous, world, records):
 @pytest.mark.parametrize("records", [16384, 1048576])
 def test_global_selection_and_empty_context_shards(tmp_path, records):
     world = torch.cuda.device_count()
-    assert world in (4, 16)
+    assert world in (4, 8, 16)
     mp.spawn(_rank, args=((tmp_path / "rendezvous").as_uri(), world, records), nprocs=world, join=True)

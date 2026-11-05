@@ -90,3 +90,60 @@ def test_gather_thread_tuning_keeps_other_kimi_collective_settings():
     assert KIMI3.b12x_environment["B12X_PCIE_DCP_THREADS"] == "512"
     assert RECIPE.b12x_environment == {**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0"}
     assert RECIPE.b12x_environment["B12X_PCIE_DCP_BLOCK_LIMIT"] == "8"
+
+
+def test_exl3_keeps_sparse_attention_and_bf16_projections(raw):
+    raw["quantization_config"] = raw["text_config"]["quantization_config"] = {
+        "quant_method": "exl3", "dense_format": "bf16",
+        "exl3": {"manifest": "exl3-manifest.json"},
+    }
+    config = ModelConfig.from_dict(raw)
+    config.validate_shard(TensorParallelShard(0, 8))
+    assert config.layers.count("dsa") == 24
+    prefix = "language_model.model.layers.1.block_sparse_moe"
+    for projection in ("w1", "w3", "w2"):
+        assert config.projection_format(f"{prefix}.experts.0.{projection}") == "exl3"
+    assert config.projection_format(f"{prefix}.shared_experts.up_proj") == "bf16"
+    assert config.projection_format("language_model.model.layers.3.self_attn.indexer.wq_b") == "bf16"
+
+
+@pytest.mark.parametrize("fields", [
+    {"dense_format": "mxfp8"}, {"exl3": None}, {"exl3": {"manifest": "other.json"}},
+])
+def test_exl3_rejects_undeclared_retained_storage(raw, fields):
+    raw["text_config"]["quantization_config"] = {
+        "quant_method": "exl3", "dense_format": "bf16",
+        "exl3": {"manifest": "exl3-manifest.json"}, **fields,
+    }
+    with pytest.raises(ValueError, match="EXL3"):
+        ModelConfig.from_dict(raw)
+
+
+def test_tp8_costs_match_complete_history_layout(raw):
+    config = ModelConfig.from_dict(raw)
+    config.validate_shard(TensorParallelShard(0, 8))
+    assert continuation_layout(config, 8).row_bytes == RECIPE.plain_ranks[8].state_row_bytes
+    assert page_bytes(config) == RECIPE.plain_ranks[8].page_bytes
+    draft = DSparkConfig.from_dict(json.loads((FIXTURES / "draft-config.json").read_text()), config.text)
+    config = replace(config, draft=draft)
+    assert continuation_layout(config, 8, speculative_tokens=7).row_bytes == RECIPE.ranks[8].state_row_bytes
+    assert page_bytes(config) == RECIPE.ranks[8].page_bytes
+
+
+def test_tp8_preparation_keeps_context_parallel_page_geometry():
+    from ignition.recipes.kimi3.bootstrap import PreparationConfig
+
+    config = PreparationConfig(devices=tuple(range(8)), prefill_chunk_size=256,
+        max_active=1, vision=False, speculative_widths=())
+    assert config.page_tokens == 1024
+    assert config.preparation_pages == 3
+    with pytest.raises(ValueError, match="distinct GPUs"):
+        replace(config, devices=(0,) * 8)
+
+
+def test_exl3_rejects_shards_that_split_intermediate_hadamard_blocks(raw):
+    raw["text_config"]["quantization_config"] = {"quant_method": "exl3", "dense_format": "bf16",
+        "exl3": {"manifest": "exl3-manifest.json"}}
+    config = ModelConfig.from_dict(raw)
+    with pytest.raises(ValueError, match="aligned rank partitions"):
+        config.validate_shard(TensorParallelShard(0, 16))

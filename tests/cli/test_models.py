@@ -21,7 +21,7 @@ HUB = Path.home() / ".cache/huggingface/hub"
 def test_declarations_import_without_model_dependencies():
     result = subprocess.run(
         [sys.executable, "-c", "import sys; from ignition.recipes import aliases; from ignition import planning;"
-         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-27b', 'glm-5.3-flash', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'step5-preview-nvfp4', 'nemotron-bolt-24gb', 'minimax-m3-1-flash', 'gemma-4-e2b', 'gemma-4-e4b', 'gemma-4-12b', 'gemma-4-26b-a4b', 'gemma-4-31b', 'gemma-4-e4b-nvfp4', 'gemma-4-12b-nvfp4', 'gemma-4-26b-a4b-nvfp4', 'gemma-4-31b-nvfp4', 'muse-spark-open-nvfp4');"
+         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-27b', 'qwen3.8-27b-qad', 'glm-5.3-flash', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'kimi-k3.1-pro', 'step5-preview-nvfp4', 'nemotron-bolt-24gb', 'minimax-m3-1-flash', 'gemma-4-e2b', 'gemma-4-e4b', 'gemma-4-12b', 'gemma-4-26b-a4b', 'gemma-4-31b', 'gemma-4-e4b-nvfp4', 'gemma-4-12b-nvfp4', 'gemma-4-26b-a4b-nvfp4', 'gemma-4-31b-nvfp4', 'muse-spark-open-nvfp4');"
          " assert not {'torch', 'transformers', 'flare_heliopause'} & set(sys.modules)"],
         cwd=ROOT, check=False, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -42,6 +42,73 @@ def write_checkpoint(directory, architecture, total_size):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config.json").write_text(json.dumps({"architectures": [architecture]}))
     (directory / "model.safetensors.index.json").write_text(json.dumps({"metadata": {"total_size": total_size}}))
+
+
+def write_exl3_checkpoint(directory, *, declared_bytes=600):
+    write_checkpoint(directory, "KimiK31ForConditionalGeneration", 100)
+    config = {"architectures": ["KimiK31ForConditionalGeneration"],
+              "quantization_config": {"quant_method": "exl3", "dense_format": "bf16",
+                  "exl3": {"manifest": "exl3-manifest.json", "weight_file_bytes": declared_bytes}}}
+    (directory / "config.json").write_text(json.dumps(config))
+    (directory / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": 100}, "weight_map": {"norm": "retained.safetensors"}}))
+    (directory / "retained.safetensors").write_bytes(b"\0" * 100)
+    (directory / "exl3-manifest.json").write_text(json.dumps({
+        "kind": "exl3-manifest", "schema": "exl3-v1",
+        "layers": {"1": {"file": "exl3-layer-00001.safetensors"}}}))
+
+
+def test_exl3_resolution_counts_expert_files_outside_retained_index(tmp_path):
+    write_exl3_checkpoint(tmp_path)
+    model = resolve(str(tmp_path))
+    assert model.recipe.name == "kimi31"
+    assert model.checkpoint.stored_bytes == 600
+    assert model.checkpoint.device_bytes - model.checkpoint.draft_bytes == 600
+    assert not model.cached(HUB)
+    (tmp_path / "exl3-layer-00001.safetensors").write_bytes(b"\0" * 500)
+    assert model.cached(HUB)
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 50, "600"])
+def test_exl3_rejects_invalid_total_weight_size(tmp_path, value):
+    write_exl3_checkpoint(tmp_path, declared_bytes=value)
+    with pytest.raises(UsageError, match="weight_file_bytes"):
+        resolve(str(tmp_path))
+
+
+def test_exl3_local_size_without_hint_uses_every_layer_file(tmp_path):
+    write_exl3_checkpoint(tmp_path)
+    config = json.loads((tmp_path / "config.json").read_text())
+    del config["quantization_config"]["exl3"]["weight_file_bytes"]
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "exl3-layer-00001.safetensors").write_bytes(b"\0" * 500)
+    assert resolve(str(tmp_path)).checkpoint.stored_bytes == 600
+
+
+def test_kimi_exl3_reports_conversion_savings_without_enabling_conversion(tmp_path):
+    write_exl3_checkpoint(tmp_path, declared_bytes=797_000_000_000)
+    path = tmp_path / "config.json"
+    raw = json.loads((ROOT / "tests/fixtures/kimi31/config.json").read_text())
+    raw["quantization_config"] = raw["text_config"]["quantization_config"] = {
+        "quant_method": "exl3", "dense_format": "bf16",
+        "exl3": {"manifest": "exl3-manifest.json", "weight_file_bytes": 797_000_000_000}}
+    path.write_text(json.dumps(raw))
+    model = resolve(str(tmp_path))
+    original = model.recipe.weights_bytes(model.checkpoint, 8, None)
+    converted = model.recipe.weights_bytes(model.checkpoint, 8, None, online_mxfp8=True)
+    assert original == 99_625_000_000
+    assert 4 << 30 < original - converted < 5 << 30
+    assert model.checkpoint.stored_bytes == 797_000_000_000
+    assert raw["text_config"]["quantization_config"]["dense_format"] == "bf16"
+
+
+def test_exl3_cache_does_not_accept_a_layer_path_outside_checkpoint(tmp_path):
+    write_exl3_checkpoint(tmp_path)
+    model = resolve(str(tmp_path))
+    manifest = json.loads((tmp_path / "exl3-manifest.json").read_text())
+    manifest["layers"]["1"]["file"] = "../other.safetensors"
+    (tmp_path / "exl3-manifest.json").write_text(json.dumps(manifest))
+    assert not model.cached(HUB)
 
 
 def test_a_directory_is_served_by_the_recipe_for_its_architecture(tmp_path):
@@ -109,7 +176,7 @@ def test_a_different_revision_of_a_declared_repository_is_not_the_pinned_checkpo
 
 @pytest.mark.parametrize("name", ["qwen", "Qwen3.8-Flash", "qwen3.8-flash@main"])
 def test_unknown_aliases_list_the_supported_aliases(name):
-    with pytest.raises(UsageError, match="supported models: qwen3.8-flash, qwen3.8-27b, glm-5.3-flash"):
+    with pytest.raises(UsageError, match="supported models: " + ", ".join(aliases())):
         resolve(name)
 
 

@@ -137,6 +137,23 @@ def test_declared_container_fields_exclude_runtime_scratch():
     assert names == {'weights.experts.w13', 'weights.experts.w2'}
 
 
+def test_trellis_rotation_tables_are_named_stored_weights():
+    from b12x.moe._shared.kernels.w4a16.prepare import TrellisWeightState
+    import ignition.components.weights  # noqa: F401 - Register external container weight fields.
+
+    sides = tuple(torch.ones(size, dtype=torch.float16) for size in (512, 512, 1536, 512))
+    state = TrellisWeightState(codebook="lut_e4m3", bits=2,
+        gate_suh=sides[0], up_suh=sides[1], intermediate_rotations=sides[2], down_svh=sides[3])
+    model = Model(torch.zeros(1), torch.zeros(1), ({"expert_trellis": state},), 0)
+    views = list(declared_views(declare_weights(model, components=("embedding",))))
+    observed = {name.rsplit(".", 1)[-1]: (tensor, group, storage)
+                for name, _owner, tensor, group, storage in views if "expert_trellis" in name}
+    for name, expected in zip(("gate_suh", "up_suh", "intermediate_rotations", "down_svh"), sides):
+        actual, group, storage = observed[name]
+        assert actual is expected and group == "layer-000" and storage == STABLE
+    assert len(observed) == 4
+
+
 def test_declared_catalog_matches_legacy_schema():
     catalog = rebuild_weights_metadata(declare_weights(build(), components=COMPONENTS))
     assert catalog['version'] == 1

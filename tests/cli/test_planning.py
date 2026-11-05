@@ -738,6 +738,10 @@ def test_every_recipe_passes_collective_policy_to_preparation(monkeypatch, tmp_p
 
     world = min((size for size in recipe.tensor_parallel if size > 1), default=1)
     ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json") | {"world_size": world} if mode == "runtime" and world in (2, 3, 4, 6, 8, 10) else None
+    if ladder is not None and world not in (2, 4):
+        # This propagation test needs a valid reduction-only fixture; the TP4
+        # word-exchange gather contract is not valid at other rank counts.
+        ladder = ladder | {"all_gather": None}
     devices = tuple(replace(gpu(i, 4096), total_bytes=4096 * GIB) for i in range(world))
     plan = replace(derive(model=recipe, gpus=devices, selected=tuple(range(world)), speculation=None), collective_tuning=mode, collective_ladder=ladder)
     original = bootstrap.PreparationConfig

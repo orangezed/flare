@@ -126,7 +126,8 @@ class PreparedRoutedExperts:
             # A plan can keep alternate scale layouts beside its canonical planes.
             for field in ("w13_scale", "w2_scale", "w13_sfb", "w2_sfb",
                           "w13_global_scale", "w2_global_scale", "micro_w13_scale", "micro_w2_scale",
-                          "micro_w13_global_scale", "micro_w2_global_scale"):
+                          "micro_w13_global_scale", "micro_w2_global_scale", "gate_suh", "up_suh",
+                          "intermediate_rotations", "down_svh", "fc1_trellis_pair_modes", "fc2_trellis_pair_modes"):
                 tensor = getattr(representation.value, field, None)
                 if tensor is not None:
                     record_numeric_tensor(tensor)
