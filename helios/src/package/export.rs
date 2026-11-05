@@ -860,8 +860,37 @@ fn initializer_merge_length(
         .ok_or_else(|| invalid("initializer length overflow"))
 }
 
-/// Validate every destination path and name before any file is created.
+/// Reject rank metadata that cannot fit before reading or writing payloads.
+fn preflight_metadata(request: &PublishRequest) -> Result<(), crate::Error> {
+    let mut fixed_bytes = 0usize;
+    for rank in request.deployments.iter().flat_map(|deployment| &deployment.ranks) {
+        // Publication replaces resources and payload descriptors, and adjacent
+        // initializers may coalesce. The remaining encoded fields are retained
+        // verbatim, so their total is a lower bound on the final envelope.
+        let replaced = rank.body.initializers.iter()
+            .map(|value| prost::encoding::message::encoded_len(6, value))
+            .chain(rank.body.payloads.iter()
+                .map(|value| prost::encoding::message::encoded_len(7, value)))
+            .chain(rank.body.resources.iter()
+                .map(|value| prost::encoding::message::encoded_len(8, value)))
+            .sum::<usize>();
+        let retained = rank.body.encoded_len().checked_sub(replaced)
+            .ok_or_else(|| invalid("rank metadata size accounting underflow"))?;
+        fixed_bytes = fixed_bytes.checked_add(retained)
+            .ok_or_else(|| invalid("package metadata size overflow"))?;
+    }
+    if fixed_bytes > schema::MAX_ENVELOPE {
+        return Err(invalid(format!(
+            "package envelope requires at least {fixed_bytes} bytes of fixed rank metadata, exceeding limit {} bytes",
+            schema::MAX_ENVELOPE,
+        )));
+    }
+    Ok(())
+}
+
+/// Validate metadata size and every destination path before any file is created.
 fn preflight(request: &PublishRequest, destination: &Destination<'_>) -> Result<(), crate::Error> {
+    preflight_metadata(request)?;
     let mut paths = std::collections::BTreeSet::new();
     let mut tensors = std::collections::BTreeSet::new();
     // Package-scoped payloads are embedded in the primary as named tensors:
@@ -1371,6 +1400,103 @@ mod tests {
             relative: relative.to_string(),
             spans,
         }
+    }
+
+    fn metadata_request(bodies: Vec<wire::RankBody>) -> PublishRequest {
+        PublishRequest {
+            package: wire::PackageBody::default(),
+            payloads: vec![],
+            deployments: vec![PublishDeployment {
+                body: wire::DeploymentBody {
+                    deployment_id: "sm120-tp2".into(),
+                    ..Default::default()
+                },
+                ranks: bodies.into_iter().map(|body| PublishRank {
+                    body, payloads: vec![], resources: vec![],
+                }).collect(),
+                payloads: vec![],
+            }],
+            package_id: [1; 32],
+            public_key: [2; 32],
+            accepted: "fixture".into(),
+            no_weights: false,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn metadata_budget_rejects_before_reading_payloads_or_opening_executables() {
+        let directory = scratch("metadata-budget");
+        let payload_path = directory.join("frontend.bin");
+        std::fs::write(&payload_path, b"frontend").unwrap();
+        let destination = directory.join("package");
+        let bodies = (0..2).map(|rank| wire::RankBody {
+            rank,
+            functions: vec![wire::Function {
+                symbol: "x".repeat(schema::MAX_ENVELOPE / 2),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }).collect::<Vec<_>>();
+        assert!(bodies.iter().all(|body| body.encoded_len() < schema::MAX_BODY));
+        let required = bodies.iter().map(Message::encoded_len).sum::<usize>();
+        let mut request = metadata_request(bodies);
+        request.payloads.push(PublishPayload {
+            role: wire::PayloadRole::Frontend,
+            relative: String::new(),
+            source: pin_file(&payload_path, 8).unwrap(),
+            id: PayloadId::of(b"frontend"),
+            tensor: Some("frontend.tokenizer".into()),
+        });
+        request.deployments[0].ranks[0].resources.push(PublishResource {
+            kind: wire::ExecutableKind::Cubin,
+            path: directory.join("must-not-be-opened.cubin"),
+            nbytes: 1,
+        });
+        let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let (result, bytes_read) = container::count_payload_reads(&[payload_path], || {
+            publish(&request, &key, Destination::Directory(&destination))
+        });
+        assert_eq!(result.unwrap_err().to_string(), format!(
+            "package envelope requires at least {required} bytes of fixed rank metadata, exceeding limit {} bytes",
+            schema::MAX_ENVELOPE,
+        ));
+        assert_eq!(bytes_read, 0);
+        assert!(!destination.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn metadata_budget_allows_initializers_that_coalesce_below_the_limit() {
+        let allocation = format!("weights-{}", "a".repeat(248));
+        let count = schema::MAX_ENVELOPE / (allocation.len() + 32) + 1;
+        let body = wire::RankBody {
+            allocations: vec![wire::Allocation {
+                name: allocation.clone(), nbytes: count as u64,
+                ..Default::default()
+            }],
+            initializers: (0..count).map(|offset| wire::Initializer {
+                allocation: allocation.clone(),
+                destination_offset: offset as u64,
+                source: Some(wire::PayloadUse {
+                    slice: Some(wire::PayloadSlice {
+                        payload_id: vec![1; 32], offset: offset as u64, nbytes: 1,
+                    }),
+                    role: wire::PayloadRole::Weights as i32,
+                }),
+            }).collect(),
+            ..Default::default()
+        };
+        assert!(body.encoded_len() > schema::MAX_ENVELOPE);
+        let mut request = metadata_request(vec![body]);
+        let directory = scratch("coalesced-metadata-budget");
+        preflight(&request, &Destination::Directory(&directory.join("package"))).unwrap();
+        let body = &mut request.deployments[0].ranks[0].body;
+        coalesce_initializers(&mut body.initializers).unwrap();
+        assert_eq!(body.initializers.len(), 1);
+        assert_eq!(body.initializers[0].source.as_ref().unwrap().slice.as_ref().unwrap().nbytes, count as u64);
+        assert!(body.encoded_len() < schema::MAX_BODY);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

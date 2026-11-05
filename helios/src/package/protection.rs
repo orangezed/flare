@@ -107,7 +107,10 @@ fn check_commitment(commitment: &[u8], body: &[u8], what: &str) -> Result<()> {
 /// Decode and bound-check an envelope without trusting anything it says.
 pub fn envelope(bytes: &[u8]) -> Result<wire::ProtectedPackage> {
     if bytes.len() > schema::MAX_ENVELOPE {
-        return Err(invalid("package envelope exceeds its limit"));
+        return Err(invalid(format!(
+            "package envelope is {} bytes, exceeding limit {} bytes",
+            bytes.len(), schema::MAX_ENVELOPE,
+        )));
     }
     let envelope = wire::ProtectedPackage::decode(bytes)
         .map_err(|_| invalid("invalid payload package envelope"))?;
@@ -730,36 +733,54 @@ impl EnvelopeBuilder {
         let sign = |body: BodyKind, bytes: &[u8]| -> Result<Vec<u8>> {
             sign_body(key, &self.package_id, &self.public_key, body, bytes)
         };
-        let envelope = wire::ProtectedPackage {
+        let mut envelope = wire::ProtectedPackage {
             version: schema::FORMAT_VERSION,
             package_id: self.package_id.to_vec(),
             signer: signer.to_vec(),
-            package_signature: sign(BodyKind::Package, &self.package_body)?,
+            package_signature: vec![0; 64],
             package_body: self.package_body,
             deployments: self
                 .deployments
                 .into_iter()
                 .map(|(index, body)| {
-                    Ok(wire::SignedDeployment {
+                    wire::SignedDeployment {
                         index,
-                        signature: sign(BodyKind::Deployment(index), &body)?,
+                        signature: vec![0; 64],
                         body,
-                    })
+                    }
                 })
-                .collect::<Result<Vec<_>>>()?,
+                .collect(),
             ranks: self
                 .ranks
                 .into_iter()
                 .map(|(deployment, rank, body)| {
-                    Ok(wire::SignedRank {
+                    wire::SignedRank {
                         deployment,
                         rank,
-                        signature: sign(BodyKind::Rank { deployment, rank }, &body)?,
+                        signature: vec![0; 64],
                         body,
-                    })
+                    }
                 })
-                .collect::<Result<Vec<_>>>()?,
+                .collect(),
         };
+        // Ed25519 signatures always occupy 64 bytes. Reserve those exact fields
+        // to check the aggregate wire size before signing or encoding bodies.
+        let nbytes = envelope.encoded_len();
+        if nbytes > schema::MAX_ENVELOPE {
+            return Err(invalid(format!(
+                "package envelope is {nbytes} bytes, exceeding limit {} bytes",
+                schema::MAX_ENVELOPE,
+            )));
+        }
+        envelope.package_signature = sign(BodyKind::Package, &envelope.package_body)?;
+        for deployment in &mut envelope.deployments {
+            deployment.signature = sign(BodyKind::Deployment(deployment.index), &deployment.body)?;
+        }
+        for rank in &mut envelope.ranks {
+            rank.signature = sign(
+                BodyKind::Rank { deployment: rank.deployment, rank: rank.rank }, &rank.body,
+            )?;
+        }
         Ok(wire::ProtectedPackage::encode_to_vec(&envelope))
     }
 }
@@ -1451,6 +1472,31 @@ mod tests {
             inline_rank_nbytes * RANKS as usize,
             fixture.envelope.len(),
         );
+    }
+
+    #[test]
+    fn signing_rejects_aggregate_rank_bodies_below_the_individual_limit() {
+        let key = signature::Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let public_key = key.public_key().as_ref().try_into().unwrap();
+        let mut builder = EnvelopeBuilder::new(vec![], public_key, [1; 32]).unwrap();
+        for rank in 0..2 {
+            builder.rank(0, rank, vec![0; schema::MAX_BODY / 2]).unwrap();
+        }
+        let body_bytes = schema::MAX_BODY;
+        let expected = wire::ProtectedPackage {
+            version: schema::FORMAT_VERSION,
+            package_id: vec![1; 32], signer: vec![0; 32], package_signature: vec![0; 64],
+            ranks: (0..2).map(|rank| wire::SignedRank {
+                rank, body: vec![], signature: vec![0; 64], ..Default::default()
+            }).collect(),
+            ..Default::default()
+        };
+        // Body and containing-message length prefixes grow at this boundary.
+        let encoded_bytes = body_bytes + expected.encoded_len() + 2 * (5 + 3);
+        assert_eq!(builder.sign(&key).unwrap_err().to_string(), format!(
+            "package envelope is {encoded_bytes} bytes, exceeding limit {} bytes",
+            schema::MAX_ENVELOPE,
+        ));
     }
 
     #[test]
