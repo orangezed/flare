@@ -26,6 +26,8 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
         revision="6d0a0202956796543364d666ab19c6ad1a494ee1", architecture="KimiK31ForConditionalGeneration",
         stored_bytes=1_561_217_377_280, device_bytes=1_496_756_986_630, draft_bytes=5_373_504_512),),
     online_mxfp8=True, language_model_only=True,
+    # Gather threads are tuned independently; the attention components declare LSE's 512-thread geometry.
+    b12x_environment=MappingProxyType({**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0"}),
     ranks=MappingProxyType({16: RankCosts(state_row_bytes=32_869_632, page_bytes=2_543_616,
                                         graph_bytes=9 << 29, page_tokens=128 * 16)}),
     plain_ranks=MappingProxyType({16: RankCosts(state_row_bytes=30_275_328, page_bytes=2_174_976,

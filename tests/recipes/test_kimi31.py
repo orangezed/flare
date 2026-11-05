@@ -82,3 +82,11 @@ def test_recipe_preserves_image_capacity_and_sampling():
     assert RECIPE.sampling_defaults.temperature == 1.
     assert RECIPE.sampling_defaults.top_k == -1
     assert RECIPE.max_draft_tokens == 7
+
+
+def test_gather_thread_tuning_keeps_other_kimi_collective_settings():
+    from ignition.recipes.kimi3.recipe import RECIPE as KIMI3
+
+    assert KIMI3.b12x_environment["B12X_PCIE_DCP_THREADS"] == "512"
+    assert RECIPE.b12x_environment == {**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0"}
+    assert RECIPE.b12x_environment["B12X_PCIE_DCP_BLOCK_LIMIT"] == "8"

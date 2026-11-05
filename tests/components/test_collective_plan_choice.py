@@ -166,3 +166,40 @@ def test_collective_choice_keys_distinguish_alternatives_and_finalist_policy():
     assert len({static, runtime_without_finalists, runtime}) == 3
     assert static == key("oneshot", None)
     assert runtime == key("joint_latency", joint_finalist_policy())
+
+
+@pytest.mark.parametrize("geometry,expected", [({}, (256, 16)),
+    ({"threads": 512, "block_limit": 8}, (512, 8))])
+def test_lse_geometry_is_declaration_metadata_without_replay_overrides(monkeypatch, geometry, expected):
+    def no_cuda(*args, **kwargs):
+        pytest.fail("collective metadata tests must not initialize CUDA")
+
+    monkeypatch.setattr(torch.cuda, "_lazy_init", no_cuda)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    from types import MethodType
+    from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
+    from ignition.components import collectives
+
+    runtime = SimpleNamespace(world_size=16, rank=0, device=torch.device("cpu"), max_batch_size=4,
+        total_heads=16, heads_per_rank=1, head_dim=128, query_head_dim=128,
+        _slot_bytes=1 << 20, _signal_ptrs=tuple(range(16)), _threads_override=0,
+        _block_limit_override=0, exchange_group=object(), _owned_buffers=())
+    runtime._resolve_launch_config = MethodType(PCIeDCPA2A._resolve_launch_config, runtime)
+    requests, primed, replayed = [], [], []
+    runtime.lse_reduce_scatter = lambda *args, **kwargs: replayed.append(kwargs)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: list(range(16)))
+    monkeypatch.setattr(collectives, "declare", lambda session, values, **kwargs: requests.extend(values))
+    partial = torch.zeros((4, 16, 128), dtype=torch.bfloat16)
+    lse = torch.zeros((4, 16), dtype=torch.float32)
+    output = torch.empty((4, 1, 128), dtype=torch.bfloat16)
+    operation = collectives.PreparedLseReduceScatter(partial, lse, output, runtime=runtime,
+        session=object(), coordinator=object(), name="attention.combine", **geometry)
+    call = operation.plan.query.call
+    assert (call["threads"], call["block_limit"]) == expected
+    prepared = requests[0].prepare_call(SimpleNamespace(run=lambda **kwargs: primed.append(kwargs)))
+    prepared.run()
+    operation(partial, lse)
+    for invocation in (*primed, *replayed):
+        assert "threads" not in invocation and "block_limit" not in invocation
+    assert replayed[0]["plan"] is operation.plan

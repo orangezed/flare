@@ -89,7 +89,7 @@ class PreparedDSA:
                 gather = PreparedAllGather(quantized.view(count, -1), q.view(count, -1), runtime=context.heads,
                     coordinator=coordinator, session=session, name=stage_name + ".gather_heads")
                 combine = PreparedLseReduceScatter(attended, lse, output[begin:end], runtime=context.heads,
-                    session=session, coordinator=coordinator, name=stage_name + ".combine")
+                    session=session, coordinator=coordinator, name=stage_name + ".combine", threads=512, block_limit=8)
             else:
                 quantized = lse = None
             caps = dense_mla.Caps(device=device, mode="decode", q_dtype=q.dtype, kv_dtype=cache.dtype,

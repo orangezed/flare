@@ -134,7 +134,7 @@ class PreparedMLA:
                 self.token_lengths, self.token_starts, caps=caps, scale=scale, session=session,
                 name=name + ".attention", workspace=workspace, lse=self.lse)
             self.combine = PreparedLseReduceScatter(self.partial, self.lse, self.attended, runtime=context.heads,
-                session=session, coordinator=context.coordinator, name=name + ".combine")
+                session=session, coordinator=context.coordinator, name=name + ".combine", threads=512, block_limit=8)
 
     def __call__(self, source):
         p, m, shards = self.projections, self.metadata, self.shards
