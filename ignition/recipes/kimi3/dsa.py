@@ -65,18 +65,26 @@ class PreparedDSA:
             # hundreds of MiB for query scales and other small intermediates.
             buffers["index_workspace"] = GraphBufferPool(device, chunk_bytes=2 << 20)
         pool = buffers["index_workspace"]
+        cache_records = cache.view(-1, 1, RECORD_BYTES)
+        selection_views = {}
         for begin in range(0, rows, capacity):
             end = min(begin + capacity, rows)
             count = end - begin
             stage_name = name + f".rows{begin}"
             cursor = pool.cursor()
+            # Identical stage regions share tensor identities as well as their backing storage.
+            if count not in selection_views:
+                selection_views[count] = (self.pages[:count], self.lengths[:count], self.local[:count],
+                    self.scores[:count], self.selected[:count], self.physical[:count], self.counts[:count],
+                    self.offsets[:count + 1])
+            pages, lengths, local, scores, selected, physical, counts, offsets = selection_views[count]
             selector = PreparedFP8Indexer(self.index_query[begin:end], weight_input[begin:end], index_cache,
-                self.pages[:count], self.lengths[:count], self.active, self.local[:count], mode="decode",
+                pages, lengths, self.active, local, mode="decode",
                 session=session, name=stage_name + ".index", workspace=workspace, buffers=cursor,
-                scores=self.scores[:count], rotation="none")
+                scores=scores, rotation="none")
             merge = None
             if self.shards.world > 1:
-                merge = PreparedDistributedTopK(self.local[:count], self.scores[:count], self.selected[:count],
+                merge = PreparedDistributedTopK(local, scores, selected,
                     world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
                     session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor)
             gather = combine = None
@@ -96,8 +104,8 @@ class PreparedDSA:
                 num_q_heads=q.shape[1], max_total_q=count, max_batch=count, page_size=1,
                 max_cache_tokens=TOPK, max_page_table_width=TOPK, num_cache_pages=cache.shape[0] * PAGE_TOKENS,
                 use_cuda_graph=True, partial_dtype=torch.float32)
-            attention = PreparedDenseMLA(q, cache.view(-1, 1, RECORD_BYTES), attended,
-                self.physical[:count], self.counts[:count], self.offsets[:count + 1], caps=caps,
+            attention = PreparedDenseMLA(q, cache_records, attended,
+                physical, counts, offsets, caps=caps,
                 scale=192**-.5, session=session, name=stage_name + ".sparse_attention", workspace=workspace, lse=lse)
             self.stages.append((begin, end, selector, merge, quantized, gather, attention, combine, lse))
 
