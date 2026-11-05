@@ -581,38 +581,72 @@ fn publish_inner(
                 Some(payload_bytes),
             );
             let mut reused_bytes = 0;
-            for payload in &rank.payloads {
-                data_phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
-                let id = payload.id;
-                if reuse_weight(payload, weights, &mut destination, &mut locations, located.contains_key(&id))? {
-                    reused_bytes += payload.nbytes();
-                    located.insert(id, ());
-                } else if located.contains_key(&id) {
-                    verify_payload_source(payload)?;
-                } else {
-                    install_payload(
-                        payload,
-                        &mut destination,
-                        &mut locations,
-                        request.no_weights,
-                    )?;
-                    located.insert(id, ());
+            let cache = match &destination {
+                Destination::Cache(root, _) if weights.is_none() => Some((**root).clone()),
+                _ => None,
+            };
+            let batch_size = if cache.is_some() {
+                crate::package::reader::verification_workers(rank.payloads.len()).max(1)
+            } else { 1 };
+            let mut remaining = rank.payloads.as_slice();
+            while !remaining.is_empty() {
+                // A prior occurrence may install an object required by a later
+                // --no-weights occurrence. End a batch before an identity repeats.
+                let mut identities = std::collections::BTreeSet::new();
+                let width = remaining.iter().take(batch_size)
+                    .take_while(|payload| identities.insert(payload.id)).count();
+                let (batch, rest) = remaining.split_at(width);
+                data_phase.detail(format!("verifying {} payloads ({} bytes)", batch.len(),
+                    batch.iter().map(PublishPayload::nbytes).sum::<u64>()));
+                let mut prepared = cache.as_ref()
+                    .map(|root| prepare_cache_batch(root, batch, request.no_weights))
+                    .transpose()?.map(Vec::into_iter);
+                for payload in batch {
+                    data_phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
+                    let id = payload.id;
+                    if let Some(prepared) = prepared.as_mut() {
+                        let object = prepared.next().expect("one prepared object per payload");
+                        if !located.contains_key(&id) {
+                            let Destination::Cache(_, staging) = &mut destination else { unreachable!() };
+                            staging.link(&object, &payload.relative)?;
+                            locations.push(wire::PayloadLocation {
+                                payload_id: id.as_bytes().to_vec(),
+                                file: payload.relative.clone(),
+                                tensor: container::COMPANION_TENSOR.to_string(),
+                            });
+                            located.insert(id, ());
+                        }
+                    } else if reuse_weight(payload, weights, &mut destination, &mut locations, located.contains_key(&id))? {
+                        reused_bytes += payload.nbytes();
+                        located.insert(id, ());
+                    } else if located.contains_key(&id) {
+                        verify_payload_source(payload)?;
+                    } else {
+                        install_payload(
+                            payload,
+                            &mut destination,
+                            &mut locations,
+                            request.no_weights,
+                        )?;
+                        located.insert(id, ());
+                    }
+                    data_phase.advance_bytes(payload.nbytes());
+                    let descriptor = wire::PayloadDescriptor {
+                        id: id.as_bytes().to_vec(),
+                        nbytes: payload.nbytes(),
+                    };
+                    rank_body.payloads.push(descriptor.clone());
+                    body.payloads.push(descriptor.clone());
+                    catalog.insert(&descriptor)?;
+                    published.entry(id).or_insert(PublishedPayload {
+                        id,
+                        nbytes: payload.nbytes(),
+                        role: payload.role as i32,
+                        relative: payload.relative.clone(),
+                        tensor: None,
+                    });
                 }
-                data_phase.advance_bytes(payload.nbytes());
-                let descriptor = wire::PayloadDescriptor {
-                    id: id.as_bytes().to_vec(),
-                    nbytes: payload.nbytes(),
-                };
-                rank_body.payloads.push(descriptor.clone());
-                body.payloads.push(descriptor.clone());
-                catalog.insert(&descriptor)?;
-                published.entry(id).or_insert(PublishedPayload {
-                    id,
-                    nbytes: payload.nbytes(),
-                    role: payload.role as i32,
-                    relative: payload.relative.clone(),
-                    tensor: None,
-                });
+                remaining = rest;
             }
             data_phase.finish(data_result(payload_bytes, reused_bytes));
             let ranks_count =
@@ -1115,6 +1149,62 @@ fn reuse_weight(
     Ok(true)
 }
 
+/// Verify every source occurrence and retain its installed object through linking.
+fn prepare_cache_payload(
+    root: &crate::package::cache::Root,
+    payload: &PublishPayload,
+    no_weights: bool,
+) -> Result<crate::package::cache::PayloadObject, crate::Error> {
+    if no_weights && matches!(payload.role, wire::PayloadRole::Weights | wire::PayloadRole::TunedWeights) {
+        verify_payload_source(payload)?;
+        let object = root.payload(payload.id)?.ok_or_else(|| invalid(format!(
+            "no-weights export is missing cached payload {} (group {})",
+            payload.id, payload.relative,
+        )))?;
+        if object.length() != payload.nbytes() {
+            return Err(invalid(format!("cached payload {} length differs from its declaration", payload.id)));
+        }
+        if object.slice().digest()? != payload.id {
+            return Err(invalid(format!("cached payload {} bytes do not match their identity", payload.id)));
+        }
+        return Ok(object);
+    }
+    // A hit hashes both the cached bytes and the supplied stream. A miss uses
+    // the cache's checked installation, retaining its object lease on return.
+    root.insert_payload(payload.id, payload.nbytes(), payload.reader())
+}
+
+fn prepare_cache_batch(
+    root: &crate::package::cache::Root,
+    payloads: &[PublishPayload],
+    no_weights: bool,
+) -> Result<Vec<crate::package::cache::PayloadObject>, crate::Error> {
+    if payloads.len() <= 1 {
+        return payloads.iter().map(|payload| prepare_cache_payload(root, payload, no_weights)).collect();
+    }
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(payloads.len());
+        let mut spawn_error = None;
+        for payload in payloads {
+            match std::thread::Builder::new().spawn_scoped(scope, move || {
+                prepare_cache_payload(root, payload, no_weights)
+            }) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => { spawn_error = Some(error); break; }
+            }
+        }
+        // Join every worker before returning an error or allowing staging to
+        // close. Results and error selection follow declaration order.
+        let results: Vec<_> = workers.into_iter().map(|worker| {
+            worker.join().map_err(|_| invalid("cache payload worker panicked"))?
+        }).collect();
+        if let Some(error) = spawn_error {
+            return Err(invalid(format!("spawn cache payload worker: {error}")));
+        }
+        results.into_iter().collect()
+    })
+}
+
 fn install_payload(
     payload: &PublishPayload,
     destination: &mut Destination<'_>,
@@ -1421,6 +1511,282 @@ mod tests {
             accepted: "fixture".into(),
             no_weights: false,
         }
+    }
+
+    fn cache_publication_fixture(directory: &Path, count: usize) -> (PublishRequest, ring::signature::Ed25519KeyPair) {
+        use ring::signature::KeyPair;
+        let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
+        let mut request = metadata_request(vec![wire::RankBody {
+            deployment_id: "sm120-tp1".into(),
+            context: Some(crate::runtime_package::wire::Context::default()),
+            allocations: vec![wire::Allocation {
+                name: "weights".into(), nbytes: (count * 4096) as u64,
+                alignment: 256, address: Some(0x1000), ..Default::default()
+            }],
+            graphs: vec![wire::Graph {
+                name: "decode".into(), node_count: 1, ..Default::default()
+            }],
+            ..Default::default()
+        }]);
+        request.public_key = key.public_key().as_ref().try_into().unwrap();
+        request.accepted = "example".into();
+        request.package = wire::PackageBody {
+            format_version: schema::FORMAT_VERSION,
+            package_id: request.package_id.to_vec(), model_identity: "fixture".into(),
+            hardware_identity: "sm120".into(),
+            publisher: Some(wire::PublisherMetadata {
+                namespace: "example".into(),
+                official_source: "https://huggingface.co/example/fixture".into(),
+                ..Default::default()
+            }),
+            frontend: Some(crate::runtime_package::wire::FrontendSettings::default()),
+            sampling_defaults: Some(crate::runtime_package::wire::DefaultSamplingParameters::default()),
+            ..Default::default()
+        };
+        let deployment = &mut request.deployments[0];
+        deployment.body.deployment_id = "sm120-tp1".into();
+        deployment.body.architecture = vec![12, 0];
+        deployment.body.tensor_parallel = 1;
+        deployment.body.contract = Some(crate::runtime_package::wire::ServingContract::default());
+        let rank = &mut deployment.ranks[0];
+        let graph = directory.join("graph.bin");
+        std::fs::write(&graph, b"graph").unwrap();
+        rank.resources.push(PublishResource { kind: wire::ExecutableKind::Graph, path: graph, nbytes: 5 });
+        for index in 0..count {
+            let bytes = vec![index as u8 + 1; 4096];
+            let source = directory.join(format!("source-{index}.bin"));
+            std::fs::write(&source, &bytes).unwrap();
+            let id = PayloadId::of(&bytes);
+            rank.payloads.push(PublishPayload {
+                role: wire::PayloadRole::Weights,
+                relative: format!("weights/part-{index}.safetensors"),
+                source: pin_file(&source, bytes.len() as u64).unwrap(), id, tensor: None,
+            });
+            rank.body.initializers.push(wire::Initializer {
+                allocation: "weights".into(), destination_offset: (index * 4096) as u64,
+                source: Some(wire::PayloadUse {
+                    slice: Some(wire::PayloadSlice { payload_id: id.as_bytes().to_vec(), offset: 0, nbytes: 4096 }),
+                    role: wire::PayloadRole::Weights as i32,
+                }),
+            });
+        }
+        (request, key)
+    }
+
+    #[test]
+    fn cache_batches_verify_hits_and_misses_and_retain_object_leases() {
+        let directory = scratch("cache-batch-leases");
+        let root = crate::package::cache::Root::open(&directory.join("cache")).unwrap();
+        let (request, _) = cache_publication_fixture(&directory, 4);
+        let payloads = &request.deployments[0].ranks[0].payloads;
+        let objects = prepare_cache_batch(&root, payloads, false).unwrap();
+        assert_eq!(root.collect().unwrap().objects, 0);
+        for (payload, object) in payloads.iter().zip(&objects) {
+            assert_eq!(object.id(), payload.id);
+            assert_eq!(object.length(), payload.nbytes());
+            assert_eq!(object.slice().digest().unwrap(), payload.id);
+        }
+        let hits = prepare_cache_batch(&root, payloads, true).unwrap();
+        drop(objects);
+        assert_eq!(root.collect().unwrap().objects, 0);
+        drop(hits);
+        assert_eq!(root.collect().unwrap().objects, 4);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn duplicate_ids_in_one_cache_batch_finish_with_retained_leases_on_hits_and_misses() {
+        let directory = scratch("cache-batch-same-id");
+        let root = crate::package::cache::Root::open(&directory.join("cache")).unwrap();
+        let bytes = vec![0x37; 4 << 20];
+        let id = PayloadId::of(&bytes);
+        let path = directory.join("source.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        let payloads: Vec<_> = (0..4).map(|index| PublishPayload {
+            role: wire::PayloadRole::Weights,
+            relative: format!("weights/duplicate-{index}.safetensors"),
+            source: pin_file(&path, bytes.len() as u64).unwrap(), id, tensor: None,
+        }).collect();
+        assert!(root.payload(id).unwrap().is_none());
+        let mut retained = Vec::new();
+        for _ in 0..2 {
+            let (send, receive) = std::sync::mpsc::channel();
+            let worker_root = root.clone();
+            let worker_payloads = payloads.clone();
+            let worker = std::thread::spawn(move || {
+                assert!(send.send(prepare_cache_batch(&worker_root, &worker_payloads, false)).is_ok());
+            });
+            let objects = receive.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("same-ID cache batch did not finish while completed object leases were retained")
+                .unwrap();
+            worker.join().unwrap();
+            assert_eq!(objects.len(), 4);
+            assert!(objects.iter().all(|object| object.id() == id && object.length() == bytes.len() as u64));
+            retained.extend(objects);
+            assert_eq!(root.collect().unwrap().objects, 0);
+        }
+        drop(retained);
+        assert_eq!(root.collect().unwrap().objects, 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cache_batch_hits_hash_both_pinned_sources_and_cached_objects() {
+        let directory = scratch("cache-batch-reads");
+        let root = crate::package::cache::Root::open(&directory.join("cache")).unwrap();
+        let (request, _) = cache_publication_fixture(&directory, 4);
+        let payloads = &request.deployments[0].ranks[0].payloads;
+        let objects = prepare_cache_batch(&root, payloads, false).unwrap();
+        let paths: Vec<_> = (0..4).map(|index| directory.join(format!("source-{index}.bin")))
+            .chain(objects.iter().map(|object| object.path().to_path_buf())).collect();
+        for no_weights in [false, true] {
+            let (result, bytes) = container::count_payload_reads(&paths, || {
+                prepare_cache_batch(&root, payloads, no_weights)
+            });
+            assert_eq!(result.unwrap().len(), 4);
+            assert_eq!(bytes, 2 * 4 * 4096, "both source and cached bytes must be verified");
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cache_batches_reject_nonfirst_cache_corruption_and_missing_required_weights() {
+        let directory = scratch("cache-batch-integrity");
+        let root = crate::package::cache::Root::open(&directory.join("cache")).unwrap();
+        let (mut request, _) = cache_publication_fixture(&directory, 4);
+        let payloads = &mut request.deployments[0].ranks[0].payloads;
+        assert!(prepare_cache_batch(&root, payloads, true).err().unwrap().to_string().contains("missing cached payload"));
+        for payload in payloads.iter() {
+            assert!(root.payload(payload.id).unwrap().is_none());
+        }
+        payloads[3].role = wire::PayloadRole::InitialState;
+        let state = prepare_cache_payload(&root, &payloads[3], true).unwrap();
+        assert_eq!(state.id(), payloads[3].id);
+        drop(state);
+        drop(prepare_cache_batch(&root, payloads, false).unwrap());
+        corrupt_cached_payload(&root, payloads[2].id);
+        let error = prepare_cache_batch(&root, payloads, false).err().unwrap();
+        assert!(error.to_string().contains("installed object"), "{error}");
+        assert_eq!(root.collect().unwrap().objects, 4, "failed workers must release every object lease");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn parallel_cache_publication_checks_duplicate_sources_before_linking_the_batch() {
+        let directory = scratch("cache-batch-duplicate");
+        let root = crate::package::cache::Root::open(&directory.join("cache")).unwrap();
+        let (mut request, key) = cache_publication_fixture(&directory, 2);
+        let rank = &mut request.deployments[0].ranks[0];
+        let first = &rank.payloads[0];
+        drop(root.insert_payload(first.id, first.nbytes(), first.reader()).unwrap());
+        rank.payloads[1].id = rank.payloads[0].id;
+        rank.body.initializers[1].source.as_mut().unwrap().slice.as_mut().unwrap().payload_id = rank.payloads[0].id.as_bytes().to_vec();
+        let id = rank.payloads[0].id;
+        let duplicate_relative = rank.payloads[1].relative.clone();
+        let mut staging = root.stage("fixture", "duplicate").unwrap();
+        let error = publish(&request, &key, Destination::Cache(&root, &mut staging)).unwrap_err();
+        assert!(error.to_string().contains("supplied payload"), "{error}");
+        assert!(!staging.directory().join("model.safetensors").exists());
+        assert!(!staging.directory().join(duplicate_relative).exists());
+        drop(staging);
+        assert!(root.collect().unwrap().objects >= 1);
+        assert!(root.payload(id).unwrap().is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn parallel_cache_publication_matches_serial_directory_metadata_on_hits_and_misses() {
+        let directory = scratch("cache-batch-order");
+        let root = crate::package::cache::Root::open(&directory.join("cache")).unwrap();
+        let (mut request, key) = cache_publication_fixture(&directory, 11);
+        let serial = directory.join("serial");
+        std::fs::create_dir(&serial).unwrap();
+        let expected = publish(&request, &key, Destination::Directory(&serial)).unwrap();
+        let expected_locations = crate::package::reader::Metadata::open(&serial).unwrap().locations;
+        for (name, no_weights) in [("miss", false), ("hit", false), ("required-hit", true)] {
+            request.no_weights = no_weights;
+            let mut staging = root.stage("fixture", name).unwrap();
+            let actual = publish(&request, &key, Destination::Cache(&root, &mut staging)).unwrap();
+            assert_eq!(actual.manifest, expected.manifest);
+            assert_eq!(actual.payloads, expected.payloads);
+            assert_eq!(crate::package::reader::Metadata::open(staging.directory()).unwrap().locations, expected_locations);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn required_weights_can_follow_an_identical_fresh_state_payload() {
+        let directory = scratch("cache-batch-required-order");
+        let root = crate::package::cache::Root::open(&directory.join("cache")).unwrap();
+        let (mut request, key) = cache_publication_fixture(&directory, 2);
+        request.no_weights = true;
+        let rank = &mut request.deployments[0].ranks[0];
+        rank.payloads[0].role = wire::PayloadRole::InitialState;
+        rank.body.initializers[0].source.as_mut().unwrap().role = wire::PayloadRole::InitialState as i32;
+        rank.payloads[1].source = rank.payloads[0].source.clone();
+        rank.payloads[1].id = rank.payloads[0].id;
+        rank.body.initializers[1].source.as_mut().unwrap().slice.as_mut().unwrap().payload_id = rank.payloads[0].id.as_bytes().to_vec();
+        let first = rank.payloads[0].relative.clone();
+        let duplicate = rank.payloads[1].relative.clone();
+        let mut staging = root.stage("fixture", "required-order").unwrap();
+        publish(&request, &key, Destination::Cache(&root, &mut staging)).unwrap();
+        assert!(staging.directory().join(first).is_file());
+        assert!(!staging.directory().join(duplicate).exists());
+        drop(staging);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "diagnostic benchmark: creates eight 64 MiB cached payloads"]
+    fn benchmark_cached_payload_publication() {
+        let directory = scratch("cache-publication-timing");
+        let root = crate::package::cache::Root::open(&directory.join("cache")).unwrap();
+        let nbytes = 64 << 20;
+        let objects: Vec<_> = (0..8).map(|index| {
+            root.capture_payload(nbytes as u64, vec![index + 1; nbytes].as_slice()).unwrap()
+        }).collect();
+        let payloads: Vec<_> = objects.iter().enumerate().map(|(index, object)| PublishPayload {
+            role: wire::PayloadRole::Weights,
+            relative: format!("weights/part-{index}.safetensors"),
+            source: object.slice().clone(), id: object.id(), tensor: None,
+        }).collect();
+        let workers = crate::package::reader::verification_workers(payloads.len()).max(1);
+        for repetition in 0..5 {
+            for parallel in if repetition % 2 == 0 { [false, true] } else { [true, false] } {
+                let mut staging = root.stage("fixture", &format!("sample-{repetition}-{parallel}")).unwrap();
+                let started = std::time::Instant::now();
+                let mut locations = Vec::new();
+                if parallel {
+                    for batch in payloads.chunks(workers) {
+                        let prepared = prepare_cache_batch(&root, batch, false).unwrap();
+                        for (payload, object) in batch.iter().zip(prepared) {
+                            staging.link(&object, &payload.relative).unwrap();
+                            locations.push(wire::PayloadLocation {
+                                payload_id: payload.id.as_bytes().to_vec(), file: payload.relative.clone(),
+                                tensor: container::COMPANION_TENSOR.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    // The serial control verifies source and cached bytes, then
+                    // links through the ordinary single-payload publisher.
+                    for payload in &payloads {
+                        install_payload(payload, &mut Destination::Cache(&root, &mut staging), &mut locations, false).unwrap();
+                    }
+                }
+                let elapsed = started.elapsed().as_secs_f64();
+                assert_eq!(locations.len(), payloads.len());
+                println!("{}", serde_json::json!({
+                    "mode": if parallel { "parallel" } else { "serial" },
+                    "repetition": repetition, "payloads": payloads.len(), "payload_bytes": nbytes,
+                    "workers": if parallel { workers } else { 1 }, "elapsed_seconds": elapsed,
+                    "scope": "cached source and destination verification plus ordered linking",
+                }));
+            }
+        }
+        drop(objects);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

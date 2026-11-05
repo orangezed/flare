@@ -336,7 +336,7 @@ impl PayloadFiles {
 
 const MAX_VERIFY_WORKERS: usize = 8;
 
-fn verification_workers(payloads: usize) -> usize {
+pub(crate) fn verification_workers(payloads: usize) -> usize {
     std::thread::available_parallelism()
         .map_or(1, |workers| workers.get())
         .min(MAX_VERIFY_WORKERS)
