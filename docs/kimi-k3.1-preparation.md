@@ -152,17 +152,26 @@ Flare serves the prepared CUDA graphs natively.
 The export captured all 104 graphs and wrote weight payloads. Package combination
 then failed because its envelope was 166,123,939 bytes, exceeding the existing
 134,217,728-byte limit. No MXFP8/4096 package was published or served. The limit
-has not been raised; envelope compaction and recoverability are under investigation.
+remains unchanged. The producer now coalesces nearby InitialState ranges in
+fixed ordinary device allocations, explicitly storing short zero gaps. It
+excludes managed, host and peer allocations, weight-owner ranges, relocations
+and conflicting globals. Source payloads remain fully hash-checked. On the
+qualified BF16/1024 package, a CPU wire-size replay reduced 68,084,668 to
+49,553,379 bytes and 327,834 to 47,868 initializers. It wrote 3.86 GB of state
+payloads including 184.55 MB of zero padding; weights were untouched. The
+MXFP8/4096 fit remains unqualified until its export succeeds.
 
 Failed-export cleanup removed the per-rank source records and staging indexes.
 Immutable payload blobs remain in the cache, but they do not contain the graph
 and placement indexes needed to recombine a package. A CPU-only retry from those
-blobs has not been established. Preserve the blobs while resolving the envelope
-size; do not assume that they constitute a loadable runtime.
+blobs is unsupported without the deleted source records. Preserve the blobs
+until weight-cache reuse is established; they are not a loadable runtime.
 
-The diagnostic export uses Flare `d2e66491` and FlashInfer `981798fd`, with the
-first three Torch patches. It does not include the shared DSA view identities
-added to this branch. Record this distinction when comparing preparation times.
+The failed diagnostic export used Flare `d2e66491` and FlashInfer `981798fd`,
+with three Torch patches and distinct DSA view objects. The compaction
+validation export uses Flare `9b4c7257`, the same FlashInfer, shared DSA views
+and all four Torch patches; it retains `--no-compile` to isolate package
+publication from complete-forward compilation.
 Its controller is configured to start native Flare on port 8170 only after
 successful publication, then check text, images, concurrent requests and 32K
 recall before C1/C4 decode, uncached
@@ -170,16 +179,25 @@ recall before C1/C4 decode, uncached
 has been qualified yet.
 
 ```sh
-systemctl status astra-kimi31-mxfp8-uncompiled-export.service
-tail -n 30 /data/kimi31-support/export-mxfp8-prefill4096-uncompiled.log
+systemctl status astra-kimi31-state-compaction-export.service
+tail -n 30 /data/kimi31-support/export-mxfp8-prefill4096-state-compaction.log
 cat /data/kimi31-support/execution-state.json
 ```
 
-The controller is `/data/kimi31-support/after-mxfp8-uncompiled-export.py`; it
-exited on the envelope failure. No Kimi server is running on port 8170.
+The running controller is `/data/kimi31-support/after-mxfp8-state-compaction-export.py`
+(PID 788723 at publication). Its export source is the detached worktree
+`/data/kimi31-support/flare-envelope-validation` at `9b4c7257`; its native
+extension is in `/data/kimi31-support/state-compaction-native-python`.
+No Kimi server is ready on port 8170 yet.
 Preparation has an 850 GiB service memory limit; an independent watcher stops
-only its owned controller below 128 GiB host `MemAvailable`. The target-only
-comparison and restoration of K7 serving remain pending native validation.
+only its owned controller below 128 GiB host `MemAvailable`. The first native launch selects `--mtp-draft-tokens 0` from the K7 package.
+It validates target-only text/images and measures C1/C4 decode, 32K prefill and
+Tetris. The separate `astra-kimi31-state-compaction-k7-followup` unit then loads
+the same package with seven drafts, repeats checks and benchmarks, and leaves
+K7 serving. Its script is `/data/kimi31-support/after-target-first-benchmarks.py`.
+These steps remain pending native validation. Loading with zero drafts retains
+the package's prepared weights and cache layout; a package exported without
+drafts is required to measure the storage saved by excluding them.
 
 Full-forward compiler qualification uses the serialized 3584-token prefill
 metadata in `/data/kimi31-support/compile-study/full-forward-storage-input/`;
@@ -195,13 +213,54 @@ It is the qualified functional baseline; it does not contain the MXFP8 dense
 conversion or fixed-neighbor gather selections. Retain it until a replacement
 package passes native validation.
 
-For the measured compiler phases, complete metadata qualification is being
-continued on Frank2 with the recorded TP16/3584 forward.
-The helper uses shared GPU 8 only for correctness and compiler execution, with
-no weights or GPU-performance claims. Its directory is
-`/data/kimi31-support/full-forward-four-patch-ready-replay-20261105`; normal
-metadata restoration passed before tracing started. Dependency setup includes
-the CuTe Python bootstrap and prepared sampling module. The running unit is
-`flare-four-patch-metadata-ready-20261105` (PID 3230572 at publication).
-Compilation is bounded to 40 minutes and 128 GiB; only its owned helper stops below 128 GiB host available
-memory. Completion of the full artifact remains pending.
+The four-patch full metadata compile on Frank2 reached postgrad decomposition
+with 49,514 direct replacements and one canonical replacement, then exhausted
+its 40-minute bound in `Scheduler.compute_ancestors`. Peak memory was 62.55 GiB;
+there was no OOM. That full artifact remains unqualified. Logs are on Frank2
+in `/data/kimi31-support/full-forward-four-patch-ready-replay-20261105`.
+A scheduler-local compact-ancestry prototype is research-only and has not been
+added to the preparation patches. It must preserve ordered-set behavior and
+fusion decisions before complete-forward qualification.
+
+## Retain publisher inputs for CPU diagnosis
+
+The optional [publisher-input recorder](../qualify/runtime_package/capture_sources.py)
+runs the ordinary Ignition export, then hardlinks the publisher's disk sources
+and referenced cached payloads before combination. It records peer-memory
+arguments and rewrites only copied FileSource paths. Model operators, graph
+choices and the arguments passed to the ordinary publisher remain unchanged.
+It omits signing requests and signing material. Use an unused capture directory
+on the same filesystem as the source files; a recorder failure is reported and
+the ordinary export continues.
+
+```sh
+.venv/bin/python qualify/runtime_package/capture_sources.py \
+  --capture-dir /data/kimi31-publisher-inputs -- export kimi-k3.1-pro \
+  --gpus 0-15 --max-concurrency 4 --image-concurrency 4 \
+  --prefill-chunk-size 4096 --mtp-draft-tokens 7 \
+  --speculative-token-capacity 128 --speculative-graph-budget 64 \
+  --online-mxfp8 --collective-tuning static --autotune-effort default \
+  --compile-workers 16 --no-compile --verbose
+```
+
+The validation host records those inputs at
+`/data/kimi31-support/state-compaction-export-inputs`. The recorded
+`combine-inputs.json` identifies copied rank records, payload pins and the cache
+root. An explicit CPU retry must supply its own publisher and verify that the
+referenced cache objects remain available. This recorder is a diagnosis tool,
+not an independently loadable model or a serving path.
+
+## Draft checkpoint compatibility
+
+The draft is `Inferact/Kimi-K3.1-Pro-DSpark-preview`, revision
+`5e654fbe920278f228a89519b06b2680aa56480f`. Its [model card](https://huggingface.co/Inferact/Kimi-K3.1-Pro-DSpark-preview)
+declares Kimi K3.1 Pro as its target and five full-causal MLA layers. Full MLA
+is intentional even though the target uses Gated DSA. The source architecture
+identifier `K3DSparkModel` names this checkpoint implementation.
+
+A read-only reference audit found matching zero-based target output taps
+75/79/83/87/91, context projection/normalization, full paged history, causal
+lengths, shared embeddings/head and sequential Markov conditioning. vLLM's
+76/80/84/88/92 capture slots account for its embedding entry. Extracted YaRN
+frequencies and scaling matched bitwise. This is a source-contract check;
+K3.1 native acceptance and end-to-end speed remain unqualified for MXFP8/4096.
