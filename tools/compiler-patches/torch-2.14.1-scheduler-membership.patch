@@ -1,0 +1,31 @@
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -1542,12 +1542,12 @@
+         ):
+             return
+ 
++        # Code generation does not modify these sets while deciding in-place reuse.
++        # Query them directly to avoid copying all previously scheduled operations.
++        ancestors = self.ancestors
+         # NOTE remove V.graph.removed_operations once deps issue is fixed
+-        inconsequential_nodes = (
+-            self.ancestors
+-            | V.graph.removed_operations
+-            | self.scheduler.completed_operations
+-        )
++        removed_operations = V.graph.removed_operations
++        completed_operations = self.scheduler.completed_operations
+ 
+         def single_index_in_fused_node(buf_to_be_inplaced: SchedulerBuffer) -> bool:
+             # Inside of NodeUser, we track that the read and write are equivalent
+@@ -1615,7 +1615,9 @@
+                     remaining_uses = [
+                         x
+                         for x in input_buf.users
+-                        if x.node.get_name() not in inconsequential_nodes
++                        if (name := x.node.get_name()) not in ancestors
++                        and name not in removed_operations
++                        and name not in completed_operations
+                     ]
+                     has_cross_stream_hazard = self.scheduler.has_cross_stream_hazard(
+                         read.name, self

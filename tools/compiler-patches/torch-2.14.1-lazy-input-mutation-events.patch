@@ -1,0 +1,36 @@
+--- a/torch/_dynamo/symbolic_convert.py
++++ b/torch/_dynamo/symbolic_convert.py
+@@ -337,6 +337,9 @@
+     # instead of tracing it. Set when we detect that such an intermediate
+     # leaks as a graph output with requires_grad=True.
+     graph_break_on_requires_grad_: bool = False
++    # Event recording consumes input-mutation stream metadata. Once encountered,
++    # retrace the root with complete checks; this requirement survives restarts.
++    requires_input_mutation_stream_checks: bool = False
+ 
+     def restart(self) -> None:
+         self.index = 0
+--- a/torch/_dynamo/output_graph.py
++++ b/torch/_dynamo/output_graph.py
+@@ -1299,6 +1299,8 @@
+             return
+         if not tx.symbolic_stream_state.in_stream_context():
+             return
++        if not tx.speculation_log.requires_input_mutation_stream_checks:
++            return
+ 
+         tracer = self.root_tracer
+         if self._last_checked_input_versions is None:
+@@ -1340,6 +1342,12 @@
+         """Error if an event is being recorded on a stream that already has
+         an input mutation. Called at record time so ordering is naturally
+         respected — records before mutations won't trigger this."""
++        speculation_log = self.root_tx.speculation_log
++        if not speculation_log.requires_input_mutation_stream_checks:
++            speculation_log.requires_input_mutation_stream_checks = True
++            raise exc.SpeculationRestartAnalysis(
++                restart_reason="event recording requires input-mutation stream checks"
++            )
+         if stream_index not in self._input_mutation_streams:
+             return
+ 

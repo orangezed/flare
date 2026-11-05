@@ -29,46 +29,95 @@ recorded for this reference. An uncached 32K
 raw-input request generated one token in 259.84 seconds. These measurements
 precede the MXFP8 and gather changes and do not describe their serving speed.
 
-## Preparation compiler patch
+## Forward compilation
 
-The development preparation environment uses Torch `2.14.1+cu132` with
-[a Python compiler patch](../tools/compiler-patches/torch-2.14.1-mutation-regions.patch).
-It defers mutation-region recomputation only in the singleton
-`decompose_auto_functionalized` pass. Other pattern passes retain their checks;
-the pass rebuilds region IDs before returning. This patch changes preparation
-time. CUDA libraries and Torch binaries are unchanged, and the native server
-has no Torch dependency.
+The storage-lifetime analysis in Ignition indexes pending reads by storage and
+retires values at their last-use positions. It preserves the order of reads,
+writes and required snapshots without rescanning every live value at each node.
+Implemented and qualified: 205 CPU alias/mutation cases and 12 compiled CUDA
+cases pass. On a captured 475,656-node Kimi prefill graph, the direct-scan
+analysis took 1444.04 seconds and the indexed analysis took 1.20 seconds;
+ordered results were identical. This measures one preparation function, not
+model latency. The reference used one CPU with low scheduling priority; clocks
+and scheduling were not normalized. The captured inputs and raw comparison are
+on Frank1 at `/data/kimi31-support/compile-study/storage-lifetime-real-comparison.json`.
 
-Apply it after environment installation, while that environment has no running
-preparation process:
+Sparse-attention stages also reuse identical cache and selection view objects
+for each row count. Each stage retains its own plans, cursor and dependencies.
+This changes preparation identities without changing tensor regions or GPU
+arithmetic. Six CPU cases and TP1/TP4 CUDA component cases cover serialization,
+partial/inactive rows, poisoned scratch and compiled/native replay. The two
+source changes pass 211 CPU cases together. Full-model serving with the shared
+view identities remains unqualified.
+
+### Torch 2.14.1 preparation patches
+
+The native server does not use Torch. The following patches change only the
+`2.14.1+cu132` preparation environment; CUDA libraries and native Torch binaries
+are unchanged. They are supplied as source patches rather than host-specific
+installed files.
+
+| Patch | Resulting behavior | Qualification |
+|---|---|---|
+| [Mutation regions](../tools/compiler-patches/torch-2.14.1-mutation-regions.patch) | Rebuild mutation-region IDs once after singleton auto-functionalization rewrites; other passes retain their checks. | Qualified: 20 CPU cases preserve FX, regions, outputs, aliases and stream/mempool metadata. |
+| [Scheduler membership](../tools/compiler-patches/torch-2.14.1-scheduler-membership.patch) | Query the existing ancestor, removed-operation and completed-operation sets directly during in-place reuse decisions. | Qualified: 40 CPU cases preserve decisions and real kernel argument bindings. |
+| [Event-triggered mutation checks](../tools/compiler-patches/torch-2.14.1-lazy-input-mutation-events.patch) | Defer input-version bookkeeping until event recording requires it; restart root tracing before recording and retain the complete existing checks on that trace. | Qualified: CPU mutation/restart cases and 18 CUDA event cases preserve FX, outputs, errors, side effects and event ordering. |
+| [No-clone custom-op decomposition](../tools/compiler-patches/torch-2.14.1-no-clone-custom-op-decomposition.patch) | Build the one-call replacement graph directly for eligible returnless custom operations; retain canonical fake execution, metadata and replacement handling. Tensor geometry must be static; existing FX integer operands remain runtime bindings. Views, clones, unsupported constants and symbol-producing cases retain canonical tracing. | Research-only for the complete model. Focused CPU and CUDA artifact tests pass; complete Kimi compilation has not completed with this patch. |
+
+The no-clone patch covers runtime integer handles, not just constant operands.
+CPU and CUDA checks compile, save, reload and rebind handles while preserving
+caller mutations and physical alias coherence through writes to overlapping
+views. Canonical fake execution preserves layout checks and shape guards.
+Its full-model compilation-time benefit remains unqualified.
+
+Apply the three component-qualified patches in order after environment setup,
+while that environment has no running preparation process:
 
 ```sh
 k31_torch_site=$(.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')
-patch --fuzz=0 --directory "$k31_torch_site" -p1 \
-  < tools/compiler-patches/torch-2.14.1-mutation-regions.patch
+for k31_patch in \
+  torch-2.14.1-mutation-regions.patch \
+  torch-2.14.1-scheduler-membership.patch \
+  torch-2.14.1-lazy-input-mutation-events.patch
+do
+  patch --fuzz=0 --directory "$k31_torch_site" -p1 \
+    < "tools/compiler-patches/$k31_patch"
+done
 ```
 
-The patch is CPU-qualified on 20 cases covering v1/v2 functionalization,
-reinplacing, overlapping views, BF16, empty and strided tensors, nested
-`control_deps`, stream/mempool metadata and ordinary mutation barriers.
-Original and patched environments produced identical FX code, region IDs,
-outputs and aliases. For 32 rewrites with 32768 alias nodes, the complete pass
-measured 0.346 seconds versus 0.185 seconds; full-region scans fell from 33 to 1.
-This is a compiler-pass result, not a full-model inference gain.
+The fourth patch is separate for preparation qualification:
 
-Keep an unpatched environment for the comparison, then run:
+```sh
+patch --fuzz=0 --directory "$k31_torch_site" -p1 \
+  < tools/compiler-patches/torch-2.14.1-no-clone-custom-op-decomposition.patch
+```
+
+Keep a separate unpatched environment. Representative checks, run from the
+repository root, are:
 
 ```sh
 python3 qualify/torch_mutation_regions/validate.py \
   --baseline-python /path/to/unpatched-venv/bin/python \
-  --patched-python .venv/bin/python \
-  --output /tmp/k31-compiler-check
+  --patched-python .venv/bin/python --output /tmp/k31-mutation-regions
+
+CUDA_VISIBLE_DEVICES= .venv/bin/python qualify/torch_compiler/scheduler_membership.py \
+  --baseline-source /path/to/unpatched-venv/lib/python3.12/site-packages/torch/_inductor/scheduler.py
+
+CUDA_VISIBLE_DEVICES= /path/to/unpatched-venv/bin/python \
+  qualify/torch_compiler/events_cpu.py baseline --output /tmp/k31-events-baseline.json
+CUDA_VISIBLE_DEVICES= .venv/bin/python qualify/torch_compiler/events_cpu.py candidate \
+  --baseline-result /tmp/k31-events-baseline.json --output /tmp/k31-events-candidate.json
+
+CUDA_VISIBLE_DEVICES= .venv/bin/python qualify/torch_compiler/unbacked_handle_aot_cpu.py \
+  --expect-direct --output /tmp/k31-runtime-handles/result.json
 ```
 
-The driver masks CUDA and launches separate interpreters. Choose an unused
-output directory. Torch's source key invalidates forward and Inductor caches
-normally. Kernel selections remain subject to their ordinary identity and guard
-checks. No forward-cache migration is required.
+The runtime-handle check requires the fourth patch. CUDA event checks use
+`qualify/torch_compiler/events_cuda.py baseline|candidate` on an explicitly
+selected GPU and write one JSON result to stdout. Use unused output paths.
+Torch source keys invalidate forward and Inductor caches normally. Existing
+b12x kernel selections remain subject to their query identities and guards;
+changing Torch source does not authorize forward-cache migration.
 
 ## Gather checks without model weights
 
@@ -92,38 +141,67 @@ unlocked clocks (active frequencies were not recorded), the 32-row 512 KiB-per-r
 0.322/0.328 ms warm/cold with the ring, versus approximately 7 ms for ordinary
 512-thread/eight-block DCP. These are component timings, not model throughput.
 
-## Work remaining on the development host
+## Full-model validation and host continuation
 
-The MXFP8/4096 preparation on Frank1 exhausted host RAM during concurrent
-forward compilation. Linux recorded almost all of the 1.2 TB host memory in
-use; individual compiler processes reached about 108 GiB RSS. The fixed
-2 GiB-per-worker estimate in `ignition/preparation/host_memory.py` is inadequate
-for these graphs. Reducing `--compile-workers` does not itself provide a
-per-process RAM bound.
+The MXFP8/4096 configuration is implemented but its serving speed and native KV
+capacity remain unqualified. A TP16/C4/K7 diagnostic export uses the ordinary
+Ignition command with `--online-mxfp8`, `--prefill-chunk-size 4096`, four image
+slots and `--no-compile`. This flag skips complete-forward compilation;
+kernels are still prepared and CUDA graphs are captured for native serving.
+Flare serves the prepared CUDA graphs natively.
+The export captured all 104 graphs and wrote weight payloads. Package combination
+then failed because its envelope was 166,123,939 bytes, exceeding the existing
+134,217,728-byte limit. No MXFP8/4096 package was published or served. The limit
+has not been raised; envelope compaction and recoverability are under investigation.
 
-A sampled compiler stack also showed Dynamo scanning input tensor versions in
-`OutputGraph.check_input_mutation_on_current_stream`. A proposed stream-tracking
-shortcut was not integrated because correctness across direct stream setters,
-new placeholders and multiple devices was not established.
+Failed-export cleanup removed the per-rank source records and staging indexes.
+Immutable payload blobs remain in the cache, but they do not contain the graph
+and placement indexes needed to recombine a package. A CPU-only retry from those
+blobs has not been established. Preserve the blobs while resolving the envelope
+size; do not assume that they constitute a loadable runtime.
 
-The resumed job uses `--compile-workers 16`, an 850 GiB service memory limit
-and a separate watcher that stops its owned preparation process below 128 GiB
-host `MemAvailable`. Eighty-two compiled artifacts survived the failed run;
-the remaining 3584- and 4096-token prefill variants are needed with and without
-draft feedback. Full export, MXFP8 serving speed, native KV capacity and the
-target-only comparison remain unqualified.
-
-For continuation on that host:
+The diagnostic export uses Flare `d2e66491` and FlashInfer `981798fd`, with the
+first three Torch patches. It does not include the shared DSA view identities
+added to this branch. Record this distinction when comparing preparation times.
+Its controller is configured to start native Flare on port 8170 only after
+successful publication, then check text, images, concurrent requests and 32K
+recall before C1/C4 decode, uncached
+32K prefill and Tetris. No serving-performance result from that configuration
+has been qualified yet.
 
 ```sh
-systemctl status astra-kimi31-mxfp8-bounded-export.service
-tail -n 30 /data/kimi31-support/export-mxfp8-prefill4096-compiler-bounded.log
+systemctl status astra-kimi31-mxfp8-uncompiled-export.service
+tail -n 30 /data/kimi31-support/export-mxfp8-prefill4096-uncompiled.log
 cat /data/kimi31-support/execution-state.json
 ```
 
-The controller `/data/kimi31-support/after-mxfp8-compiler-bounded-export.py`
-starts native Flare on port 8170 after export, then runs text/image checks,
-C1/C4 decode, 32K prefill and Tetris. The separate
-`astra-kimi31-target-only-followup.service` waits for those tests, measures the
-same package with zero drafts and restores K7 serving. These host scripts are
-orchestration; model preparation uses the ordinary Ignition command above.
+The controller is `/data/kimi31-support/after-mxfp8-uncompiled-export.py`; it
+exited on the envelope failure. No Kimi server is running on port 8170.
+Preparation has an 850 GiB service memory limit; an independent watcher stops
+only its owned controller below 128 GiB host `MemAvailable`. The target-only
+comparison and restoration of K7 serving remain pending native validation.
+
+Full-forward compiler qualification uses the serialized 3584-token prefill
+metadata in `/data/kimi31-support/compile-study/full-forward-storage-input/`;
+it loads no checkpoint weights. The three-patch compiler passed storage
+analysis in 1.589 seconds inside that full pipeline, but reached a 20-minute
+bound during per-operation auto-functionalization decomposition before code
+generation. The fourth patch addresses that measured phase. Full artifact
+completion and subsequent compiled native-package validation remain pending.
+
+The retained BF16/1024 package is
+`/data/kimi31-support/package-cache/models/moonshotai_2FKimi-K3.1-Pro/gb202-tp16-202611050522`.
+It is the qualified functional baseline; it does not contain the MXFP8 dense
+conversion or fixed-neighbor gather selections. Retain it until a replacement
+package passes native validation.
+
+For the measured compiler phases, complete metadata qualification is being
+continued on Frank2 with the recorded TP16/3584 forward.
+The helper uses shared GPU 8 only for correctness and compiler execution, with
+no weights or GPU-performance claims. Its directory is
+`/data/kimi31-support/full-forward-four-patch-ready-replay-20261105`; normal
+metadata restoration passed before tracing started. Dependency setup includes
+the CuTe Python bootstrap and prepared sampling module. The running unit is
+`flare-four-patch-metadata-ready-20261105` (PID 3230572 at publication).
+Compilation is bounded to 40 minutes and 128 GiB; only its owned helper stops below 128 GiB host available
+memory. Completion of the full artifact remains pending.
