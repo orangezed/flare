@@ -74,6 +74,14 @@ Python owners until native CUDA work has drained. A failed drain retains those
 owners. Final assembly consumes rank indexes and open source file ranges
 independently of the prepared model.
 
+Export retains captured graph templates without keeping an executable for every
+variant. The native exporter instantiates and destroys one temporary executable
+at a time to validate each template and record its actual CUDA flags; it does not
+launch those executables. Ignition requests the same `AUTO_FREE_ON_LAUNCH` policy
+as PyTorch. Existing callers may instead supply live executables. Both paths
+write the same package representation. Diagnostic native handoff materializes
+executables before transferring graph ownership to the replay worker.
+
 **Storage.** PyTorch's persistent device allocations come from one address range
 reserved before model loading: 1 TiB per rank from `0x0800_0000_0000` on Linux or
 `0x0400_0000_0000` on Windows, backed on

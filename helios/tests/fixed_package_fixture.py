@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 from signing import publisher
 from fixture_frontend import server_config
-import sys
 import subprocess
 
 import torch
@@ -87,7 +86,7 @@ __global__ void no_arguments() {}
     return module, function, empty
 
 
-def prepare(root, shard_size=64 << 30, legacy=False, completion_token_capacity=8):
+def prepare(root, shard_size=64 << 30, legacy=False, completion_token_capacity=8, templates_only=False):
     with ModuleImages() as images:
         torch.cuda.set_device(0)
         with PackageStorage() as storage:
@@ -151,8 +150,12 @@ def prepare(root, shard_size=64 << 30, legacy=False, completion_token_capacity=8
             graph = torch.cuda.CUDAGraph(keep_graph=True)
             with torch.cuda.graph(graph, pool=storage.graph_pool.id):
                 run()
-            graph.instantiate()
-            graph.replay()
+            if templates_only:
+                run()
+                assert not graph._has_graph_exec
+            else:
+                graph.instantiate()
+                graph.replay()
             torch.cuda.synchronize()
             expected = output.view(torch.uint8).cpu().numpy().tobytes()
             output.zero_()
@@ -170,6 +173,8 @@ def prepare(root, shard_size=64 << 30, legacy=False, completion_token_capacity=8
             assert graph_segments
     package = export_model(prepared, images, storage, root / "rank.json", options={},
                            sources=True)
+    if templates_only:
+        assert not graph._has_graph_exec
     assert not any(a.address <= unused_address < a.address + a.nbytes for a in package.allocations)
     assert not any(a.address <= freed_address < a.address + a.nbytes for a in package.allocations)
     assert any(a.address == segment["address"] for a in package.allocations for segment in graph_segments)
@@ -207,10 +212,11 @@ if __name__ == "__main__":
     parser.add_argument("--shard-size", type=int, default=64 << 30)
     parser.add_argument("--legacy", action="store_true")
     parser.add_argument("--completion-token-capacity", type=int, default=8)
+    parser.add_argument("--templates-only", action="store_true")
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
     if args.completion_token_capacity < 1:
         parser.error("completion token capacity must be positive")
-    prepare(args.directory, args.shard_size, args.legacy, args.completion_token_capacity)
+    prepare(args.directory, args.shard_size, args.legacy, args.completion_token_capacity, args.templates_only)
     if args.executable:
         os.execv(args.executable, [args.executable, str(args.directory)])

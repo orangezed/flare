@@ -52,6 +52,24 @@ def test_manifest_offsets_are_stable_across_graphs(monkeypatch):
     assert manifest["buffers"][-1]["dtype"] == "bool"
 
 
+def test_export_manifest_uses_templates_and_omits_executable_handles(monkeypatch):
+    execution = _execution(estimated_durations_ns={"decode": 123_000, "prefill": 456_000})
+    spans = [(4096, 4), (8192, 8), (12288, 2048), (16384, 128), (20480, 1)]
+    def validate(*, executable=True):
+        assert not executable
+        return 9, [11, 12], spans
+    monkeypatch.setattr(execution, "_validate_resources", validate)
+    exported = execution.export_manifest()
+    assert exported["input_frame_bytes"] == 152
+    assert [graph["name"] for graph in exported["graphs"]] == ["decode", "prefill"]
+    assert all("handle" not in graph for graph in exported["graphs"])
+    monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [111, 112], spans))
+    live = execution.manifest(all_variants=True)
+    for graph in live["graphs"]:
+        assert graph.pop("handle") in (111, 112)
+    assert live == exported
+
+
 def test_verification_keeps_prefix_width_separate_from_total_rows(monkeypatch):
     signature = GraphSignature('speculative', 4, 6, ('tokens',), packed_token_capacity=12)
     execution = _execution(graphs={'verify':object()}, signatures={'verify':signature})

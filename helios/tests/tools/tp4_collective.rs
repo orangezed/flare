@@ -196,10 +196,11 @@ pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(completion) = worker.poll()? {
                     assert_eq!(completion.fence, tickets[rank]);
                     assert_eq!(completion.records.len(), 1);
-                    assert_eq!(completion.records[0].fields(), vec![
+                    let mut expected_record = vec![
                         0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 1,
-                        -1, -1, -1, -1, -1, -1, -1, -1,
-                    ]);
+                    ];
+                    expected_record.resize(manifests[rank].completion_fields(), -1);
+                    assert_eq!(completion.records[0].fields(), expected_record);
                     break;
                 }
                 if Instant::now() > deadline { return Err("TP4 collective replay timed out".into()); }

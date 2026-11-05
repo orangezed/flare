@@ -104,7 +104,7 @@ class RuntimePackage:
             cubin_bytes=sum(len(image) for image in self.modules.values() if isinstance(image, bytes)))
 
     def write(self, path, graphs, *, execution=None, server=None, progress=None, package_data=None,
-              publisher=None, sources=False, rebuild_weights=None, zero_ranges=()):
+              publisher=None, sources=False, rebuild_weights=None, zero_ranges=(), instantiate_flags=None):
         import flare_heliopause
         from .package_snapshot import _OPTIONS
         from .rebuild_manifest import rebuild_weights_metadata, weight_payload_request
@@ -117,7 +117,7 @@ class RuntimePackage:
         # Absent cache configuration stays absent: the native exporter owns
         # default destination and cache selection.
         cache = _OPTIONS.get()
-        request = dict(path=str(path), context=context, graphs=_graphs(graphs),
+        request = dict(path=str(path), context=context, graphs=_graphs(graphs, instantiate_flags=instantiate_flags),
             allocations=[asdict(a) for a in self.allocations], kernels=[asdict(k) for k in self.kernels],
             modules={name: str(path) for name,path in self.modules.items()},
             roots=[a.name for a in self.allocations],
@@ -143,9 +143,13 @@ class RuntimePackage:
         self.export_counts = output["export_counts"]
 
 
-def _graphs(graphs):
-    return [dict(name=name, graph=int(graph.raw_cuda_graph()), executable=int(graph.raw_cuda_graph_exec()))
-            for name, graph in graphs.items()]
+def _graphs(graphs, *, instantiate_flags=None):
+    """Export live executables or templates that the native exporter validates sequentially."""
+    if instantiate_flags is not None and (type(instantiate_flags) is not int or not 0 <= instantiate_flags < 1 << 64):
+        raise ValueError("graph instantiation flags must be an unsigned 64-bit integer")
+    return [dict(name=name, graph=int(graph.raw_cuda_graph()),
+                 **({"executable": int(graph.raw_cuda_graph_exec())} if instantiate_flags is None
+                    else {"instantiate_flags": instantiate_flags})) for name, graph in graphs.items()]
 
 
 def _cache_options(cache, options=None):
@@ -222,11 +226,13 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         peer_addresses=[] if storage.peer_storage is None else list(storage.peer_storage.owned),
         peer_mappings=[] if storage.peer_storage is None else
             [part for parts in storage.peer_storage.imported_mappings.values() for part in parts],
-        graphs=_graphs(prepared.graphs), allocations=[asdict(a) for a in allocations], discover_allocations=True,
+        # Match PyTorch's AUTO_FREE_ON_LAUNCH policy without retaining every executable.
+        graphs=_graphs(prepared.graphs, instantiate_flags=1),
+        allocations=[asdict(a) for a in allocations], discover_allocations=True,
         events=prepared.export_events, numeric=numeric, inactive=inactive,
         parameter_layouts=parameter_layouts, zero_ranges=zero_ranges, transports=transports,
         device_address_floor=storage.EXTERNAL_FLOOR if storage.integrated else 0,
-        execution=prepared.manifest(all_variants=True), server=None if bundle_only else {**prepared.server_config, **options},
+        execution=prepared.export_manifest(), server=None if bundle_only else {**prepared.server_config, **options},
         package_data=None if bundle_only or prepared.package_data is None else prepared.package_data.export_metadata(),
         rebuild_weights=None if getattr(prepared, "rebuild_weights", None) is None else
             rebuild_weights_metadata(prepared.rebuild_weights),

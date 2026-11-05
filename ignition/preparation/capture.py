@@ -129,10 +129,9 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                     stream.synchronize()
                 with capture_consumers(session, graph), communication, session.capture(), torch.cuda.graph(graph, pool=pool, stream=stream):
                     function()
-                if retain_graphs:
-                    if progress is not None:
-                        progress(f"instantiating {name}: {memory_detail()}")
-                    graph.instantiate()
+                # Retained templates are validated one executable at a time by
+                # the exporter. Holding the entire executable catalog here can
+                # exhaust device memory before package serialization starts.
             except Exception as error:
                 error.add_note(f"Graph {name!r} on {device}: {memory_detail()}")
                 raise

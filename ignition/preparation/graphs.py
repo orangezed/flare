@@ -31,6 +31,8 @@ class PreparedGraphBundle:
     does not expose a graph's capture device, so capture on that device remains
     a preparation invariant. Registration checks its capability and context,
     every declared buffer's device and extent, and instantiated graph handles.
+    Native handoff instantiates retained templates before transferring ownership;
+    export metadata validates templates without materializing the executable catalog.
 
     Graphs must not use PyTorch generator-backed random operations: raw native
     launch bypasses PyTorch RNG bookkeeping. After handoff, callers must not
@@ -119,7 +121,7 @@ class PreparedGraphBundle:
             self, context, self._device, handles, spans, queue_capacity=queue_capacity,
         )
 
-    def _validate_resources(self) -> tuple[int, list[int], list[tuple[int, int]]]:
+    def _validate_resources(self, *, executable=True) -> tuple[int, list[int], list[tuple[int, int]]]:
         import torch
         import flare_heliopause
 
@@ -133,14 +135,24 @@ class PreparedGraphBundle:
                 if not isinstance(graph, torch.cuda.CUDAGraph):
                     raise TypeError(f"graph {name!r} must be a torch.cuda.CUDAGraph")
                 try:
-                    handle = graph.raw_cuda_graph_exec()
+                    if executable:
+                        # Export retains templates. Diagnostic native handoff
+                        # materializes executable handles before serving begins.
+                        if not graph._has_graph_exec:
+                            if self._consumed:
+                                raise RuntimeError("a graph handed to native execution lost its executable")
+                            graph.instantiate()
+                        handle = graph.raw_cuda_graph_exec()
+                    else:
+                        handle = graph.raw_cuda_graph()
                 except RuntimeError as error:
-                    raise ValueError(f"graph {name!r} must already be instantiated: {error}") from error
+                    resource = "executable" if executable else "retained capture template"
+                    raise ValueError(f"graph {name!r} has no usable {resource}: {error}") from error
                 if not isinstance(handle, int) or handle <= 0:
-                    raise ValueError(f"graph {name!r} has no instantiated executable handle")
+                    raise ValueError(f"graph {name!r} has no CUDA graph handle")
                 handles.append(handle)
             if len(set(handles)) != len(handles):
-                raise ValueError("named graphs must have unique executable handles")
+                raise ValueError("named graphs must have unique CUDA graph handles")
 
             spans = []
             for name, tensor in self._buffers.items():

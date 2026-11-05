@@ -6,6 +6,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
+import os
 from threading import Event
 from types import SimpleNamespace
 
@@ -119,3 +120,40 @@ def test_invalid_capacity_never_consumes_bundle(capacity):
     with pytest.raises(ValueError, match="queue_capacity"):
         prepared.start_worker(queue_capacity=capacity)
     assert not prepared.consumed
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires an assigned GPU")
+def test_retained_templates_instantiate_only_at_native_handoff():
+    from contextlib import nullcontext
+    import torch
+    from ignition.preparation.capture import capture_forwards
+
+    device = torch.device("cuda:0")
+    source = torch.zeros(128, device=device)
+    output = torch.empty_like(source)
+    stream = torch.cuda.Stream(device=device)
+    functions = {"double": lambda: output.copy_(source * 2),
+                 "increment": lambda: output.copy_(source + 5)}
+    graphs, _ = capture_forwards(functions,
+        {name: SimpleNamespace(kind="decode") for name in functions},
+        session=SimpleNamespace(capture=nullcontext), device=device, stream=stream,
+        pool=torch.cuda.graph_pool_handle(), compile_decoder=False, retain_graphs=True)
+    assert all(not graph._has_graph_exec for graph in graphs.values())
+    prepared = PreparedGraphBundle(device=0, graphs=graphs, buffers={"source": source, "output": output},
+                                   resources=(functions, stream))
+    prepared._validate_resources(executable=False)
+    assert all(not graph._has_graph_exec for graph in graphs.values())
+    worker = prepared.start_worker()
+    assert all(graph._has_graph_exec for graph in graphs.values())
+    try:
+        for iteration, index in enumerate((0, 1, 1, 0, 1, 0)):
+            source.fill_(iteration)
+            output.fill_(float("nan"))
+            torch.cuda.synchronize()
+            ticket = worker.submit(index)
+            result = worker.poll(timeout_ms=30000)
+            assert result is not None and result.ticket == ticket and result.error is None
+            expected = iteration * 2 if index == 0 else iteration + 5
+            torch.testing.assert_close(output, torch.full_like(output, expected), rtol=0, atol=0)
+    finally:
+        worker.close()

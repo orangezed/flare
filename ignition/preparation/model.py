@@ -61,7 +61,7 @@ class PreparedModel(PreparedExecution):
         self._preparation_thread = get_ident()
 
     def manifest(self, *, all_variants=False):
-        """Expose the serving width to diagnostics and the complete catalog to export."""
+        """Describe live diagnostic graphs, optionally including unselected variants."""
         manifest = super().manifest(all_variants=all_variants)
         fixed = self.server_config.get("speculative_fixed_width")
         if fixed is not None and not all_variants:

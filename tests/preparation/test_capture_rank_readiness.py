@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Collective warmup waits for every rank to finish the preceding graph's instantiation."""
+"""Collective warmup waits for every rank to finish the preceding capture."""
 
 import multiprocessing
+import pytest
 
 
-def capture_rank(rank, world, store, finished, outcome):
-    from contextlib import nullcontext
+def capture_rank(rank, world, store, finished, outcome, retain):
+    from contextlib import contextmanager, nullcontext
     from datetime import timedelta
     from types import SimpleNamespace
     import time
@@ -29,9 +30,20 @@ def capture_rank(rank, world, store, finished, outcome):
                 created.append(self)
 
             def instantiate(self):
+                assert not retain, "export must defer executable creation"
                 if rank == world - 1 and self.index == 0:
                     time.sleep(.3)
                 finished[rank * 2 + self.index] = 1
+
+        @contextmanager
+        def capture_context(graph, **kwargs):
+            yield
+            if retain:
+                if rank == world - 1 and graph.index == 0:
+                    time.sleep(.3)
+                finished[rank * 2 + graph.index] = 1
+            else:
+                graph.instantiate()
 
         def first():
             pass
@@ -44,12 +56,12 @@ def capture_rank(rank, world, store, finished, outcome):
         capture.torch.cuda.stream = lambda stream: nullcontext()
         capture.torch.cuda.synchronize = lambda device: None
         capture.torch.cuda.CUDAGraph = Graph
-        capture.torch.cuda.graph = lambda *args, **kwargs: nullcontext()
+        capture.torch.cuda.graph = capture_context
         functions = {"first": first, "second": second}
         graphs, _ = capture.capture_forwards(functions,
             {name: SimpleNamespace(kind="decode") for name in functions},
             session=SimpleNamespace(capture=nullcontext), device="cpu", stream=stream, pool=None,
-            coordinator=coordinator, compile_decoder=False, retain_graphs=True)
+            coordinator=coordinator, compile_decoder=False, retain_graphs=retain)
         outcome.put((rank, list(graphs)))
     except Exception:
         outcome.put((rank, traceback.format_exc()))
@@ -58,13 +70,14 @@ def capture_rank(rank, world, store, finished, outcome):
             dist.destroy_process_group()
 
 
-def test_warmup_waits_for_slow_peer_graph_instantiation(tmp_path):
+@pytest.mark.parametrize("retain", [False, True])
+def test_warmup_waits_for_slow_peer_capture_finalization(tmp_path, retain):
     context = multiprocessing.get_context("fork")
     world = 3
     finished = context.Array("i", world * 2, lock=False)
     outcome = context.Queue()
     processes = [context.Process(target=capture_rank,
-        args=(rank, world, tmp_path / "store", finished, outcome)) for rank in range(world)]
+        args=(rank, world, tmp_path / "store", finished, outcome, retain)) for rank in range(world)]
     for process in processes:
         process.start()
     results = dict(outcome.get(timeout=30) for _ in processes)

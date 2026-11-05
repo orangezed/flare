@@ -194,7 +194,15 @@ class PreparedExecution(PreparedGraphBundle):
         self.export_events = dict(export_events or {})
 
     def manifest(self, *, all_variants=False) -> dict[str, Any]:
-        context, handles, spans = self._validate_resources()
+        return self._execution_metadata(all_variants=all_variants, executable=True)
+
+    def export_manifest(self) -> dict[str, Any]:
+        """Describe every captured variant without materializing executable handles."""
+        return self._execution_metadata(all_variants=True, executable=False)
+
+    def _execution_metadata(self, *, all_variants, executable):
+        context, handles, spans = (self._validate_resources() if executable
+                                  else self._validate_resources(executable=False))
         descriptors = []
         offsets = {}
         cursor = 0
@@ -222,7 +230,7 @@ class PreparedExecution(PreparedGraphBundle):
             if not all_variants and signature.speculation_enabled not in (None, speculative):
                 continue
             inputs = (*reserved, *signature.inputs)
-            graphs.append({"name": name, "kind": signature.kind, "handle": handle,
+            graphs.append({"name": name, "kind": signature.kind,
                 "sampling_mode": signature.sampling_mode,
                 "batch_capacity": signature.batch_capacity, "token_capacity": signature.token_capacity,
                 "prefill_capacity": signature.prefill_capacity,
@@ -230,6 +238,8 @@ class PreparedExecution(PreparedGraphBundle):
                 "estimated_duration_ns": self.estimated_durations_ns[name],
                 "input_bindings": [{"buffer_name": field, "host_offset": offsets[field][0],
                                     "nbytes": offsets[field][1]} for field in inputs]})
+            if executable:
+                graphs[-1]["handle"] = handle
             graphs[-1]["tuned_bindings"] = [dict(buffer=value.buffer, tuning_graph=value.tuning_graph)
                 for value in self.tuned_bindings.get(name, ())]
             if signature.speculation_enabled is not None:
@@ -244,8 +254,9 @@ class PreparedExecution(PreparedGraphBundle):
                 "context": context, "device": self.device,
                 "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,
                 "buffers": descriptors, "graphs": graphs,
-                "tuning_graphs": [dict(name=name, handle=graph_handles[name], outputs=list(value.outputs),
-                                       status_buffer=value.status_buffer) for name, value in self.tuning_graphs.items()]}
+                "tuning_graphs": [dict(name=name, outputs=list(value.outputs), status_buffer=value.status_buffer,
+                                       **({"handle": graph_handles[name]} if executable else {}))
+                                  for name, value in self.tuning_graphs.items()]}
 
     def start_executor(self, *, peers=None):
         """Synchronize preparation and consume the bundle into the native executor."""

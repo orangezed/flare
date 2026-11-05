@@ -15,6 +15,19 @@ import pytest
 from ignition.preparation.runtime_package import FileSource
 
 
+def test_template_descriptions_do_not_require_live_executables():
+    from types import SimpleNamespace
+    from ignition.preparation.runtime_package import _graphs
+
+    graph = SimpleNamespace(raw_cuda_graph=lambda: 17,
+        raw_cuda_graph_exec=lambda: pytest.fail("template export must not require a live executable"))
+    assert _graphs({"decode": graph}, instantiate_flags=1) == [
+        {"name": "decode", "graph": 17, "instantiate_flags": 1}]
+    for flags in (-1, 1 << 64, True, 1.5):
+        with pytest.raises(ValueError, match="unsigned 64-bit"):
+            _graphs({"decode": graph}, instantiate_flags=flags)
+
+
 def test_invalid_serving_metadata_fails_before_cuda_or_weight_copy(tmp_path):
     import flare_heliopause
 
