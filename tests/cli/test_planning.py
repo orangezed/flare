@@ -476,6 +476,32 @@ def test_language_model_only_plans_no_images_for_recipes_that_declare_it():
         planned(PAIR, language_model_only=True)
 
 
+@pytest.mark.parametrize("online", [False, True])
+def test_kimi31_language_model_only_requires_an_explicit_flag(online):
+    from ignition.cli import _parser
+    from ignition.recipes.kimi31.recipe import RECIPE
+
+    devices = tuple(replace(gpu(i, 95), total_bytes=256 * GIB, free_bytes=255 * GIB) for i in range(16))
+
+    def planned(flags):
+        args = _parser().parse_args(["export", "kimi-k3.1-pro", "--max-concurrency", "4",
+            *(["--online-mxfp8"] if online else []), *flags])
+        return planning.plan(RECIPE, RECIPE.checkpoints[0], devices, selected=tuple(range(16)),
+            concurrency=args.max_concurrency, reserve_bytes=0, speculation=RECIPE.speculation,
+            language_model_only=args.language_model_only, image_concurrency=args.image_concurrency,
+            online_mxfp8=args.online_mxfp8)
+
+    vision, text = planned([]), planned(["--language-model-only"])
+    assert not vision.language_model_only and vision.max_images == 4 and vision.image_concurrency == 4
+    assert text.language_model_only and text.max_images == 0 and text.image_concurrency == 0
+    assert vision.online_mxfp8 is text.online_mxfp8 is online
+    assert vision.to_dict()["language_model_only"] is False
+    assert text.to_dict()["language_model_only"] is True
+    assert planned(["--image-concurrency", "4"]) == vision
+    with pytest.raises(UsageError, match="--image-concurrency requires the vision encoder"):
+        planned(["--language-model-only", "--image-concurrency", "4"])
+
+
 def test_first_fitting_gpus_and_smallest_supported_tensor_parallel_size():
     assert [g.index for g in derive(gpus=(gpu(0, 10), gpu(1, 95), gpu(2, 95))).gpus] == [1]
     assert [g.index for g in derive(gpus=(gpu(0, 95, (9, 0)), gpu(1, 95))).gpus] == [1]

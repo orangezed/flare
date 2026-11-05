@@ -76,8 +76,8 @@ def test_draft_geometry_and_target_identity(raw, field, value):
         DSparkConfig.from_dict(draft, raw["text_config"])
 
 
-def test_recipe_preserves_vision_and_sampling():
-    assert not RECIPE.language_model_only
+def test_recipe_preserves_image_capacity_and_sampling():
+    assert RECIPE.max_images == 4
     assert RECIPE.sampling_defaults.top_p == .95
     assert RECIPE.sampling_defaults.temperature == 1.
     assert RECIPE.sampling_defaults.top_k == -1

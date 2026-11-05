@@ -1049,7 +1049,8 @@ Use ordinary export when changing from BF16 to MXFP8; `--reuse-weights`
 requires matching prepared weight layouts. Ordinary export reuses unchanged
 cached weight objects and writes the converted projections.
 
-`--language-model-only` omits image preparation. `--no-mtp` omits draft weights
+`--language-model-only` omits image preparation; image support remains enabled
+when the flag is omitted. `--no-mtp` omits draft weights
 and history; loading an existing package with `--mtp-draft-tokens 0` retains
 the prepared layout and selects ordinary execution.
 
