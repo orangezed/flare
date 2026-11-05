@@ -98,7 +98,14 @@ class PreparationConfig:
             raise ValueError("Kimi K3 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
 
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+        if self.vision:
+            images = image_capacity(self.max_active, self.image_concurrency)
+        else:
+            if self.image_concurrency is not None and (type(self.image_concurrency) is not int
+                                                       or self.image_concurrency != 0):
+                raise ValueError("image concurrency must be zero or omitted when vision is disabled")
+            images = 0
+        object.__setattr__(self, "image_concurrency", images)
         if len(self.devices) != 16 or len(set(self.devices)) != 16 or any(d < 0 for d in self.devices):
             raise ValueError("Kimi K3 preparation requires sixteen distinct GPUs")
         request_capacity(self.max_active)
