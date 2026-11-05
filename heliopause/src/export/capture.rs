@@ -541,6 +541,59 @@ fn kernel_node(
     })
 }
 
+struct TemporaryGraphExecutable<'a> {
+    cuda: &'a Cuda,
+    handle: Handle,
+    destroy: unsafe extern "C" fn(Handle) -> c_int,
+}
+
+impl<'a> TemporaryGraphExecutable<'a> {
+    fn new(cuda: &'a Cuda, graph: usize, flags: u64) -> ExportResult<Self> {
+        // Resolve cleanup before creating a resource that must remain local to
+        // one graph's export, including failures while inspecting its flags.
+        let destroy = unsafe { cuda.symbol(b"cuGraphExecDestroy\0")? };
+        let mut executable = Self { cuda, handle: std::ptr::null_mut(), destroy };
+        cu!(
+            cuda,
+            "cuGraphInstantiateWithFlags",
+            (*mut Handle, Handle, u64),
+            &mut executable.handle,
+            graph as Handle,
+            flags
+        )?;
+        Ok(executable)
+    }
+
+    fn close(mut self) -> ExportResult<()> {
+        let handle = std::mem::replace(&mut self.handle, std::ptr::null_mut());
+        self.cuda.check("cuGraphExecDestroy", unsafe { (self.destroy)(handle) })
+    }
+}
+
+impl Drop for TemporaryGraphExecutable<'_> {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { (self.destroy)(self.handle); }
+        }
+    }
+}
+
+fn graph_flags(cuda: &Cuda, graph: &super::GraphHandle) -> ExportResult<u64> {
+    let temporary = graph.instantiate_flags
+        .map(|flags| TemporaryGraphExecutable::new(cuda, graph.graph, flags))
+        .transpose()?;
+    let executable = temporary.as_ref()
+        .map_or(graph.executable as Handle, |temporary| temporary.handle);
+    let mut flags = 0u64;
+    let result = cu!(cuda, "cuGraphExecGetFlags", (Handle, *mut u64), executable, &mut flags);
+    // Destroy before returning, even if the flag query failed. A cleanup error
+    // stops export rather than accumulating executables across graph templates.
+    let cleanup = temporary.map(TemporaryGraphExecutable::close).transpose();
+    result?;
+    cleanup?;
+    Ok(flags)
+}
+
 fn capture_graph(
     cuda: &Cuda,
     graph: &super::GraphHandle,
@@ -745,14 +798,7 @@ fn capture_graph(
             })
         })
         .collect::<ExportResult<Vec<_>>>()?;
-    let mut flags = 0u64;
-    cu!(
-        cuda,
-        "cuGraphExecGetFlags",
-        (Handle, *mut u64),
-        graph.executable as Handle,
-        &mut flags
-    )?;
+    let flags = graph_flags(cuda, graph)?;
     Ok((result, edges, flags))
 }
 
@@ -2492,15 +2538,11 @@ pub(crate) fn capture_rank(
         )
         .into());
     }
-    if request.graphs.is_empty()
-        || request
-            .graphs
-            .iter()
-            .any(|g| g.name.is_empty() || g.graph == 0 || g.executable == 0)
-    {
-        return Err(invalid(
-            "named live graph templates and executables are required",
-        ));
+    if request.graphs.is_empty() {
+        return Err(invalid("at least one named live graph template is required"));
+    }
+    for graph in &request.graphs {
+        graph.validate()?;
     }
     if request
         .graphs
@@ -3225,6 +3267,168 @@ pub(crate) fn drain_context(context: usize) -> ExportResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::export::GraphHandle;
+
+    #[test]
+    fn graph_handles_preserve_executable_requests_and_explicit_template_flags() -> ExportResult<()> {
+        let declaration = serde_json::json!({"name": "decode", "graph": 17, "executable": 23});
+        let executable: GraphHandle = serde_json::from_value(declaration.clone())?;
+        executable.validate()?;
+        assert_eq!(executable.executable, 23);
+        assert_eq!(executable.instantiate_flags, None);
+        assert_eq!(serde_json::to_value(executable)?, declaration);
+
+        for flags in [0, 1, u64::MAX] {
+            for explicit_zero in [false, true] {
+                let mut declaration = serde_json::json!({
+                    "name": "prefill", "graph": 17, "instantiate_flags": flags,
+                });
+                if explicit_zero {
+                    declaration["executable"] = 0.into();
+                }
+                let template: GraphHandle = serde_json::from_value(declaration)?;
+                template.validate()?;
+                assert_eq!(template.executable, 0);
+                assert_eq!(template.instantiate_flags, Some(flags));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn graph_handle_rejections_precede_cuda_access() -> ExportResult<()> {
+        let directory = tempfile::tempdir()?;
+        for declaration in [
+            serde_json::json!({"name": "decode", "graph": 17}),
+            serde_json::json!({"name": "decode", "graph": 17, "executable": 0}),
+            serde_json::json!({"name": "decode", "graph": 17, "instantiate_flags": null}),
+            serde_json::json!({"name": "decode", "graph": 17, "executable": 23, "instantiate_flags": 0}),
+            serde_json::json!({"name": "decode", "graph": 17, "executable": 23, "instantiate_flags": 1}),
+        ] {
+            let request: CaptureRequest = serde_json::from_value(serde_json::json!({
+                "path": directory.path().join("package"), "context": 0,
+                "graphs": [declaration], "allocations": [],
+            }))?;
+            let error = capture_rank(&request, None).err().expect("invalid graph request accepted");
+            assert!(error.to_string().contains("exactly one"), "{error}");
+            assert!(!request.path.exists());
+        }
+        for declaration in [
+            serde_json::json!({"name": "", "graph": 17, "instantiate_flags": 1}),
+            serde_json::json!({"name": "decode", "graph": 0, "instantiate_flags": 1}),
+        ] {
+            let graph: GraphHandle = serde_json::from_value(declaration)?;
+            assert!(graph.validate().unwrap_err().to_string().contains("live graph template"));
+        }
+        for flags in [serde_json::json!(-1), serde_json::json!("1")] {
+            assert!(serde_json::from_value::<GraphHandle>(serde_json::json!({
+                "name": "decode", "graph": 17, "instantiate_flags": flags,
+            })).is_err());
+        }
+        Ok(())
+    }
+
+    fn graph_release_notification(cuda: &Cuda, graph: Handle) -> ExportResult<Arc<std::sync::atomic::AtomicBool>> {
+        use std::sync::atomic::AtomicBool;
+        unsafe extern "C" fn released(pointer: Handle) {
+            let completed = unsafe { Arc::from_raw(pointer.cast::<AtomicBool>()) };
+            completed.store(true, Ordering::Release);
+        }
+        let completed = Arc::new(AtomicBool::new(false));
+        let pointer = Arc::into_raw(completed.clone()) as Handle;
+        let mut object = std::ptr::null_mut();
+        let created = cu!(cuda, "cuUserObjectCreate",
+            (*mut Handle, Handle, unsafe extern "C" fn(Handle), u32, u32),
+            &mut object, pointer, released, 1, 1);
+        if let Err(error) = created {
+            drop(unsafe { Arc::from_raw(pointer.cast::<AtomicBool>()) });
+            return Err(error);
+        }
+        let retained = cu!(cuda, "cuGraphRetainUserObject", (Handle, Handle, u32, u32), graph, object, 1, 0);
+        let released = cu!(cuda, "cuUserObjectRelease", (Handle, u32), object, 1);
+        retained?;
+        released?;
+        Ok(completed)
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn raw_graph_flags_validate_without_launch_and_release_executables() -> ExportResult<()> {
+        let cuda = Cuda::new()?;
+        cu!(&cuda, "cuInit", (u32), 0)?;
+        let previous = cuda.current()?;
+        let mut context = std::ptr::null_mut();
+        cu!(&cuda, "cuCtxCreate_v2", (*mut Handle, u32, c_int), &mut context, 0, 0)?;
+        let mut address = 0u64;
+        let mut graphs = Vec::new();
+        let result = (|| -> ExportResult<()> {
+            cu!(&cuda, "cuMemAlloc_v2", (*mut u64, usize), &mut address, 4)?;
+            for flags in [0, 1] {
+                for fail_after_instantiation in [false, true] {
+                    let mut graph = std::ptr::null_mut();
+                    cu!(&cuda, "cuGraphCreate", (*mut Handle, u32), &mut graph, 0)?;
+                    graphs.push(graph);
+                    let completed = graph_release_notification(&cuda, graph)?;
+                    let mut node = std::ptr::null_mut();
+                    let params = MemsetParams {
+                        destination: address, pitch: 4, value: 0xA5,
+                        element_size: 1, width: 4, height: 1,
+                    };
+                    cu!(&cuda, "cuGraphAddMemsetNode",
+                        (*mut Handle, Handle, *const Handle, usize, *const MemsetParams, Handle),
+                        &mut node, graph, std::ptr::null(), 0, &params, context)?;
+                    cu!(&cuda, "cuMemsetD8_v2", (u64, u8, usize), address, 0x37, 4)?;
+                    if fail_after_instantiation {
+                        let failed = (|| -> ExportResult<()> {
+                            let _executable = TemporaryGraphExecutable::new(&cuda, graph as usize, flags)?;
+                            Err(invalid("failure after graph instantiation"))
+                        })();
+                        assert!(failed.unwrap_err().to_string().contains("failure after graph instantiation"));
+                    } else {
+                        let mut declaration = GraphHandle {
+                            name: "memset".into(), graph: graph as usize,
+                            executable: 0, instantiate_flags: Some(flags),
+                        };
+                        for _ in 0..4 {
+                            assert_eq!(graph_flags(&cuda, &declaration)?, flags);
+                        }
+                        declaration.instantiate_flags = Some(u64::MAX);
+                        let error = graph_flags(&cuda, &declaration).unwrap_err();
+                        assert!(error.to_string().contains("cuGraphInstantiateWithFlags"), "{error}");
+                        let executable = TemporaryGraphExecutable::new(&cuda, graph as usize, flags)?;
+                        declaration.executable = executable.handle as usize;
+                        declaration.instantiate_flags = None;
+                        assert_eq!(graph_flags(&cuda, &declaration)?, flags);
+                        assert_eq!(graph_flags(&cuda, &declaration)?, flags);
+                        executable.close()?;
+                    }
+                    let mut bytes = [0u8; 4];
+                    cu!(&cuda, "cuMemcpyDtoH_v2", (*mut u8, u64, usize), bytes.as_mut_ptr(), address, 4)?;
+                    assert_eq!(bytes, [0x37; 4], "graph validation must not launch the memset node");
+                    cu!(&cuda, "cuGraphDestroy", (Handle), graph)?;
+                    graphs.pop();
+                    // User-object references survive in every instantiated executable.
+                    // Its callback therefore proves that none escaped validation.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !completed.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    assert!(completed.load(Ordering::Acquire), "temporary graph executable retained its user object");
+                }
+            }
+            Ok(())
+        })();
+        for graph in graphs {
+            cu!(&cuda, "cuGraphDestroy", (Handle), graph)?;
+        }
+        if address != 0 {
+            cu!(&cuda, "cuMemFree_v2", (u64), address)?;
+        }
+        cu!(&cuda, "cuCtxDestroy_v2", (Handle), context)?;
+        cu!(&cuda, "cuCtxSetCurrent", (Handle), previous as Handle)?;
+        result
+    }
+
     fn allocation(name: &str, address: u64, nbytes: u64) -> Allocation {
         Allocation {
             name: name.into(),

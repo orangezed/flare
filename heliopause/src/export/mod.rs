@@ -107,7 +107,25 @@ pub(crate) struct Kernel {
 pub(crate) struct GraphHandle {
     pub name: String,
     pub graph: usize,
+    #[serde(default)]
     pub executable: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instantiate_flags: Option<u64>,
+}
+
+impl GraphHandle {
+    fn validate(&self) -> ExportResult<()> {
+        if self.name.is_empty() || self.graph == 0 {
+            return Err(invalid("graph export requires a name and a live graph template"));
+        }
+        if (self.executable != 0) == self.instantiate_flags.is_some() {
+            return Err(invalid(format!(
+                "graph {} requires exactly one of a live executable or explicit instantiate_flags",
+                self.name
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
