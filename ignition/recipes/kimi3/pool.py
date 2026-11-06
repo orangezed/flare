@@ -12,6 +12,7 @@ from ignition.components.state import StateLayout
 
 from .config import PAGE_TOKENS, LatentDSparkConfig
 from .dcp import RECORD_BYTES
+from ignition.recipes.kimi31.dflash_config import DFlash2Config
 
 
 def page_specs(config):
@@ -43,7 +44,10 @@ def continuation_layout(config, world_size, *, speculative_tokens=0):
             regions.extend(((f"layer{index}.convolution", (3 * heads * 128, 3 + speculative_tokens), torch.bfloat16),
                             (f"layer{index}.recurrent", (heads, 128, 128), torch.float32)))
     regions.extend((name, shape, torch.uint8) for name, shape in page_specs(config))
-    if speculative_tokens and config.draft is not None and not isinstance(config.draft, LatentDSparkConfig):
+    if speculative_tokens and isinstance(config.draft, DFlash2Config):
+        for layer in range(config.draft.layers):
+            regions.append((f"draft{layer}.latent", (config.draft.window, RECORD_BYTES), torch.float8_e4m3fn))
+    elif speculative_tokens and config.draft is not None and not isinstance(config.draft, LatentDSparkConfig):
         d = config.draft
         for layer in range(d.layers):
             for kind in ("key", "value"):
@@ -71,12 +75,15 @@ class ContinuationPool(PagedStateStorage):
     def draft_attention(self, layer):
         return self.pages[f"draft{layer}.latent"].view(torch.float8_e4m3fn).view(-1, PAGE_TOKENS, RECORD_BYTES)
 
-    def share_pages(self, storage, group):
-        """Every rank's address of each MLA layer's page pool, {layer: [world] int64}, mapped through CUDA IPC.
+    def share_pages(self, storage, group, *, suffix=".latent"):
+        """Map each rank's target-layer latent or index page pools through CUDA IPC.
 
-        Context-parallel prefill reads earlier positions from the ranks that own them.
+        The result is {layer: [world] int64}. Prefill reads committed history from
+        its owning rank without changing either packed representation.
         """
-        names = [name for name in self.pages if name.startswith("layer") and name.endswith(".latent")]
+        if suffix not in (".latent", ".index"):
+            raise ValueError("Kimi peer pages must be latent records or index records")
+        names = [name for name in self.pages if name.startswith("layer") and name.endswith(suffix)]
         regions = {region.address: region for region in storage.dynamic_regions}
         addresses = storage.peer_storage.share_regions(group, [regions[self.pages[name].data_ptr()] for name in names])
         return {int(name.split(".")[0].removeprefix("layer")): torch.tensor(pointers, dtype=torch.int64,

@@ -246,6 +246,42 @@ class PreparedChunkedAllReduce:
         return self.output
 
 
+class PreparedPromotedAllReduce:
+    """Reduce BF16 activations through caller-owned FP32 transport and accumulation buffers.
+
+    Promotion is exact; only the final result is rounded to BF16. Serial reductions
+    may reuse the two buffers, but neither may alias a live input or output.
+    """
+
+    def __init__(self, source, output, *, accumulation_buffers, runtime, session, coordinator, name):
+        if (source.dtype != torch.bfloat16 or output.dtype != source.dtype or source.shape != output.shape
+                or output.device != source.device or source.numel() == 0
+                or not source.is_contiguous() or not output.is_contiguous()):
+            raise ValueError("promoted reduction requires matching contiguous BF16 activations")
+        if len(accumulation_buffers) != 2:
+            raise ValueError("promoted reduction requires separate input and output workspaces")
+        views = []
+        for buffer in accumulation_buffers:
+            if (buffer.dtype != torch.float32 or buffer.device != source.device
+                    or not buffer.is_contiguous() or buffer.numel() < source.numel()):
+                raise ValueError("promoted reduction workspace must be contiguous FP32 with sufficient capacity")
+            views.append(buffer.view(-1)[:source.numel()].view(source.shape))
+        self.promoted, self.reduced = views
+        ranges = [(t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in (source, output, *views)]
+        for index in (2, 3):
+            if any(ranges[index][0] < end and begin < ranges[index][1] for begin, end in ranges[:index]):
+                raise ValueError("promoted reduction workspace must not overlap live activations or its peer workspace")
+        self.output = output
+        self.reduce = PreparedChunkedAllReduce(self.promoted, self.reduced, runtime=runtime,
+            session=session, coordinator=coordinator, name=name)
+
+    def __call__(self, source):
+        self.promoted.copy_(source)
+        self.reduce(self.promoted)
+        self.output.copy_(self.reduced)
+        return self.output
+
+
 @dataclass(frozen=True)
 class WeightedGroupSource:
     """Ordered weighted groups with physical [rows, groups, hidden] storage.

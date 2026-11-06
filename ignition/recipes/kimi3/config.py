@@ -37,6 +37,9 @@ class DSparkConfig:
 
     @classmethod
     def from_dict(cls, raw, target):
+        if raw.get("architectures") == ["DFlash2DraftModel"]:
+            from ignition.recipes.kimi31.dflash_config import DFlash2Config
+            return DFlash2Config.from_dict(raw, target)
         if raw.get("model_type") == "k3_dspark":
             return LatentDSparkConfig.from_dict(raw, target)
         layer = raw.get("transformer_layer_config", {})

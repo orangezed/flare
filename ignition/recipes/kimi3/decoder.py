@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import torch
 import triton
 
-from ignition.components.collectives import PreparedChunkedAllGather, PreparedChunkedAllReduce
+from ignition.components.collectives import PreparedChunkedAllGather, PreparedChunkedAllReduce, PreparedPromotedAllReduce
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch
@@ -160,7 +160,7 @@ class PreparedMLP:
 
 class PreparedLatentMoE:
     def __init__(self, weights, source, config, shard, *, runtime, router_runtime, coordinator, session, name, workspace, buffers, storage,
-                 route_runtime=None, allocator=None):
+                 route_runtime=None, allocator=None, accumulation_buffers=None):
         tokens, hidden = source.shape
         c, device = config.text, source.device
         latent = c["routed_expert_hidden_size"]
@@ -186,8 +186,10 @@ class PreparedLatentMoE:
                                       session=session, name=name + ".latent_up", workspace=workspace)
         # Each rank normalizes the full latent row and keeps the columns its up-projection shard reads.
         self.latent_norm, self.eps = weights["latent_norm"], c["rms_norm_eps"]
-        self.expert_reduce = PreparedChunkedAllReduce(self.expert_output, self.latent_sum, runtime=runtime,
-                                                     coordinator=coordinator, session=session, name=name + ".expert_reduce")
+        reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedPromotedAllReduce
+        reduction_args = {} if accumulation_buffers is None else dict(accumulation_buffers=accumulation_buffers)
+        self.expert_reduce = reduction(self.expert_output, self.latent_sum, runtime=runtime,
+            coordinator=coordinator, session=session, name=name + ".expert_reduce", **reduction_args)
         local_logits = buffer("local_router", weights["router"].shape[0], torch.float32)
         self.router_projection = UnquantizedProjection(source, weights["router"], local_logits, session=session, name=name + ".router")
         if "routes" not in buffers:
@@ -205,8 +207,8 @@ class PreparedLatentMoE:
         else:
             self.down = prepare_projection(self.source, weights["latent_down"], buffer("down", latent),
                                             session=session, name=name + ".latent_down", workspace=workspace)
-            self.down_reduce = PreparedChunkedAllReduce(self.down.output, self.latent, runtime=runtime,
-                                                       coordinator=coordinator, session=session, name=name + ".down_reduce")
+            self.down_reduce = reduction(self.down.output, self.latent, runtime=runtime,
+                coordinator=coordinator, session=session, name=name + ".down_reduce", **reduction_args)
             logits = buffer("router", c["num_experts"], torch.float32)
             self.router_logits = logits
             local_experts = local_logits.shape[1]
@@ -268,6 +270,19 @@ class PreparedDecoder:
         self.vision_state = vision_state if mode == "prefill" else None
         config, source = weights.config, scratch.activations
         allocator = buffers.allocator
+        accumulation_buffers = None
+        from b12x.comm.pcie import DmaAllReduce
+
+        if isinstance(runtime, DmaAllReduce):
+            if mode != "prefill":
+                raise ValueError("Kimi copy-engine reductions are prepared only for prefill")
+            views = []
+            for key in ("prefill_reduction_input", "prefill_reduction_output"):
+                if key not in buffers.scratch or buffers.scratch[key].numel() < source.numel():
+                    buffers.scratch[key] = (torch.zeros(source.shape, dtype=torch.float32, device=source.device)
+                        if allocator is None else allocator.zeros(source.shape, torch.float32))
+                views.append(buffers.scratch[key])
+            accumulation_buffers = tuple(views)
         self.local_embedding = torch.zeros((source.shape[0], weights.embedding.shape[1]), dtype=source.dtype, device=source.device)
         self.embedding = PreparedShardedEmbedding(weights.embedding, metadata.token_ids, self.local_embedding, source,
             runtime=embedding_runtime, coordinator=coordinator,
@@ -296,7 +311,9 @@ class PreparedDecoder:
                 PreparedMLA(w["attention"], source, metadata, pool.attention(index), context=context,
                             index_cache=pool.index(index) if kind == "dsa" else None,
                             eps=config.text["rms_norm_eps"],
-                            peers=context.peers[index] if context is not None and kind == "mla" else None,
+                            peers=context.peers.get(index) if context is not None else None,
+                            index_peers=(context.index_peers.get(index)
+                                         if context is not None and context.index_peers is not None else None),
                             coordinator=coordinator,
                             # The smallest latent exchange that carries the step, else the largest in chunks.
                             latents=next((r for r in latent_runtimes if source.shape[0] <= r.max_batch_size),
@@ -317,13 +334,16 @@ class PreparedDecoder:
                 mlp = PreparedLatentMoE(w, source, config, weights.shard, runtime=runtime,
                     router_runtime=router_runtime, route_runtime=route_runtime if mode != "prefill" else None,
                     coordinator=coordinator, session=session, name=prefix + ".moe", workspace=workspace,
-                    buffers=self.buffers.setdefault("moe", {}), storage=buffers, allocator=allocator)
+                    buffers=self.buffers.setdefault("moe", {}), storage=buffers, allocator=allocator,
+                    accumulation_buffers=accumulation_buffers)
             # The sum buffer is consumed before the next attention or MLP reduction.
             if "total" not in self.buffers:
                 self.buffers["total"] = zeros(source.shape)
             total = self.buffers["total"][:source.shape[0]]
-            reduce = PreparedChunkedAllReduce(source, total, runtime=runtime, coordinator=coordinator,
-                                              session=session, name=prefix + ".reduce")
+            reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedPromotedAllReduce
+            reduction_args = {} if accumulation_buffers is None else dict(accumulation_buffers=accumulation_buffers)
+            reduce = reduction(source, total, runtime=runtime, coordinator=coordinator,
+                               session=session, name=prefix + ".reduce", **reduction_args)
             self.layers.append((w, attention, mlp, reduce))
         # The running block sum and committed blocks persist through one forward; every forward
         # rewrites them from its embeddings before reading them.

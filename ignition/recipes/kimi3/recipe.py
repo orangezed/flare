@@ -21,7 +21,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
 
 
 def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revision, compile_forwards,
-                    kernel_cache, progress, retain_graphs=False, package_storage=None, ranks=None):
+                    kernel_cache, progress, retain_graphs=False, package_storage=None, ranks=None,
+                    draft_directory=None):
     from ignition.preparation.rank_group import prepare_group
     from .config import DRAFT_DIRECTORY
 
@@ -33,9 +34,11 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
     if plan.speculation is not None:
         drafting = dict(speculative_widths=plan.speculation.widths, speculative_fixed_width=plan.speculation.fixed_width,
                         speculative_token_capacity=plan.speculative_token_capacity,
-                        speculative_graph_budget=plan.speculation.graph_budget or 64)
-        if (Path(snapshot) / DRAFT_DIRECTORY).is_dir():
-            drafting["draft_checkpoint"] = str(Path(snapshot) / DRAFT_DIRECTORY)
+                        speculative_graph_budget=plan.speculation.graph_budget or 64,
+                        draft_head_quantization=plan.speculation.draft_head_quantization)
+        directory = draft_directory or DRAFT_DIRECTORY
+        if (Path(snapshot) / directory).is_dir():
+            drafting["draft_checkpoint"] = str(Path(snapshot) / directory)
         else:
             from huggingface_hub import snapshot_download
 

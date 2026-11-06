@@ -12,7 +12,7 @@ from ignition.components.distributed_topk import PreparedDistributedTopK, select
 from ignition.components.fp8_indexer import PreparedFP8Indexer
 
 from .config import PAGE_TOKENS
-from .dcp import ContextShards, RECORD_BYTES
+from .dcp import ContextShards, RECORD_BYTES, pull_context
 from .projections import prepare_projection
 
 # Slice selection and its cross-rank candidate exchange so prefill scratch is context-independent.
@@ -23,7 +23,22 @@ INDEX_HEADS, INDEX_DIM, TOPK = 32, 128, 2048
 class PreparedDSA:
     def __init__(self, weights, query_residual, key_input, weight_input, query, output, slots,
                  metadata, cache, index_cache, *, context, session, coordinator, name, workspace,
-                 buffers, allocator=None, eps=1e-5):
+                 buffers, allocator=None, eps=1e-5, mode="decode", latent=None, peers=None, index_peers=None):
+        self.prefill = None
+        if mode == "prefill" and context is not None and context.prefill_layout == "query_split":
+            from .dsa_prefill import PreparedGatheredDSA
+
+            self.prefill = PreparedGatheredDSA(weights, query_residual, key_input, weight_input,
+                query, output, slots, metadata, cache, index_cache, context=context, session=session,
+                coordinator=coordinator, name=name, workspace=workspace, buffers=buffers,
+                latent=latent, peers=peers, index_peers=index_peers, eps=eps)
+            return
+        self.gathered_context = mode == "prefill" and context is not None and context.prefill_layout == "ckv"
+        self.context, self.peers = context, peers
+        if self.gathered_context:
+            if metadata.starts.numel() != 1 or peers is None or context.slab is None:
+                raise ValueError("gathered DSA prefill requires one request and a shared context slab")
+            self.window = torch.zeros(2, dtype=torch.int64, device=query.device)
         self.metadata, self.query, self.output, self.slots = metadata, query, output, slots
         self.query_residual = query_residual
         self.eps = eps
@@ -65,7 +80,7 @@ class PreparedDSA:
             # hundreds of MiB for query scales and other small intermediates.
             buffers["index_workspace"] = GraphBufferPool(device, chunk_bytes=2 << 20)
         pool = buffers["index_workspace"]
-        cache_records = cache.view(-1, 1, RECORD_BYTES)
+        cache_records = (context.slab if self.gathered_context else cache).view(-1, 1, RECORD_BYTES)
         selection_views = {}
         for begin in range(0, rows, capacity):
             end = min(begin + capacity, rows)
@@ -89,7 +104,10 @@ class PreparedDSA:
                     session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor)
             gather = combine = None
             q, attended = query[begin:end], output[begin:end]
-            if context is not None:
+            if self.gathered_context:
+                quantized = cursor.zeros(q.shape, torch.float8_e4m3fn)
+                q, lse = quantized, None
+            elif context is not None:
                 quantized = cursor.zeros(q.shape, torch.float8_e4m3fn)
                 q = cursor.zeros((count, heads * self.shards.world, RECORD_BYTES), torch.float8_e4m3fn)
                 attended = cursor.zeros((count, heads * self.shards.world, 512), torch.bfloat16)
@@ -102,7 +120,7 @@ class PreparedDSA:
                 quantized = lse = None
             caps = dense_mla.Caps(device=device, mode="decode", q_dtype=q.dtype, kv_dtype=cache.dtype,
                 num_q_heads=q.shape[1], max_total_q=count, max_batch=count, page_size=1,
-                max_cache_tokens=TOPK, max_page_table_width=TOPK, num_cache_pages=cache.shape[0] * PAGE_TOKENS,
+                max_cache_tokens=TOPK, max_page_table_width=TOPK, num_cache_pages=cache_records.shape[0],
                 use_cuda_graph=True, partial_dtype=torch.float32)
             attention = PreparedDenseMLA(q, cache_records, attended,
                 physical, counts, offsets, caps=caps,
@@ -110,6 +128,8 @@ class PreparedDSA:
             self.stages.append((begin, end, selector, merge, quantized, gather, attention, combine, lse))
 
     def __call__(self):
+        if self.prefill is not None:
+            return self.prefill()
         m, shards = self.metadata, self.shards
         self.project(self.query_residual)
         self.key.copy_(torch.nn.functional.layer_norm(self.key_input.float(), (INDEX_DIM,),
@@ -124,12 +144,25 @@ class PreparedDSA:
             self.active.copy_(self.lengths[:count].max().reshape(1))
             selector()
             selected = self.local[:count] if merge is None else merge()
-            physical, lengths = selected_local_records(selected, positions, pages, world=shards.world,
-                rank=shards.owner, page_size=PAGE_TOKENS)
+            if self.gathered_context:
+                # The candidate exchange orders all ranks' cache writes before peer reads.
+                if begin == 0:
+                    self.window[0:1].zero_()
+                    self.window[1:].copy_((m.positions.max() + 1).clamp_min(0).reshape(1))
+                    pull_context(self.peers, m.page_table[0], self.window,
+                                 self.context.slab.view(torch.int32), shards)
+                live = (selected >= 0) & (selected <= positions[:, None])
+                physical = torch.sort(torch.where(live, selected, torch.iinfo(torch.int32).max), dim=1).values
+                lengths = live.sum(1).to(torch.int32)
+                physical = torch.where(physical != torch.iinfo(torch.int32).max, physical, -1)
+            else:
+                physical, lengths = selected_local_records(selected, positions, pages, world=shards.world,
+                    rank=shards.owner, page_size=PAGE_TOKENS)
             self.physical[:count].copy_(physical)
             self.counts[:count].copy_(lengths)
-            if gather is not None:
+            if quantized is not None:
                 quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
+            if gather is not None:
                 gather(quantized.view(count, -1))
             attention()
             if combine is not None:

@@ -124,6 +124,36 @@ def pull_context(addresses, table, window, slab, shards):
             num_warps=4)
 
 
+@triton.jit
+def _pull_index_context(Addresses, Table, End, Destination, columns,
+                        WORLD: tl.constexpr, PAGE: tl.constexpr, ROWS: tl.constexpr):
+    # Preserve the original FP8 bytes and FP32 scales in planar 64-record pages.
+    tokens = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    words = tl.arange(0, 32)
+    end = tl.load(End).to(tl.int64)
+    local = tokens // WORLD
+    live = tokens < end
+    block = local // PAGE
+    page = tl.load(Table + tl.minimum(block, columns - 1), mask=live, other=-1).to(tl.int64)
+    live &= (block < columns) & (page >= 0)
+    source = tl.load(Addresses + tokens % WORLD).to(tl.pointer_type(tl.int32))
+    index_page = page * 2 + local % PAGE // 64
+    src = index_page * (64 * 33) + local % 64 * 32
+    dst = tokens // 64 * (64 * 33) + tokens % 64 * 32
+    keys = tl.load(source[:, None] + src[:, None] + words[None, :], mask=live[:, None], other=0)
+    tl.store(Destination + dst[:, None] + words[None, :], keys, mask=live[:, None])
+    scale = tl.load(source + index_page * (64 * 33) + 64 * 32 + local % 64, mask=live, other=0)
+    tl.store(Destination + tokens // 64 * (64 * 33) + 64 * 32 + tokens % 64, scale, mask=live)
+
+
+def pull_index_context(addresses, table, end, destination, shards):
+    """Copy committed index history into a contiguous, byte-identical planar index cache."""
+    records = destination.shape[0] * 64
+    _launch(_pull_index_context, (triton.cdiv(records, 8),),
+            (addresses, table, end, destination.view(torch.int32), table.numel()),
+            WORLD=shards.world, PAGE=PAGE_TOKENS, ROWS=8, num_warps=4)
+
+
 def write_records(latent, indices, table):
     """Write each token's BF16 record [tokens, 576], saturated to E4M3 as vLLM's FP8 cache stores it, at its
     slot of `table`: a row of [rows, 576], or page * records + record of [pages, records, 576] with any page
@@ -139,9 +169,10 @@ def write_records(latent, indices, table):
 class ContextParallel:
     """Shared context placement and head/LSE exchanges for latent attention.
 
-    Dense prefill uses peer page addresses ({layer: [world] int64}) and an E4M3
-    context slab [window + chunk, 576]. Sparse attention exchanges selection
-    candidates and reads local records; its peer-address map is empty and it has no slab.
+    Peer page addresses are {layer: [world] int64}. Dense prefill uses a bounded
+    E4M3 context slab [window + chunk, 576]. Gathered sparse prefill instead uses
+    full-context latent/index slabs and exchanges final selected positions;
+    decode and verification retain context-sharded candidates and head/LSE exchange.
     """
 
     shards: ContextShards
@@ -151,3 +182,7 @@ class ContextParallel:
     slab: torch.Tensor
     window: int = CONTEXT_WINDOW
     candidates: object = None
+    prefill_layout: str = "dcp"
+    index_peers: dict | None = None
+    index_slab: torch.Tensor | None = None
+    selections: object = None

@@ -107,7 +107,8 @@ def create_result_broadcast_runtime(group, device, *, layouts, ipc=None):
         columns=256 * dist.get_world_size(group), ipc=ipc)
 
 
-def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2):
+def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2,
+                                 wire_mode=None):
     """Allocate a b12x copy-engine ring for prefill reductions in caller-owned shared storage."""
     from b12x.comm.pcie import DmaAllReduce
 
@@ -115,7 +116,8 @@ def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc
         raise ValueError("all-reduce capacities must be positive integers")
     if element_bytes not in (2, 4):
         raise ValueError("all-reduce storage must use two- or four-byte elements")
-    return DmaAllReduce(exchange_group=group, device=device, max_bytes=max_tokens * hidden_size * element_bytes, ipc=ipc)
+    return DmaAllReduce(exchange_group=group, device=device, max_bytes=max_tokens * hidden_size * element_bytes,
+                        ipc=ipc, fp8=wire_mode)
 
 
 def create_head_exchange(group, device, *, max_rows, heads, head_dim, query_head_dim=None, ipc=None):

@@ -29,7 +29,7 @@ FP8 = torch.float8_e4m3fn
 
 class PreparedMLA:
     def __init__(self, weights, source, metadata, cache, *, mode, session, name, workspace, buffers, latents=None,
-                 coordinator=None, context=None, peers=None, allocator=None, index_cache=None,
+                 coordinator=None, context=None, peers=None, allocator=None, index_cache=None, index_peers=None,
                  eps=1e-6, rotary=None, gated=True, partial_budget_bytes=None):
         tokens, hidden = source.shape
         heads = weights["key"].shape[0]
@@ -101,7 +101,8 @@ class PreparedMLA:
             self.sparse = PreparedDSA(weights, self.query_norm, self.local[:, index_begin:index_begin + 128],
                 self.local[:, index_begin + 128:index_begin + 160], self.absorbed, self.attended, self.slots,
                 metadata, cache, index_cache, context=context, session=session, coordinator=coordinator,
-                name=name, workspace=workspace, buffers=buffers.setdefault("selection", {}), allocator=allocator, eps=eps)
+                name=name, workspace=workspace, buffers=buffers.setdefault("selection", {}), allocator=allocator, eps=eps,
+                mode=mode, latent=self.latent, peers=peers, index_peers=index_peers)
         elif world == 1:
             # Every rank holds every record: attend with this rank's heads; b12x quantizes the BF16 query.
             self.lengths = torch.zeros_like(metadata.lengths)
