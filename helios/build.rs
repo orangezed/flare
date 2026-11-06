@@ -14,6 +14,7 @@ fn main() {
         // contracts, graph selection, frontend settings, and engine placement.
         let mut runtime = prost_build::Config::new();
         runtime
+            .field_attribute(".flare.runtime.RebuildManifest.compile_kinds", "#[serde(default)]")
             .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
             .file_descriptor_set_path(out.join("runtime_package_descriptor.bin"))
             .field_attribute(".flare.runtime.RebuildSpeculation.vocabulary_parallel_sampling", "#[serde(default)]")

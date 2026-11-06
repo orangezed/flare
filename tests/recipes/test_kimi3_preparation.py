@@ -43,3 +43,33 @@ def test_vision_keeps_its_default_and_explicit_capacity(config_type, active, cap
 def test_vision_rejects_capacity_outside_active_requests(config_type, capacity):
     with pytest.raises(ValueError, match="image concurrency"):
         config_type(max_active=4, image_concurrency=capacity)
+
+
+@pytest.mark.parametrize("kind", ["vision", "scored_prefill", "speculative"])
+def test_explicit_compilation_requires_a_represented_signature(config_type, kind):
+    from ignition.preparation.execution import GraphSignature
+
+    signatures = {"decode1": GraphSignature("decode", 1, 1),
+                  "resume1": GraphSignature("resume", 1, 1),
+                  "prefill4096": GraphSignature("prefill", 1, 4096)}
+    config = config_type(compile_kinds=(kind,))
+    with pytest.raises(ValueError, match=f"no prepared forwards: {kind}"):
+        config.compiled_kinds(signatures)
+    signatures[kind] = GraphSignature(kind, 1, 64, ("prompt_target_tokens",)) if kind == "scored_prefill" else GraphSignature(kind, 1, 1)
+    assert config.compiled_kinds(signatures) == (kind,)
+
+
+def test_default_compilation_and_decode_selection_keep_catalog_unchanged(config_type):
+    from ignition.preparation.execution import GraphSignature
+
+    signatures = {"decode1": GraphSignature("decode", 1, 1), "resume1": GraphSignature("resume", 1, 1)}
+    before = dict(signatures)
+    assert config_type().compiled_kinds(signatures) == (
+        "prefill", "scored_prefill", "decode", "resume", "vision", "speculative")
+    assert config_type(compile_kinds=("decode", "resume")).compiled_kinds(signatures) == ("decode", "resume")
+    assert signatures == before
+
+
+def test_compilation_override_requires_enabled_compilation(config_type):
+    with pytest.raises(ValueError, match="enabled compilation"):
+        config_type(compile_decoder=False, compile_kinds=("decode",))

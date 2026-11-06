@@ -147,7 +147,7 @@ def run(args):
     plan = derive(configuration, model, Host.discover(), gpus=args.gpus, concurrency=concurrency,
         speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
         context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
-        compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus,
+        compile_kinds=args.compile_kinds, compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus,
         autotune_effort=args.autotune_effort, collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
         lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
         force_moe_decode_a16=args.force_moe_decode_a16,
@@ -222,9 +222,9 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
         "requested_max_concurrency": plan.concurrency, "prepared_request_capacity": max(settings.batches),
         "preparation": {key: preparation[key] for key in (
             "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel",
-            "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers",
+            "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers", "compile_kinds",
             "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
-            "online_mxfp8", "language_model_only")}}
+            "online_mxfp8", "language_model_only") if key in preparation}}
 
     if settings.speculation_study:
         details["configuration"]["speculation_study"] = dict(

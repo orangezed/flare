@@ -75,6 +75,7 @@ class PreparationConfig:
     snapshot_budget_bytes: int = 4 << 30
     headroom_bytes: int = 4 << 30
     compile_decoder: bool = True
+    compile_kinds: tuple[str, ...] | None = None
     retain_graphs: bool = False
     kernel_cache: Path | None = None
     # Red Hat DSpark checkpoint, either external or in the target's dspark directory.
@@ -94,6 +95,13 @@ class PreparationConfig:
     vision: bool = True
 
     def __post_init__(self):
+        if self.compile_kinds is not None:
+            allowed = {"prefill", "scored_prefill", "decode", "resume", "vision", "speculative"}
+            if (not self.compile_decoder or not isinstance(self.compile_kinds, tuple) or not self.compile_kinds
+                    or any(not isinstance(kind, str) for kind in self.compile_kinds)
+                    or len(set(self.compile_kinds)) != len(self.compile_kinds)
+                    or not set(self.compile_kinds) <= allowed):
+                raise ValueError("compile kinds require enabled compilation and distinct declared forward kinds")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("Kimi K3 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
@@ -121,6 +129,16 @@ class PreparationConfig:
             raise ValueError("Kimi K3 prefill chunk must be 128-aligned and fit the context")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
+
+    def compiled_kinds(self, signatures):
+        """Validate explicit compilation kinds against the complete serving catalog."""
+        if self.compile_kinds is None:
+            return ("prefill", "scored_prefill", "decode", "resume", "vision", "speculative")
+        represented = {signature.kind for signature in signatures.values()}
+        missing = tuple(kind for kind in self.compile_kinds if kind not in represented)
+        if missing:
+            raise ValueError("compile kinds have no prepared forwards: " + ", ".join(missing))
+        return self.compile_kinds
 
     @property
     def drafting(self):
@@ -413,6 +431,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()),
                         enabled=enabled)
+    compile_kinds = config.compiled_kinds(signatures)
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None, console=stage.console)
     stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
@@ -435,7 +454,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
             retain_graphs=config.retain_graphs, materialize=materialize,
             warmup_storage=package_storage,
-            compile_kinds=("prefill", "scored_prefill", "decode", "resume", "vision", "speculative"))
+            compile_kinds=compile_kinds)
     finally:
         scratch_pool.materialize()
     session.freeze()

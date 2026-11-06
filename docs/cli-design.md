@@ -1582,6 +1582,28 @@ See [multi-host serving](multi-host.md) and [RoCE ring transport](roce-ring.md).
 development `debug-serve`. It captures separate scored prefill graphs; default exports
 contain no prompt scoring storage or graphs. See [the logprob contract](logprobs-design.md#prompt-scoring).
 
+### Selecting complete-forward compilation
+
+Kimi K3 and K3.1 accept `--compile-kinds LIST` during preparation. Omit the
+flag to compile the recipe's complete selection. For a bounded decode
+compilation run, use `--compile-kinds decode,resume`; prefill, vision and
+speculative forwards still warm and capture at every prepared capacity.
+The comma-separated kinds must be distinct, declared by the recipe, and present
+in the prepared graph catalog. For example, `scored_prefill` requires
+`--prompt-logprobs`, and `vision` requires the vision encoder.
+`--compile-kinds` and `--no-compile` are mutually exclusive.
+
+```sh
+.venv/bin/ignition export kimi-k3.1-pro --gpus 0-15 \
+  --max-concurrency 4 --mtp-draft-tokens 7 --prefill-chunk-size 4096 \
+  --online-mxfp8 --compile-kinds decode,resume
+```
+
+The explicit selection is recorded in the preparation plan and package rebuild
+metadata. It does not change b12x operator tuning identities or the serving
+graph catalog. `--reuse-weights` can accompany it when a compatible cached
+package is available, with the usual weight-layout checks.
+
 ## 10. Non-goals
 
 Topology files, model families, launch override blocks, per-host environment

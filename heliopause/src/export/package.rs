@@ -3157,7 +3157,11 @@ mod payload_export_tests {
         let source = super::super::weight_reuse::open_source(root.path(), "model", &profiles)?;
         let mut metadata = serde_json::to_value(&source.source)?;
         metadata["rebuild_manifest"] = serde_json::json!({"version":1,"recipe":"fixture",
-            "checkpoint_repository":"fixture/model","checkpoint_revision":"revision-a","tensor_parallel":1});
+            "checkpoint_repository":"fixture/model","checkpoint_revision":"revision-a","tensor_parallel":1,
+            "compiled_forwards":true,"compile_kinds":["decode","resume"]});
+        let selected = rank.index.rebuild.as_mut().unwrap();
+        selected.compiled_forwards = true;
+        selected.compile_kinds = vec!["decode".into(), "resume".into()];
         // Live sources contain only fresh state; the weight bytes cannot be read here.
         fs::write(stages.join("storage-0.bin"), vec![0x77u8; 32])?;
         let bundle = &mut rank.index.ranks[0];

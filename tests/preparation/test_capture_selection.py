@@ -144,3 +144,63 @@ def test_width_one_speculation_can_be_selected_without_verification():
         ("speculative8x6", "speculative", 8, 6)]
     assert [name for name, *_ in _verification_variants(shapes, None)] == [
         "speculative8x6", "speculative8x1", "speculative1x1"]
+
+
+@pytest.mark.parametrize("kinds", [("decode", "resume"), ("decode",)])
+def test_compile_kind_filter_warms_and_captures_the_complete_catalog(monkeypatch, kinds):
+    calls, materializations = [], []
+    names = ("prefill4096", "vision1", "speculative1x8", "decode1", "resume1")
+    signatures = {name: SimpleNamespace(kind=kind) for name, kind in zip(
+        names, ("prefill", "vision", "speculative", "decode", "resume"), strict=True)}
+    stream = SimpleNamespace(wait_stream=lambda value: None, synchronize=lambda: None)
+
+    class Bound:
+        def __init__(self, name):
+            self.name = name
+        def prepare_capture(self):
+            return 0
+        def __call__(self):
+            calls.append(self.name)
+
+    functions = {name: Bound(name) for name in names}
+    class Cache:
+        def __init__(self, **kwargs):
+            assert kwargs["namespace"] == {"unchanged": "operator-plans"}
+        def prepare_many(self, forwards, sigs, **kwargs):
+            assert tuple(forwards) == tuple(name for name in names if signatures[name].kind in kinds)
+            kwargs["materialize"]()
+            return forwards
+
+    monkeypatch.setattr(capture, "ForwardCache", Cache)
+    monkeypatch.setattr(capture.torch.cuda, "_lazy_init", lambda: pytest.fail("CPU capture test must not initialize CUDA"))
+    monkeypatch.setattr(capture.torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(capture.torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(capture.torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(capture.torch.cuda, "CUDAGraph", lambda: "graph")
+    monkeypatch.setattr(capture.torch.cuda, "graph", lambda *args, **kwargs: nullcontext())
+    graphs, compiled = capture.capture_forwards(functions, signatures,
+        session=SimpleNamespace(namespace=SimpleNamespace(to_dict=lambda: {"unchanged": "operator-plans"}), capture=nullcontext),
+        device="cuda:0", stream=stream, pool=None, compile_kinds=kinds,
+        materialize=lambda: materializations.append(True))
+    assert tuple(graphs) == names
+    assert tuple(compiled) == tuple(name for name in names if signatures[name].kind in kinds)
+    assert calls == [name for name in names for _ in range(1 if signatures[name].kind in kinds else 2)]
+    assert materializations == [True]
+
+
+def test_empty_compile_subset_materializes_once_and_captures_without_compiler(monkeypatch):
+    calls = []
+    stream = SimpleNamespace(wait_stream=lambda value: None, synchronize=lambda: None)
+    monkeypatch.setattr(capture, "ForwardCache", lambda **kwargs: pytest.fail("empty compilation subset must not construct a compiler cache"))
+    monkeypatch.setattr(capture.torch.cuda, "_lazy_init", lambda: pytest.fail("CPU capture test must not initialize CUDA"))
+    monkeypatch.setattr(capture.torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(capture.torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(capture.torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(capture.torch.cuda, "CUDAGraph", lambda: "graph")
+    monkeypatch.setattr(capture.torch.cuda, "graph", lambda *args, **kwargs: nullcontext())
+    graphs, compiled = capture.capture_forwards({"vision": lambda: calls.append("vision")},
+        {"vision": SimpleNamespace(kind="vision")}, session=SimpleNamespace(capture=nullcontext),
+        device="cuda:0", stream=stream, pool=None, compile_kinds=("decode", "resume"),
+        materialize=lambda: calls.append("materialize"))
+    assert graphs == {"vision": "graph"} and compiled == {}
+    assert calls == ["materialize", "vision", "vision"]

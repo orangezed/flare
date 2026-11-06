@@ -49,6 +49,7 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency, prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
+        compile_kinds=plan.compile_kinds,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8,
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
         vision=not plan.language_model_only, **drafting)
@@ -82,6 +83,7 @@ RECIPE = Recipe(
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     verification_rows=0,
+    compile_kinds=("prefill", "scored_prefill", "decode", "resume", "vision", "speculative"),
     # KDA, MLA except batched key/value, shared experts, latent MoE projections, and the DSpark
     # draft's context projection, attention outputs and MLPs may load as MXFP8.
     online_mxfp8=True,

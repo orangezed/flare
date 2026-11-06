@@ -849,6 +849,22 @@ mod tests {
         assert_eq!(encoded.graphs[0].tuned_bindings[0].buffer, "winner");
     }
 
+    #[test]
+    fn rebuild_compilation_selection_round_trips_and_defaults_empty() {
+        let manifest: super::super::wire::RebuildManifest = super::message(
+            "RebuildManifest", &serde_json::json!({"version": 1, "compile_kinds": ["decode", "resume"]}),
+        ).unwrap();
+        assert_eq!(manifest.compile_kinds, ["decode", "resume"]);
+        let restored = <super::super::wire::RebuildManifest as prost::Message>::decode(
+            prost::Message::encode_to_vec(&manifest).as_slice(),
+        ).unwrap();
+        assert_eq!(restored.compile_kinds, ["decode", "resume"]);
+        let default: super::super::wire::RebuildManifest = super::message(
+            "RebuildManifest", &serde_json::json!({"version": 1}),
+        ).unwrap();
+        assert!(default.compile_kinds.is_empty());
+    }
+
     fn rebuild_catalog() -> (super::super::wire::RebuildWeights, Vec<super::super::wire::Allocation>) {
         use super::super::wire;
         (wire::RebuildWeights {

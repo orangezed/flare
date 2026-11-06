@@ -233,6 +233,8 @@ class Recipe:
     verification_rows: int | None = None
     stream_overlap: bool = False
     mixed_prefill: bool = False
+    # Complete-forward kinds whose compilation may be selected during preparation.
+    compile_kinds: tuple[str, ...] = ()
     online_mxfp8: bool = False
     language_model_only: bool = False
     b12x_environment: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))

@@ -41,18 +41,18 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     names = tuple(functions) if capture_names is None else tuple(capture_names)
     if len(set(names)) != len(names) or not set(names) <= functions.keys():
         raise ValueError("capture selection must name distinct prepared forwards")
-    if compile_group is not None and (not isinstance(compile_group, str) or not compile_group
+    forwards = ({name: function for name, function in functions.items()
+                 if name in names and signatures[name].kind in compile_kinds} if compile_decoder else {})
+    if compile_group is not None and (not forwards or not isinstance(compile_group, str) or not compile_group
                                       or compile_group in functions or not compile_decoder or not names):
         raise ValueError("grouped compilation requires a distinct name and selected compiled forwards")
     graphs, compiled = {}, {}
     warmup = nullcontext if warmup_storage is None else warmup_storage.transient
-    if compile_decoder:
+    if compile_decoder and forwards:
         cache = ForwardCache(namespace=session.namespace.to_dict(), device=device, root=cache_root,
                              headroom_bytes=getattr(session, "headroom_bytes", 0),
                              compile_workers=getattr(session, "requested_compile_workers", None),
                              lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune)
-        forwards = {name: function for name, function in functions.items()
-                    if name in names and signatures[name].kind in compile_kinds}
         if compile_group is not None:
             if len(forwards) != len(names):
                 raise ValueError("grouped compilation requires every selected forward to be compiled")

@@ -185,6 +185,7 @@ class Plan:
     roce_ring: bool = False
     roce_chain: bool = False
     compile_workers: int | None = None
+    compile_kinds: tuple[str, ...] | None = None
     autotune_effort: str = "default"
     collective_ladder: dict | None = None
     collective_tuning: str | None = None
@@ -204,6 +205,16 @@ class Plan:
     benchmark_selection: BenchmarkSelection | None = None
 
     def __post_init__(self):
+        if self.compile_kinds is not None:
+            if (not isinstance(self.compile_kinds, tuple) or not self.compile_kinds
+                    or any(not isinstance(kind, str) for kind in self.compile_kinds)
+                    or len(set(self.compile_kinds)) != len(self.compile_kinds)):
+                raise UsageError("--compile-kinds requires distinct nonempty graph kinds")
+            if not self.recipe.compile_kinds:
+                raise UsageError(f"--compile-kinds: {self.checkpoint.alias} does not declare selective compilation")
+            if not set(self.compile_kinds) <= set(self.recipe.compile_kinds):
+                raise UsageError(f"--compile-kinds for {self.checkpoint.alias} must select from "
+                                 + ", ".join(self.recipe.compile_kinds))
         if self.benchmark_selection is not None:
             selection = self.benchmark_selection
             if not isinstance(selection, BenchmarkSelection):
@@ -370,6 +381,7 @@ class Plan:
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
+            **({"compile_kinds": list(self.compile_kinds)} if self.compile_kinds is not None else {}),
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),

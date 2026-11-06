@@ -224,6 +224,8 @@ def from_plan(model, plan, *, compiled_forwards):
         online_mxfp8=plan.online_mxfp8, language_model_only=plan.language_model_only,
         compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes,
         collective_tuning=plan.collective_tuning)
+    if plan.compile_kinds is not None:
+        result["compile_kinds"] = list(plan.compile_kinds)
     if plan.collective_ladder is not None:
         import json
 

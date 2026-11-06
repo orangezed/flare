@@ -201,7 +201,7 @@ def _export_hosts(args):
                          online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
-    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
+    plan = replace(plan, compile_kinds=args.compile_kinds, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
@@ -270,7 +270,7 @@ def _prepare(args):
                                                     args.max_concurrency)
         host = Host.discover()
         plan = derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
-                      compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
+                      compile_kinds=args.compile_kinds, compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
                       collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
                       lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                       force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
@@ -304,6 +304,7 @@ def _prepare(args):
                      f"{' · online MXFP8' if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
+                     f"{' · compile kinds ' + ','.join(plan.compile_kinds) if plan.compile_kinds is not None else ''}"
                      f" · autotune effort {plan.autotune_effort} · collective tuning {plan.collective_tuning}{ladder_name}"
                      f"{' · native dense activations' if plan.native_dense_activations else ''}"
                      f"{' · MoE decode A16 / prefill A4' if plan.force_moe_decode_a16 else ''}"
@@ -463,7 +464,7 @@ def debug_serve(args) -> int:
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
-    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
+    plan = replace(plan, compile_kinds=args.compile_kinds, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),

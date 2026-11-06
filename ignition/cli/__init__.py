@@ -10,6 +10,14 @@ from pathlib import Path
 from ignition.errors import FlareError
 
 
+def _compile_kinds(text):
+    kinds = tuple(part.strip() for part in text.split(","))
+    allowed = {"prefill", "scored_prefill", "decode", "resume", "speculative", "mixed", "vision"}
+    if not kinds or any(kind not in allowed for kind in kinds) or len(set(kinds)) != len(kinds):
+        raise argparse.ArgumentTypeError("expected distinct comma-separated graph kinds: " + ", ".join(sorted(allowed)))
+    return kinds
+
+
 def _parser() -> argparse.ArgumentParser:
     from . import serve
     from . import publishing
@@ -234,8 +242,13 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                           help="run every concurrent branch (shared experts, projection chains, query chains)"
                                " serially on the main stream, to diagnose scheduling-dependent faults; slower"
                                " (default: overlap)")
-    advanced.add_argument("--no-compile", action="store_true",
-                          help="development: capture graphs without compiling forwards")
+    compilation = advanced.add_mutually_exclusive_group()
+    compilation.add_argument("--no-compile", action="store_true",
+                             help="development: capture graphs without compiling forwards")
+    compilation.add_argument("--compile-kinds", type=_compile_kinds, metavar="LIST",
+                             help="advanced: compile only the comma-separated complete-forward kinds;"
+                                  " Kimi K3/K3.1 only, e.g. decode,resume. All graphs still warm and capture"
+                                  " (default: the recipe's complete compilation selection)")
     advanced.add_argument("--online-mxfp8", action="store_true",
                           help="store the recipe's eligible BF16 projections as MXFP8 while loading"
                                " (Kimi K3/K3.1 KDA, MLA/DSA except batched key/value and index query, shared"
