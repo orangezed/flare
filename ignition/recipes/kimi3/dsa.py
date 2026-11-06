@@ -101,7 +101,8 @@ class PreparedDSA:
             if self.shards.world > 1:
                 merge = PreparedDistributedTopK(local, scores, selected,
                     world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
-                    session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor)
+                    session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor,
+                    workspace=workspace)
             gather = combine = None
             q, attended = query[begin:end], output[begin:end]
             if self.gathered_context:

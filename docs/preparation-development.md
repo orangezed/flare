@@ -42,6 +42,18 @@ before the session's capture guard forbids further kernel resolution.
 
 ## Complete-forward compilation and capture
 
+Prepared native operations retain their declared CPU enqueue order through
+Inductor scheduling. Ordering-only dependencies keep an auxiliary-stream fork
+ahead of independent main-stream work and its join after that work. Recorded
+CUDA stream dependencies determine GPU concurrency. Components must expose the
+asynchronous source, destination, and join dependencies as tensor operands so
+storage remains valid until device work completes.
+
+Complete copies into persistent storage execute before later opaque consumers
+of that storage. This preserves region-relative operand bindings and prevents
+functionalization from substituting different temporary buffers at a fork and
+its join.
+
 - **Compile complete prepared forwards.** Use
   [capture_forwards](../ignition/preparation/capture.py), which restores compiled
   forwards before tracing and compiles missing variants with static shapes and

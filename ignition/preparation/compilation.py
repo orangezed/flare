@@ -20,10 +20,13 @@ from torch._higher_order_ops.triton_kernel_wrap import get_mutated_tensors, kern
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
+from .enqueue_order import NativeEnqueueOrder, compilation_options_identity
+
 _INVOCATIONS = ContextVar('flare_storage_invocations')
 _OPTIONS = {'max_autotune': True, 'emulate_precision_casts': True,
             'triton.cudagraphs': False, 'triton.autotune_at_compile_time': False,
             'triton.cooperative_reductions': True,
+            '_pre_fusion_custom_pass': NativeEnqueueOrder(),
             'compile_threads': min(16, os.cpu_count() or 1)}
 if os.name == 'nt':
     _OPTIONS['worker_start_method'] = 'spawn'
@@ -293,7 +296,7 @@ def _compile_module(module, calls, owner, output_tree):
         node.args = torch.fx.node.map_aggregate(node.args, portable_device)
         node.kwargs = torch.fx.node.map_aggregate(node.kwargs, portable_device)
     cache_code = torch.fx.GraphModule({}, cache_graph).code
-    key = hashlib.sha256(pickle.dumps(('compiled-forward-portable-device-v1', cache_code, metadata, _OPTIONS, torch_key(),
+    key = hashlib.sha256(pickle.dumps(('compiled-forward-portable-device-v1', cache_code, metadata, compilation_options_identity(_OPTIONS), torch_key(),
         torch.cuda.get_device_capability(), torch.cuda.get_device_name()))).hexdigest()
     path = DEFAULT_CACHE_ROOT / 'compiled' / (key + '.bin')
     cache_hit = path.is_file()
