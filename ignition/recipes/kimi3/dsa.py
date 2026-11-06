@@ -23,7 +23,17 @@ INDEX_HEADS, INDEX_DIM, TOPK = 32, 128, 2048
 class PreparedDSA:
     def __init__(self, weights, query_residual, key_input, weight_input, query, output, slots,
                  metadata, cache, index_cache, *, context, session, coordinator, name, workspace,
-                 buffers, allocator=None, eps=1e-5, overlap_query=False):
+                 buffers, allocator=None, eps=1e-5, overlap_query=False,
+                 mode="decode", latent=None, peers=None, index_peers=None):
+        self.prefill = None
+        if mode == "prefill" and context is not None and context.prefill_layout == "query_split":
+            from .dsa_prefill import PreparedGatheredDSA
+
+            self.prefill = PreparedGatheredDSA(weights, query_residual, key_input, weight_input,
+                query, output, slots, metadata, cache, index_cache, context=context, session=session,
+                coordinator=coordinator, name=name, workspace=workspace, buffers=buffers,
+                latent=latent, peers=peers, index_peers=index_peers, eps=eps)
+            return
         self.metadata, self.query, self.output, self.slots = metadata, query, output, slots
         self.query_residual = query_residual
         self.eps = eps
@@ -119,6 +129,8 @@ class PreparedDSA:
                                         if self.overlap_query else None)
 
     def __call__(self):
+        if self.prefill is not None:
+            return self.prefill()
         m, shards = self.metadata, self.shards
         self.project(self.query_residual)
         self.key.copy_(torch.nn.functional.layer_norm(self.key_input.float(), (INDEX_DIM,),

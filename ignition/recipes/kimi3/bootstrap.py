@@ -269,9 +269,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     selection_rows if sparse else 0, draft_rows), heads=heads, head_dim=512,
                                            query_head_dim=RECORD_BYTES, ipc=package_storage.peer_storage),
                 coordinator=coordinator,
-                peers=pool.share_pages(package_storage, group) if "mla" in weights.config.layers else {}, slab=None,
+                peers=pool.share_pages(package_storage, group), slab=None,
                 candidates=(create_all_gather_runtime(group, device, max_rows=selection_rows,
-                    columns=4 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None))
+                    columns=4 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None),
+                prefill_layout="query_split" if sparse else "dcp",
+                index_peers=pool.share_pages(package_storage, group, suffix=".index") if sparse else None,
+                selections=(create_all_gather_runtime(group, device,
+                    max_rows=min(32, (config.prefill_chunk_size + shard.world_size - 1) // shard.world_size),
+                    columns=2 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None))
         # Every MLA step gathers each rank's query and KV latent rows, padded to 16 bytes: one exchange for up to
         # eight rows, as vLLM's b12x latent transport carries, and one that prefill steps use in chunks.
         text = weights.config.text
@@ -327,6 +332,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 window = min(CONTEXT_WINDOW, config.context)
                 context = replace(context, window=window, slab=torch.zeros(
                     (window + config.prefill_chunk_size, RECORD_BYTES), dtype=torch.float8_e4m3fn, device=device))
+            if context is not None and "dsa" in weights.config.layers:
+                # Serial sparse layers reuse full-context slabs. The allocation
+                # pool releases their backing while forwards compile.
+                context = replace(context,
+                    slab=torch.zeros((config.context, RECORD_BYTES), dtype=torch.float8_e4m3fn, device=device),
+                    index_slab=torch.zeros((config.context // 64, 64 * 132), dtype=torch.uint8, device=device))
         vision_prefill = vision_state = None
         if patches:
             vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
@@ -509,7 +520,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges([prefill_storage, decode_storage, graph_buffers.chunks,
             None if speculation is None else speculation.sampling_buffers.chunks, arena.tensor, metadata,
-                                           *(() if context is None else (context.slab,)),
+                                           *(() if context is None else (context.slab, context.index_slab)),
                                            *(() if not patches else (vision_storage, vision_state.arena)),
                                            decoder_buffers.scratch_tensors(), *draft_disposable]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,

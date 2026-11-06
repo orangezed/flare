@@ -13,6 +13,8 @@ their LSE (b12x DcpAllToAll). Prefill copies the request's earlier context from 
 a slab beside the chunk's own records and attends with this rank's heads.
 """
 
+from dataclasses import replace
+
 import torch
 from b12x.attention import dense_mla
 
@@ -29,7 +31,7 @@ FP8 = torch.float8_e4m3fn
 
 class PreparedMLA:
     def __init__(self, weights, source, metadata, cache, *, mode, session, name, workspace, buffers, latents=None,
-                 coordinator=None, context=None, peers=None, allocator=None, index_cache=None,
+                 coordinator=None, context=None, peers=None, allocator=None, index_cache=None, index_peers=None,
                  eps=1e-6, rotary=None, gated=True, partial_budget_bytes=None):
         tokens, hidden = source.shape
         heads = weights["key"].shape[0]
@@ -97,12 +99,18 @@ class PreparedMLA:
         if index_cache is not None:
             from .dsa import PreparedDSA
 
+            # Copying a complete million-token context is amortized by a 4096-row
+            # chunk. Smaller captures retain context-sharded selection to avoid
+            # making short continuations pay for a full-history peer copy.
+            if context is not None and mode == "prefill" and tokens < 4096:
+                context = replace(context, prefill_layout="dcp")
             index_begin = (latent_width if latents is None else latents.query_head_dim) + heads * 128
             self.sparse = PreparedDSA(weights, self.query_norm, self.local[:, index_begin:index_begin + 128],
                 self.local[:, index_begin + 128:index_begin + 160], self.absorbed, self.attended, self.slots,
                 metadata, cache, index_cache, context=context, session=session, coordinator=coordinator,
                 name=name, workspace=workspace, buffers=buffers.setdefault("selection", {}), allocator=allocator, eps=eps,
-                overlap_query=mode == "decode" and tokens == 1 and context is not None and workspace.overlap)
+                overlap_query=mode == "decode" and tokens == 1 and context is not None and workspace.overlap,
+                mode=mode, latent=self.latent, peers=peers, index_peers=index_peers)
         elif world == 1:
             # Every rank holds every record: attend with this rank's heads; b12x quantizes the BF16 query.
             self.lengths = torch.zeros_like(metadata.lengths)
