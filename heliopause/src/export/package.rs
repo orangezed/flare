@@ -3140,6 +3140,40 @@ mod payload_export_tests {
                 ..Default::default()
             },
         });
+        // The cached package may contain a separate weight allocation that a
+        // smaller graph catalog no longer retains, such as a draft-only layer.
+        let mut unused_allocation = rank.index.ranks[0].allocations[0].clone();
+        unused_allocation.name = "unselected-weights".into();
+        unused_allocation.address = Some(0x1800);
+        unused_allocation.nbytes = 32;
+        unused_allocation.data_spans.clear();
+        rank.index.ranks[0].allocations.push(unused_allocation);
+        rank.index.ranks[0].rebuild_weights.as_mut().unwrap().tensors.push(wire::RebuildTensor {
+            name: "unselected-weight".into(),
+            dtype: "uint8".into(),
+            element_bytes: 1,
+            shape: vec![32],
+            stride: vec![1],
+            storage: Some(wire::Reference {
+                allocation: "unselected-weights".into(),
+                offset: 0,
+            }),
+            ..Default::default()
+        });
+        let mut unused_group = groups[0].clone();
+        unused_group.name = "unselected-layer".into();
+        unused_group.spans = vec![WeightPayloadSourceSpan {
+            allocation: "unselected-weights".into(),
+            destination_offset: 0,
+            source_offset: 0,
+            nbytes: 32,
+        }];
+        let cached = rank.weight_payload.as_mut().unwrap();
+        cached.groups.push(unused_group);
+        cached.views.push(serde_json::from_value(serde_json::json!({
+            "name":"unselected-weight", "group":"unselected-layer", "storage":"stable",
+            "element_bytes":1, "shape":[32], "stride":[1], "address":0x1800,
+        }))?);
         let first = publish_payload(
             Path::new(""),
             &[rank.clone()],
@@ -3165,6 +3199,8 @@ mod payload_export_tests {
         // Live sources contain only fresh state; the weight bytes cannot be read here.
         fs::write(stages.join("storage-0.bin"), vec![0x77u8; 32])?;
         let bundle = &mut rank.index.ranks[0];
+        bundle.allocations.retain(|allocation| allocation.name != "unselected-weights");
+        bundle.rebuild_weights.as_mut().unwrap().tensors.retain(|tensor| tensor.name != "unselected-weight");
         bundle.allocations[0].name = "moved".into();
         bundle.allocations[0].nbytes = 512;
         bundle.allocations[0].address = Some(0x2000);
@@ -3220,6 +3256,11 @@ mod payload_export_tests {
             super::super::capture::weight_allocations(&rank.allocations),
             Vec::new(),
         ))?;
+        let mut undeclared = rank.clone();
+        undeclared.index.ranks[0].rebuild_weights.as_mut().unwrap().tensors.clear();
+        let error = request.options.reuse_weights.as_ref().unwrap()
+            .groups(&request, &undeclared, &catalog, &reused).unwrap_err();
+        assert!(error.to_string().contains("current weight allocation moved has no matching declared views"));
         for fault in ["gap", "group", "allocation", "storage"] {
             let mut invalid_catalog = catalog.clone();
             match fault {
@@ -3252,7 +3293,11 @@ mod payload_export_tests {
             assert!(
                 error
                     .to_string()
-                    .contains("not covered by one declared weight group"),
+                    .contains(if fault == "allocation" {
+                        "current weight allocation other has no matching declared views"
+                    } else {
+                        "not covered by one declared weight group"
+                    }),
                 "{fault}: {error}"
             );
         }
@@ -3294,7 +3339,7 @@ mod payload_export_tests {
         let first_meta = Metadata::open(first_entry.directory())?;
         let second_meta = Metadata::open(second_entry.directory())?;
         let profiles: Vec<helios_core::runtime_package::Publisher> = serde_json::from_str(&profiles)?;
-        for metadata in [&first_meta, &second_meta] {
+        for (metadata, expected_views) in [(&first_meta, 5), (&second_meta, 4)] {
             let verified = helios_core::package::protection::verify(
                 &metadata.envelope,
                 &profiles,
@@ -3306,7 +3351,7 @@ mod payload_export_tests {
             let body = &verified.ranks()[0];
             assert!(body.prepared_weights.is_none());
             assert!(body.compressed_prepared_weights.is_some());
-            assert_eq!(helios_core::package::schema::prepared_weights(body)?.unwrap().views.len(), 4);
+            assert_eq!(helios_core::package::schema::prepared_weights(body)?.unwrap().views.len(), expected_views);
         }
         for group in &groups {
             let locate = |metadata: &Metadata| {

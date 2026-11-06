@@ -473,6 +473,15 @@ fn map_groups(
             (group, allocations)
         })
         .collect();
+    for (_, allocations) in &coverage {
+        for allocation in allocations.keys() {
+            if !placements.values().any(|(name, _, _)| name == allocation) {
+                return Err(invalid(format!(
+                    "current weight allocation {allocation} has no matching declared views",
+                )));
+            }
+        }
+    }
     let mut result = BTreeMap::<String, WeightPayloadGroup>::new();
     for initializer in &previous.initializers {
         let Some(source) = initializer
@@ -487,9 +496,10 @@ fn map_groups(
             .as_ref()
             .ok_or_else(|| invalid("cached weight initializer has no slice"))?;
         let Some((allocation, old_origin, origin)) = placements.get(&initializer.allocation) else {
-            return Err(invalid(
-                "cached weight allocation has no matching declared views",
-            ));
+            // Every retained view was matched above. An allocation with no
+            // retained view belongs only to graphs omitted by this export.
+            // Retained allocations still require complete initializer coverage.
+            continue;
         };
         let offset = i128::from(initializer.destination_offset) + i128::from(*origin)
             - i128::from(*old_origin);
