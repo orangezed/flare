@@ -415,15 +415,12 @@ fn map_groups(
         .iter()
         .map(|view| (view.name.as_str(), view))
         .collect();
-    // Every view in an allocation must preserve the same relative placement.
-    // Allocation names and absolute addresses may change between preparations.
-    let mut placements = BTreeMap::<String, (String, u64, u64)>::new();
+    let declarations: BTreeMap<_, _> = views.views.iter().map(|view| (view.name.as_str(), view)).collect();
+    let aliases: BTreeMap<_, _> = catalog.aliases.iter().map(|alias| (alias.name.as_str(), alias.of.as_str())).collect();
+    let mut placements = Vec::new();
     for view in &current.views {
         let old = old_views.get(view.name.as_str()).ok_or_else(|| {
-            invalid(format!(
-                "cached weights lack view {}; export with weights",
-                view.name
-            ))
+            invalid(format!("cached weights lack view {}; export with weights", view.name))
         })?;
         let mut normalized = (*old).clone();
         normalized.allocation = view.allocation;
@@ -431,117 +428,234 @@ fn map_groups(
         if normalized != *view {
             return Err(invalid(format!(
                 "weight view {} has a different layout or checkpoint mapping; export without --reuse-weights",
-                view.name
+                view.name,
             )));
         }
-        let old_allocation = previous
-            .allocations
-            .get(old.allocation as usize)
+        let prior_allocation = previous.allocations.get(old.allocation as usize)
             .ok_or_else(|| invalid("cached weight allocation is absent"))?;
         let allocation = &bundle.allocations[view.allocation as usize];
-        let placement = (allocation.name.clone(), old.offset, view.offset);
-        if let Some((name, old_origin, origin)) = placements.get(&old_allocation.name) {
-            if name != &placement.0
-                || i128::from(view.offset) - i128::from(old.offset)
-                    != i128::from(*origin) - i128::from(*old_origin)
-            {
-                return Err(invalid(format!(
-                    "weight allocation {} has a different relative layout; export without --reuse-weights",
-                    old_allocation.name
-                )));
-            }
+        let declaration = declarations.get(view.name.as_str()).copied();
+        let owner = match aliases.get(view.name.as_str()).copied() {
+            Some(name) => Some(*declarations.get(name).ok_or_else(|| invalid("weight alias owner is absent"))?),
+            None => declaration,
+        };
+        let (owner_name, group, storage) = if let Some(owner) = owner {
+            let storage = match owner.storage.as_str() {
+                "stable" => weight_payload::StorageClass::Stable,
+                "tuned" => weight_payload::StorageClass::Tuned,
+                _ => return Err(invalid("weight view cannot declare state storage")),
+            };
+            let group = if storage == weight_payload::StorageClass::Tuned {
+                format!("{}:tuned", owner.group)
+            } else {
+                owner.group.clone()
+            };
+            (owner.name.clone(), group, storage)
         } else {
-            placements.insert(old_allocation.name.clone(), placement);
+            // Older prepared catalogs may name views without a semantic owner.
+            // Such views still undergo exact layout matching above; a weight
+            // group must identify their storage class before cached bytes move.
+            let matches: Vec<_> = catalog.groups.iter().filter(|group|
+                !view.group.is_empty() && (group.name == view.group || group.name == format!("{}:tuned", view.group)))
+                .collect();
+            if matches.is_empty() && view.group.is_empty() {
+                continue;
+            }
+            if matches.len() != 1 {
+                return Err(invalid(format!("weight view {} has no unique declared weight group", view.name)));
+            }
+            (view.name.clone(), matches[0].name.clone(), matches[0].storage)
+        };
+        let geometry = weight_payload::WeightViewInput {
+            name: view.name.clone(), group: group.clone(), storage, alias_of: None,
+            sources: Vec::new(), packing: String::new(), packing_parameters: None,
+            statistics_domain: String::new(), element_bytes: u64::from(view.element_bytes),
+            shape: view.shape.clone(), stride: view.stride.clone(), address: 0,
+        };
+        for (start, end) in weight_payload::occupied_runs(&geometry)? {
+            let prior_start = old.offset.checked_add(start).ok_or_else(|| invalid("cached weight offset overflow"))?;
+            let prior_end = old.offset.checked_add(end).ok_or_else(|| invalid("cached weight extent overflow"))?;
+            let destination_start = view.offset.checked_add(start).ok_or_else(|| invalid("weight offset overflow"))?;
+            let destination_end = view.offset.checked_add(end).ok_or_else(|| invalid("weight extent overflow"))?;
+            if prior_end > prior_allocation.nbytes || destination_end > allocation.nbytes {
+                return Err(invalid("retained weight view exceeds its allocation"));
+            }
+            placements.push(ViewPlacement {
+                owner: owner_name.clone(), group: group.clone(), storage,
+                allocation: allocation.name.clone(), start: destination_start, end: destination_end,
+                prior_allocation: prior_allocation.name.clone(), prior_start,
+            });
         }
     }
-    // Publication coalesces adjacent initializers across owner spans. Coverage
-    // merges those spans without changing their zero-elision boundaries.
-    let coverage: Vec<_> = catalog
-        .groups
-        .iter()
-        .map(|group| {
-            let mut allocations = BTreeMap::<&str, Vec<(u64, u64)>>::new();
-            for span in &group.spans {
-                allocations.entry(&span.allocation).or_default().push((
-                    span.destination_offset,
-                    span.destination_offset + span.nbytes,
-                ));
-            }
-            for ranges in allocations.values_mut() {
-                *ranges = super::reachability::merge_ranges(std::mem::take(ranges));
-            }
-            (group, allocations)
-        })
-        .collect();
-    for (_, allocations) in &coverage {
-        for allocation in allocations.keys() {
-            if !placements.values().any(|(name, _, _)| name == allocation) {
-                return Err(invalid(format!(
-                    "current weight allocation {allocation} has no matching declared views",
-                )));
+    let mut result = map_weight_spans(previous, placements, catalog)?;
+    for group in &mut result {
+        group.nbytes = payloads.length(&group.payload_id)?;
+    }
+    Ok(result)
+}
+
+#[derive(Clone, Debug)]
+struct ViewPlacement {
+    owner: String,
+    group: String,
+    storage: weight_payload::StorageClass,
+    allocation: String,
+    start: u64,
+    end: u64,
+    prior_allocation: String,
+    prior_start: u64,
+}
+
+fn normalize_placements(mut placements: Vec<ViewPlacement>) -> Result<Vec<ViewPlacement>> {
+    use super::reachability::{merge_ranges, subtract_ranges};
+    // Any aliases of the current bytes must refer to the same cached bytes.
+    // Comparing only payload contents would require reading the weight files.
+    placements.sort_by(|a, b| (&a.allocation, a.start, a.end).cmp(&(&b.allocation, b.start, b.end)));
+    let mut checked: Vec<ViewPlacement> = Vec::new();
+    for placement in &placements {
+        if let Some(last) = checked.last_mut() {
+            if last.allocation == placement.allocation && placement.start < last.end {
+                if last.prior_allocation != placement.prior_allocation
+                    || i128::from(last.prior_start) - i128::from(last.start)
+                        != i128::from(placement.prior_start) - i128::from(placement.start)
+                {
+                    return Err(invalid("overlapping retained weights require different cached bytes"));
+                }
+                last.end = last.end.max(placement.end);
+                continue;
             }
         }
+        checked.push(placement.clone());
+    }
+    // Match weight_payload::extract's named owner order. Aliases use their
+    // declared owner's name and therefore cannot take ownership from it.
+    placements.sort_by(|a, b| (&a.owner, &a.allocation, a.start).cmp(&(&b.owner, &b.allocation, b.start)));
+    let mut claimed = BTreeMap::<String, Vec<(u64, u64)>>::new();
+    let mut result = Vec::new();
+    for placement in placements {
+        let ranges = claimed.entry(placement.allocation.clone()).or_default();
+        let pieces = subtract_ranges(placement.start, placement.end, ranges);
+        for (start, end) in pieces {
+            result.push(ViewPlacement {
+                prior_start: placement.prior_start + (start - placement.start),
+                start,
+                end,
+                ..placement.clone()
+            });
+        }
+        ranges.push((placement.start, placement.end));
+        *ranges = merge_ranges(std::mem::take(ranges));
+    }
+    Ok(result)
+}
+
+fn map_weight_spans(
+    previous: &pwire::RankBody,
+    placements: Vec<ViewPlacement>,
+    catalog: &weight_payload::WeightPayloadCatalog,
+) -> Result<Vec<WeightPayloadGroup>> {
+    use super::reachability::merge_ranges;
+    use weight_payload::StorageClass;
+    let placements = normalize_placements(placements)?;
+    type Coverage = BTreeMap<(String, StorageClass, String), Vec<(u64, u64)>>;
+    let mut expected = Coverage::new();
+    for placement in &placements {
+        expected.entry((placement.group.clone(), placement.storage, placement.allocation.clone()))
+            .or_default().push((placement.start, placement.end));
+    }
+    let allocations: BTreeSet<_> = placements.iter().map(|placement| placement.allocation.as_str()).collect();
+    let mut actual = Coverage::new();
+    for group in &catalog.groups {
+        for span in &group.spans {
+            if !allocations.contains(span.allocation.as_str()) {
+                return Err(invalid(format!(
+                    "current weight allocation {} has no matching declared views", span.allocation,
+                )));
+            }
+            let end = span.destination_offset.checked_add(span.nbytes)
+                .ok_or_else(|| invalid("current weight extent overflow"))?;
+            actual.entry((group.name.clone(), group.storage, span.allocation.clone()))
+                .or_default().push((span.destination_offset, end));
+        }
+    }
+    for coverage in [&mut expected, &mut actual] {
+        for ranges in coverage.values_mut() {
+            *ranges = merge_ranges(std::mem::take(ranges));
+        }
+    }
+    if expected != actual {
+        return Err(invalid("retained weight bytes are not covered by one declared weight group"));
+    }
+    let mut cached = BTreeMap::<&str, Vec<(u64, u64, i32, &pwire::PayloadSlice)>>::new();
+    for initializer in &previous.initializers {
+        let Some(source) = initializer.source.as_ref().filter(|source| is_weight(source.role)) else {
+            continue;
+        };
+        let slice = source.slice.as_ref().ok_or_else(|| invalid("cached weight initializer has no slice"))?;
+        let end = initializer.destination_offset.checked_add(slice.nbytes)
+            .ok_or_else(|| invalid("cached weight extent overflow"))?;
+        cached.entry(&initializer.allocation).or_default()
+            .push((initializer.destination_offset, end, source.role, slice));
+    }
+    for spans in cached.values_mut() {
+        spans.sort_by_key(|span| span.0);
     }
     let mut result = BTreeMap::<String, WeightPayloadGroup>::new();
-    for initializer in &previous.initializers {
-        let Some(source) = initializer
-            .source
-            .as_ref()
-            .filter(|source| is_weight(source.role))
-        else {
+    for placement in placements {
+        let prior_end = placement.prior_start.checked_add(placement.end - placement.start)
+            .ok_or_else(|| invalid("cached weight view extent overflow"))?;
+        let Some(spans) = cached.get(placement.prior_allocation.as_str()) else {
+            // Signed cached allocations are initially zero; missing payload
+            // spans inside a matched view are the zero-elided bytes.
             continue;
         };
-        let slice = source
-            .slice
-            .as_ref()
-            .ok_or_else(|| invalid("cached weight initializer has no slice"))?;
-        let Some((allocation, old_origin, origin)) = placements.get(&initializer.allocation) else {
-            // Every retained view was matched above. An allocation with no
-            // retained view belongs only to graphs omitted by this export.
-            // Retained allocations still require complete initializer coverage.
-            continue;
-        };
-        let offset = i128::from(initializer.destination_offset) + i128::from(*origin)
-            - i128::from(*old_origin);
-        let offset = u64::try_from(offset)
-            .map_err(|_| invalid("reused weight offset is outside its allocation"))?;
-        let end = offset
-            .checked_add(slice.nbytes)
-            .ok_or_else(|| invalid("reused weight extent overflow"))?;
-        let storage = if source.role == pwire::PayloadRole::TunedWeights as i32 {
-            weight_payload::StorageClass::Tuned
-        } else {
-            weight_payload::StorageClass::Stable
-        };
-        let group = coverage.iter().find(|(group, allocations)| group.storage == storage &&
-            allocations.get(allocation.as_str()).is_some_and(|ranges|
-                ranges.iter().any(|&(start, stop)| start <= offset && end <= stop)))
-            .map(|(group, _)| *group)
-            .ok_or_else(|| invalid(format!(
-                "rank {} cached {} weight initializer {}[{offset}..{end}] is not covered by one declared weight group; export with weights",
-                previous.rank, storage.as_str(), allocation,
-            )))?;
-        let resolved = result
-            .entry(group.name.clone())
-            .or_insert_with(|| WeightPayloadGroup {
-                name: group.name.clone(),
-                storage: group.storage.as_str().to_string(),
-                nbytes: 0,
-                spans: Vec::new(),
-                payload_id: slice.payload_id.clone(),
+        let first = spans.partition_point(|span| span.1 <= placement.prior_start);
+        for &(start, end, role, slice) in &spans[first..] {
+            if start >= prior_end {
+                break;
+            }
+            let low = start.max(placement.prior_start);
+            let high = end.min(prior_end);
+            let storage = if role == pwire::PayloadRole::TunedWeights as i32 {
+                StorageClass::Tuned
+            } else {
+                StorageClass::Stable
+            };
+            if storage != placement.storage {
+                return Err(invalid("cached weight storage class differs from its retained view"));
+            }
+            let group = result.entry(placement.group.clone()).or_insert_with(|| WeightPayloadGroup {
+                name: placement.group.clone(), storage: storage.as_str().into(), nbytes: 0,
+                spans: Vec::new(), payload_id: slice.payload_id.clone(),
             });
-        if resolved.payload_id != slice.payload_id {
-            return Err(invalid(
-                "cached weight group uses multiple payload objects; export with weights",
-            ));
+            if group.payload_id != slice.payload_id {
+                return Err(invalid("cached weight group uses multiple payload objects; export with weights"));
+            }
+            group.spans.push(WeightPayloadSourceSpan {
+                allocation: placement.allocation.clone(),
+                destination_offset: placement.start + (low - placement.prior_start),
+                source_offset: slice.offset.checked_add(low - start)
+                    .ok_or_else(|| invalid("cached payload offset overflow"))?,
+                nbytes: high - low,
+            });
         }
-        resolved.nbytes = payloads.length(&slice.payload_id)?;
-        resolved.spans.push(WeightPayloadSourceSpan {
-            allocation: allocation.clone(),
-            destination_offset: offset,
-            source_offset: slice.offset,
-            nbytes: slice.nbytes,
-        });
+    }
+    for group in result.values_mut() {
+        group.spans.sort_by(|a, b| (&a.allocation, a.destination_offset).cmp(&(&b.allocation, b.destination_offset)));
+        let mut merged: Vec<WeightPayloadSourceSpan> = Vec::new();
+        for span in std::mem::take(&mut group.spans) {
+            if let Some(last) = merged.last_mut() {
+                if last.allocation == span.allocation
+                    && last.destination_offset + last.nbytes == span.destination_offset
+                    && last.source_offset + last.nbytes == span.source_offset
+                {
+                    last.nbytes += span.nbytes;
+                    continue;
+                }
+            }
+            merged.push(span);
+        }
+        group.spans = merged;
     }
     Ok(result.into_values().collect())
 }
@@ -550,4 +664,106 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(export_reuse_weights, module)?)?;
     module.add_class::<NativeWeightSource>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weight_payload::{PayloadSpan, StorageClass, WeightGroupPayload, WeightPayloadCatalog};
+
+    fn placement(allocation: &str, start: u64, end: u64, prior_start: u64) -> ViewPlacement {
+        ViewPlacement {
+            owner: format!("owner-{allocation}-{start}"), group: "layer".into(),
+            storage: StorageClass::Stable, allocation: allocation.into(), start, end,
+            prior_allocation: "cached".into(), prior_start,
+        }
+    }
+
+    fn previous(spans: &[(u64, u64, u64)]) -> pwire::RankBody {
+        pwire::RankBody {
+            initializers: spans.iter().map(|&(destination_offset, offset, nbytes)| pwire::Initializer {
+                allocation: "cached".into(), destination_offset,
+                source: Some(pwire::PayloadUse {
+                    role: pwire::PayloadRole::Weights as i32,
+                    slice: Some(pwire::PayloadSlice { payload_id: vec![9; 32], offset, nbytes }),
+                    ..Default::default()
+                }),
+            }).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn catalog(placements: &[ViewPlacement]) -> WeightPayloadCatalog {
+        WeightPayloadCatalog {
+            groups: vec![WeightGroupPayload {
+                name: "layer".into(), storage: StorageClass::Stable,
+                nbytes: placements.iter().map(|p| p.end-p.start).sum(),
+                spans: placements.iter().map(|p| PayloadSpan {
+                    payload_offset: 0, allocation: p.allocation.clone(),
+                    destination_offset: p.start, nbytes: p.end-p.start,
+                }).collect(),
+            }],
+            state: WeightGroupPayload {
+                name: "initial-state".into(), storage: StorageClass::State, nbytes: 0, spans: vec![],
+            },
+            aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn split_cached_initializer_across_relocated_views() -> Result<()> {
+        let placements = vec![placement("left", 16, 20, 0), placement("right", 32, 36, 4)];
+        let result = map_weight_spans(&previous(&[(0, 0, 8)]), placements.clone(), &catalog(&placements))?;
+        assert_eq!(result.len(), 1);
+        let spans = &result[0].spans;
+        assert_eq!(spans.len(), 2);
+        assert_eq!((&spans[0].allocation, spans[0].destination_offset, spans[0].source_offset, spans[0].nbytes),
+                   (&"left".to_string(), 16, 0, 4));
+        assert_eq!((&spans[1].allocation, spans[1].destination_offset, spans[1].source_offset, spans[1].nbytes),
+                   (&"right".to_string(), 32, 4, 4));
+        Ok(())
+    }
+
+    #[test]
+    fn strided_view_reuse_excludes_holes_and_preserves_zero_elision() -> Result<()> {
+        let view = weight_payload::WeightViewInput {
+            name: "strided".into(), group: "layer".into(), storage: StorageClass::Stable,
+            alias_of: None, sources: vec![], packing: String::new(), packing_parameters: None,
+            statistics_domain: String::new(), element_bytes: 1,
+            shape: vec![2, 2], stride: vec![3, 1], address: 0,
+        };
+        let runs = weight_payload::occupied_runs(&view)?;
+        assert_eq!(runs, vec![(0, 2), (3, 5)]);
+        let placements: Vec<_> = runs.into_iter().map(|(start, end)| placement("target", 16+start, 16+end, start)).collect();
+        // The second occupied row is zero-elided; the intervening byte belongs
+        // to no declared weight and must not be read or initialized by reuse.
+        let result = map_weight_spans(&previous(&[(0, 0, 2)]), placements.clone(), &catalog(&placements))?;
+        assert_eq!(result[0].spans.len(), 1);
+        assert_eq!((result[0].spans[0].destination_offset, result[0].spans[0].nbytes), (16, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn identical_aliases_deduplicate_and_conflicting_aliases_fail() -> Result<()> {
+        let owner = placement("target", 16, 24, 0);
+        let mut alias = owner.clone();
+        alias.owner = "alias".into();
+        let coverage = catalog(&[owner.clone()]);
+        let result = map_weight_spans(&previous(&[(0, 0, 16)]), vec![owner.clone(), alias.clone()], &coverage)?;
+        assert_eq!(result[0].spans.len(), 1);
+        assert_eq!(result[0].spans[0].nbytes, 8);
+        alias.prior_start = 8;
+        let error = map_weight_spans(&previous(&[(0, 0, 16)]), vec![owner, alias], &coverage).unwrap_err();
+        assert!(error.to_string().contains("different cached bytes"));
+        Ok(())
+    }
+
+    #[test]
+    fn relocated_view_rejects_incomplete_current_coverage() {
+        let placements = vec![placement("target", 16, 24, 0)];
+        let mut coverage = catalog(&placements);
+        coverage.groups[0].spans[0].nbytes -= 1;
+        let error = map_weight_spans(&previous(&[(0, 0, 8)]), placements, &coverage).unwrap_err();
+        assert!(error.to_string().contains("not covered by one declared weight group"));
+    }
 }

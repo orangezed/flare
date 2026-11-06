@@ -485,7 +485,8 @@ fn element_extent(view: &WeightViewInput) -> Result<u64> {
 
 /// Exact occupied byte intervals of a view, relative to its own address.
 /// A strided dimension contributes separate runs; a view never owns its holes.
-fn occupied_runs(view: &WeightViewInput) -> Result<Vec<(u64, u64)>> {
+pub(crate) fn occupied_runs(view: &WeightViewInput) -> Result<Vec<(u64, u64)>> {
+    element_extent(view)?;
     let element = view.element_bytes;
     let mut dimensions: Vec<(u64, u64)> = view
         .shape

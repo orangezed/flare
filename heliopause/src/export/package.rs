@@ -3256,6 +3256,45 @@ mod payload_export_tests {
             super::super::capture::weight_allocations(&rank.allocations),
             Vec::new(),
         ))?;
+        // Repacking an allocator may move views independently or split one
+        // cached allocation into several destinations without changing weights.
+        let resolve = |changed_rank: &RankOutput, changed_catalog: &super::super::weight_payload::WeightPayloadCatalog| {
+            request.options.reuse_weights.as_ref().unwrap()
+                .groups(&request, changed_rank, changed_catalog, &reused)
+        };
+        let mut moved_rank = rank.clone();
+        moved_rank.index.ranks[0].rebuild_weights.as_mut().unwrap().tensors[1]
+            .storage.as_mut().unwrap().offset = 400;
+        let mut moved_catalog = catalog.clone();
+        moved_catalog.groups[0].spans.iter_mut().find(|span| span.destination_offset == 272).unwrap()
+            .destination_offset = 400;
+        let moved = resolve(&moved_rank, &moved_catalog)?;
+        let moved_span = moved[0].spans.iter().find(|span| span.destination_offset == 400).unwrap();
+        assert_eq!((moved_span.source_offset, moved_span.nbytes), (16, 16));
+        assert_eq!(moved[0].payload_id, groups[0].payload_id);
+        let mut split_rank = rank.clone();
+        let mut split_allocation = split_rank.index.ranks[0].allocations[0].clone();
+        split_allocation.name = "split".into();
+        split_allocation.address = Some(0x3000);
+        split_allocation.nbytes = 32;
+        split_allocation.data_spans.clear();
+        split_rank.index.ranks[0].allocations.push(split_allocation);
+        let split_view = split_rank.index.ranks[0].rebuild_weights.as_mut().unwrap().tensors[1]
+            .storage.as_mut().unwrap();
+        split_view.allocation = "split".into();
+        split_view.offset = 0;
+        let mut split_catalog = catalog.clone();
+        let split_span = split_catalog.groups[0].spans.iter_mut().find(|span| span.destination_offset == 272).unwrap();
+        split_span.allocation = "split".into();
+        split_span.destination_offset = 0;
+        let split = resolve(&split_rank, &split_catalog)?;
+        let copied = split[0].spans.iter().find(|span| span.allocation == "split").unwrap();
+        assert_eq!((copied.destination_offset, copied.source_offset, copied.nbytes), (0, 16, 16));
+        moved_rank.index.ranks[0].rebuild_weights.as_mut().unwrap().tensors[1]
+            .storage.as_mut().unwrap().offset = 256;
+        moved_catalog.groups[0].spans.iter_mut().find(|span| span.destination_offset == 400).unwrap()
+            .destination_offset = 256;
+        assert!(resolve(&moved_rank, &moved_catalog).unwrap_err().to_string().contains("different cached bytes"));
         let mut undeclared = rank.clone();
         undeclared.index.ranks[0].rebuild_weights.as_mut().unwrap().tensors.clear();
         let error = request.options.reuse_weights.as_ref().unwrap()
