@@ -423,6 +423,51 @@ def _fake_all_gather(source, output, handle):
     pass
 
 
+@torch.library.custom_op("flare::start_all_gather", mutates_args=("output",))
+def _start_all_gather(source: torch.Tensor, output: torch.Tensor, handle: int, stream: int) -> None:
+    auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
+    auxiliary.wait_stream(torch.cuda.current_stream(source.device))
+    with torch.cuda.stream(auxiliary):
+        _gather_columns(source, output, handle)
+
+
+@_start_all_gather.register_fake
+def _fake_start_all_gather(source, output, handle, stream):
+    pass
+
+
+@torch.library.custom_op("flare::join_all_gather", mutates_args=("output",))
+def _join_all_gather(source: torch.Tensor, output: torch.Tensor, dependency: torch.Tensor, stream: int) -> None:
+    torch.cuda.current_stream(source.device).wait_stream(torch.cuda.ExternalStream(stream, device=source.device))
+
+
+@_join_all_gather.register_fake
+def _fake_join_all_gather(source, output, dependency, stream):
+    pass
+
+
+class ConcurrentAllGather:
+    """Fork a prepared column gather, then join before consuming or reusing its buffers.
+
+    The caller must keep this channel independent of concurrent collectives.
+    ``finish`` retains the input through the asynchronous read and orders the
+    join after the supplied main-stream dependency. Channel reuse follows it.
+    """
+
+    def __init__(self, gather, *, stream):
+        if gather.single or gather.roce:
+            raise ValueError("concurrent column gather requires a prepared PCIe channel")
+        self.gather, self.stream = gather, stream
+        self.stream_handle = stream.cuda_stream
+
+    def start(self, source):
+        _start_all_gather(source, self.gather.output, self.gather.handle, self.stream_handle)
+
+    def finish(self, source, dependency):
+        _join_all_gather(source, self.gather.output, dependency, self.stream_handle)
+        return self.gather.output
+
+
 
 
 @triton.jit

@@ -35,7 +35,7 @@ class ModelWeights:
     draft: object = None
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False,
+    def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False, online_mxfp8_scope="all",
              peers=None, vision=True):
         """``peers``, a host's Gloo group and peer storage, reads column-sharded projections once per host.
 
@@ -43,7 +43,7 @@ class ModelWeights:
         Without ``vision``, the vision encoder stays on disk.
         """
         before = torch.cuda.memory_allocated(device)
-        with KimiWeightLoader(manifest, device, shard=shard, progress=progress, online_mxfp8=online_mxfp8,
+        with KimiWeightLoader(manifest, device, shard=shard, progress=progress, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
                               peers=peers) as loader:
             config = replace(loader.config, draft=None)
             embedding = loader.linear(f"{PREFIX}.embed_tokens", columns=shard.partition(config.hidden, alignment=64))
@@ -68,19 +68,22 @@ class ModelWeights:
 
                 extra["target_embedding"] = embedding
             draft = DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
-                                      online_mxfp8=online_mxfp8, **extra)
+                                      online_mxfp8=online_mxfp8 and online_mxfp8_scope == "all", **extra)
         return cls(config, shard, embedding, norm, head, score_weight(res_norm, res_proj), layers,
                    loader.scale_scratch, torch.cuda.memory_allocated(device) - before, vision=vision, draft=draft)
 
 
 class KimiWeightLoader(DirectWeightLoader):
-    def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, online_mxfp8=False, peers=None):
+    def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, online_mxfp8=False, online_mxfp8_scope="all", peers=None):
         super().__init__(manifest, device, prefixes=prefixes, progress=progress)
         self.peers, self.shared_columns = peers, None
         self.config, self.shard = ModelConfig.load(manifest.snapshot), shard
         # Online conversion stores attention, shared-expert, and latent projections as E4M3 values
         # with E8M0 block-32 scales; their activations stay BF16.
         self.online_mxfp8 = online_mxfp8
+        self.online_mxfp8_scope = online_mxfp8_scope
+        if online_mxfp8_scope not in ("all", "kda-input"):
+            raise ValueError("online MXFP8 scope must be all or kda-input")
         self.config.validate_shard(shard)
         self.scale_scratch = None
 
@@ -182,7 +185,9 @@ class KimiWeightLoader(DirectWeightLoader):
             attention["latent_gate"] = torch.cat((*latent, gate.new_zeros((-width % 8, gate.shape[1])), gate, *suffix))
         attention["output"] = self.linear(a + ".o_proj", columns=head_rows)
         if self.online_mxfp8:
-            for key in ("input", "forget", "latent_gate", "q_b", "output"):
+            keys = (("input", "forget", "latent_gate", "q_b", "output") if self.online_mxfp8_scope == "all"
+                    else (("input",) if self.config.layers[index] == "kda" else ()))
+            for key in keys:
                 if key in attention:
                     attention[key] = quantize_bf16_linear_as_mxfp8(attention[key])
         return attention
@@ -201,7 +206,7 @@ class KimiWeightLoader(DirectWeightLoader):
             return result
         m = prefix + ".block_sparse_moe"
         result["shared"] = self.mlp(m + ".shared_experts", c["num_shared_experts"] * c["moe_intermediate_size"],
-                                    online_mxfp8=self.online_mxfp8)
+                                    online_mxfp8=self.online_mxfp8 and self.online_mxfp8_scope == "all")
         result["router"] = self.linear(m + ".gate", rows=shard.partition(c["num_experts"], alignment=8))
         result["correction"] = self.load_tensor(m + ".gate.e_score_correction_bias")
         result["latent_down"] = self.linear(m + ".routed_expert_down_proj", columns=shard.partition(c["hidden_size"]))
@@ -209,7 +214,7 @@ class KimiWeightLoader(DirectWeightLoader):
         result["latent_down_rows"] = self.linear(m + ".routed_expert_down_proj",
                                                  rows=shard.partition(c["routed_expert_hidden_size"]))
         result["latent_up"] = self.linear(m + ".routed_expert_up_proj", columns=shard.partition(c["routed_expert_hidden_size"]))
-        if self.online_mxfp8:
+        if self.online_mxfp8 and self.online_mxfp8_scope == "all":
             for key in ("latent_down", "latent_down_rows", "latent_up"):
                 result[key] = quantize_bf16_linear_as_mxfp8(result[key])
         # Each rank applies the latent norm's weights to the columns its up-projection shard reads.

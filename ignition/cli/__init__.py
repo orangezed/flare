@@ -255,6 +255,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " experts, MoE latent projections, and eligible DSpark context, attention and MLPs;"
                                " Qwen3.8 dense target attention/MLPs and DFlash2 context, attention and MLPs; Flash Next DFlash2 projections;"
                                " default: checkpoint precision)")
+    advanced.add_argument("--online-mxfp8-scope", choices=("all", "kda-input"),
+                          help="limit --online-mxfp8 to a declared projection group; all preserves the recipe's"
+                               " eligible projections, kda-input converts only fused KDA inputs (Kimi K3/K3.1)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")

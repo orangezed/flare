@@ -50,7 +50,7 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         compile_kinds=plan.compile_kinds,
-        retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8,
+        retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8, online_mxfp8_scope=plan.online_mxfp8_scope,
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
         vision=not plan.language_model_only, **drafting)
     if plan.world_size == 1:
@@ -86,7 +86,7 @@ RECIPE = Recipe(
     compile_kinds=("prefill", "scored_prefill", "decode", "resume", "vision", "speculative"),
     # KDA, MLA except batched key/value, shared experts, latent MoE projections, and the DSpark
     # draft's context projection, attention outputs and MLPs may load as MXFP8.
-    online_mxfp8=True,
+    online_mxfp8=True, online_mxfp8_scopes=("all", "kda-input"),
     # Decode and verification run each MoE layer's shared experts beside its routing and routed experts.
     stream_overlap=True,
     # Text-only plans, as vLLM serves Kimi K3 with --language-model-only, leave the MoonViT encoder unloaded.

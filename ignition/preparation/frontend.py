@@ -8,6 +8,62 @@ import json
 import hashlib
 from enum import IntEnum
 from pathlib import Path
+from tempfile import TemporaryDirectory
+
+
+class DiagnosticAssets:
+    """Own immutable frontend files until the in-process native server drains."""
+
+    def __init__(self, assets):
+        self._directory = TemporaryDirectory(prefix="flare-frontend-")
+        self.descriptors = {}
+        try:
+            for index, (name, asset) in enumerate(assets.items()):
+                path = Path(self._directory.name) / str(index)
+                digest = hashlib.sha256()
+                source, text = asset.get("path"), asset.get("text")
+                if (source is None) == (text is None):
+                    raise ValueError("frontend asset requires exactly one file path or text value")
+                offset, size = asset.get("offset"), asset.get("nbytes")
+                if "offset" in asset or "nbytes" in asset:
+                    if (source is None or type(offset) is not int or type(size) is not int
+                            or offset < 0 or size < 0):
+                        raise ValueError("frontend asset range requires a file path and nonnegative offset and nbytes")
+                with path.open("xb") as output:
+                    if text is not None:
+                        if not isinstance(text, str):
+                            raise ValueError("frontend asset text must be a string")
+                        data = text.encode("utf-8")
+                        output.write(data)
+                        digest.update(data)
+                    else:
+                        if not isinstance(source, str):
+                            raise ValueError("frontend asset path must be a string")
+                        with open(source, "rb") as input_file:
+                            if offset is not None:
+                                input_file.seek(offset)
+                            remaining = size
+                            while remaining is None or remaining:
+                                data = input_file.read(1024 * 1024 if remaining is None else min(remaining, 1024 * 1024))
+                                if not data:
+                                    if remaining:
+                                        raise ValueError("frontend asset range exceeds the source file")
+                                    break
+                                output.write(data)
+                                digest.update(data)
+                                if remaining is not None:
+                                    remaining -= len(data)
+                actual = digest.hexdigest()
+                if "sha256" in asset and (not isinstance(asset["sha256"], str)
+                                           or asset["sha256"].lower() != actual):
+                    raise ValueError("frontend asset digest differs from preparation metadata")
+                self.descriptors[name] = dict(path=str(path), sha256=actual)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        self._directory.cleanup()
 
 
 class PromptEncoder(IntEnum):

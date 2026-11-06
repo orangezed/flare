@@ -199,6 +199,8 @@ class Recipe:
     auxiliary stream, which a plan can serialize onto the main stream.
     `online_mxfp8` states that the recipe names BF16 projections a plan may store as
     MXFP8 while loading, trading checkpoint precision for decode bandwidth.
+    `online_mxfp8_scopes` names supported conversion groups; `all` preserves the
+    recipe's complete eligible set, while other scopes restrict that set.
     `language_model_only` states that a plan may prepare the recipe without its vision
     encoder, rejecting images and leaving the encoder's memory to KV pages.
     `mla_compute_modes` declares the attention arithmetic constraints a plan may select,
@@ -236,6 +238,7 @@ class Recipe:
     # Complete-forward kinds whose compilation may be selected during preparation.
     compile_kinds: tuple[str, ...] = ()
     online_mxfp8: bool = False
+    online_mxfp8_scopes: tuple[str, ...] = ("all",)
     language_model_only: bool = False
     b12x_environment: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     mla_compute_modes: tuple[str, ...] = ("auto",)

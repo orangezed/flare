@@ -116,6 +116,8 @@ message RebuildManifest {
   bool force_moe_decode_a16 = 27;
   // Preparation-only complete-forward compilation selection; empty uses recipe defaults.
   repeated string compile_kinds = 29;
+  // Empty selects all eligible projections, matching exports without an explicit scope.
+  string online_mxfp8_scope = 30;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;

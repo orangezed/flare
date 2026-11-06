@@ -343,9 +343,9 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     assert record["speculation"]["draft_prefix_selection"] == model.recipe.speculation.draft_prefix_selection
 
 
-@pytest.mark.parametrize("online", [False, True])
+@pytest.mark.parametrize("online,scope", [(False, None), (True, None), (True, "all"), (True, "kda-input")])
 @pytest.mark.parametrize("drafting", [False, True])
-def test_kimi31_online_mxfp8_is_explicit_in_cli_plan_and_rebuild_metadata(tmp_path, monkeypatch, online, drafting):
+def test_kimi31_online_mxfp8_is_explicit_in_cli_plan_and_rebuild_metadata(tmp_path, monkeypatch, online, scope, drafting):
     from types import SimpleNamespace
     from google.protobuf import json_format
     from ignition.cli import _parser, preparation
@@ -359,6 +359,8 @@ def test_kimi31_online_mxfp8_is_explicit_in_cli_plan_and_rebuild_metadata(tmp_pa
     configuration = Configuration.load(path)
     model = ResolvedModel(RECIPE, RECIPE.checkpoints[0])
     flags = ["--online-mxfp8"] if online else []
+    if scope is not None:
+        flags += ["--online-mxfp8-scope", scope]
     flags += ["--mtp-draft-tokens", "7"] if drafting else ["--no-mtp"]
     args = _parser().parse_args(["export", "kimi-k3.1-pro", "--gpus", "0-15", "--max-concurrency", "4",
         "--image-concurrency", "4", "--prefill-chunk-size", "4096", *flags])
@@ -367,9 +369,11 @@ def test_kimi31_online_mxfp8_is_explicit_in_cli_plan_and_rebuild_metadata(tmp_pa
     plan = preparation.derive(configuration, model, preparation.Host(devices, None), gpus=args.gpus,
         concurrency=configuration.max_concurrency(model.checkpoint.alias, RECIPE.concurrency, args.max_concurrency),
         speculation=preparation.speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-        image_concurrency=args.image_concurrency, online_mxfp8=args.online_mxfp8)
+        image_concurrency=args.image_concurrency, online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope)
 
     assert args.online_mxfp8 is plan.online_mxfp8 is online
+    assert plan.online_mxfp8_scope == (scope or "all")
+    assert plan.to_dict()["online_mxfp8_scope"] == (scope or "all")
     assert (plan.world_size, plan.concurrency, plan.prefill_chunk, plan.image_concurrency) == (16, 4, 4096, 4)
     assert not plan.language_model_only and plan.max_images == RECIPE.max_images
     assert plan.expert_scale_compression is None
@@ -383,9 +387,29 @@ def test_kimi31_online_mxfp8_is_explicit_in_cli_plan_and_rebuild_metadata(tmp_pa
     encoded = proto.RebuildManifest()
     json_format.ParseDict(manifest, encoded)
     assert manifest["online_mxfp8"] is encoded.online_mxfp8 is online
+    assert encoded.online_mxfp8_scope == (scope or "all")
     assert encoded.image_concurrency == 4 and not encoded.language_model_only
     assert encoded.prefill_chunk == 4096
     assert encoded.HasField("speculation") is drafting
+
+
+@pytest.mark.parametrize("scope", ["all", "kda-input"])
+def test_online_mxfp8_scope_requires_conversion(scope):
+    from ignition.recipes.kimi31.recipe import RECIPE
+
+    with pytest.raises(UsageError, match="requires --online-mxfp8"):
+        planning.plan(RECIPE, RECIPE.checkpoints[0], (), selected=None, concurrency=1,
+                      reserve_bytes=0, speculation=None, online_mxfp8_scope=scope)
+
+
+def test_online_mxfp8_scope_must_be_declared_by_recipe():
+    from ignition.recipes.kimi31.recipe import RECIPE
+
+    broad_only = replace(RECIPE, online_mxfp8_scopes=("all",))
+    with pytest.raises(UsageError, match="supports all"):
+        planning.plan(broad_only, broad_only.checkpoints[0], (), selected=None, concurrency=1,
+                      reserve_bytes=0, speculation=None, online_mxfp8=True,
+                      online_mxfp8_scope="kda-input")
 
 
 def test_context_parallel_pages_hold_every_rank_share_unless_disabled():

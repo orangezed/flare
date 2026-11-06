@@ -5,7 +5,66 @@ and `uv.lock`. The matching kernel source is published in
 [`local-inference-lab/flashinfer`, branch `k31`](https://github.com/local-inference-lab/flashinfer/tree/k31).
 The [model preparation guide](model-preparation.md#kimi-k31-pro) provides the
 complete TP16/C4/K7 export and native launch commands. Preparation needs sixteen
-SM120 GPUs with 96 GB each and the pinned target and draft checkpoints.
+SM120 GPUs with 96 GB each and the pinned target checkpoint. Speculative
+preparation additionally needs the draft checkpoint; `--no-mtp` omits it.
+
+## Projection conversion scope
+
+`--online-mxfp8` enables conversion of eligible BF16 projection weights. Its
+scope defaults to `all`, preserving the complete set listed in the model guide.
+Activations remain BF16. To convert only the fused KDA input projection, use
+`--online-mxfp8 --online-mxfp8-scope kda-input` in the export command. That
+projection contains query, key, value, output gate, forget-gate input and beta.
+The forget-gate output, attention output, MLA/DSA projections, shared experts,
+latent MoE projections and draft projections retain checkpoint precision.
+
+The scope is recorded in the preparation plan and package rebuild metadata.
+Changing it requires preparing the corresponding weight representation; do not
+use `--reuse-weights` with a package prepared under a different scope. Omitted
+scope metadata in an existing package means `all`.
+
+## C1 query-exchange qualification
+
+The `astra/k31-query-overlap` Flare branch uses the companion FlashInfer branch
+`astra/k31-recursive-ready` (`762ada1fea4d9d2e544b768e3935da0906693cd1`). The
+repository lockfile still selects the earlier dependency baseline; install or
+explicitly select the companion checkout when reproducing this configuration.
+The compiler patches described below are also required.
+
+Implemented: single-row decode exchanges the absorbed query on an auxiliary
+stream while sparse selection runs on the main stream. Native-call enqueue
+ordering survives whole-forward compilation; selection and query exchange join
+before attention. Sparse candidate selection uses a stable cutoff tie order
+across ranks. No scheduler or target-head precision change is involved.
+
+Qualified conditions: sixteen RTX PRO 6000 Blackwell GPUs, 600 W limits,
+memory-clock offset +6000, TP16/DCP16, text only, C1, no MTP, 4096-token prefill
+capacity, lossless CSF expert scales, and `--online-mxfp8-scope kda-input`.
+Three requests used 221 prompt tokens and 4096 completion tokens at temperature
+1, top-p 0.95, and disabled top-k filtering. The native package was
+`gb202-tp16-202611062201`.
+
+| Measurement | Result |
+|---|---:|
+| C1 decode, three runs | 57.756 / 57.714 / 57.678 tok/s |
+| Mean C1 decode | 57.716 tok/s |
+| KV capacity | 5,066,752 tokens |
+| Uncached 32K prefill, HTTP completion including one output token | 960.36 tok/s |
+| Native text, queued-request and 32K recall checks | 8 passed |
+
+Compiled TP16 component tests preserve exact outputs, empty-context behavior,
+source lifetimes, and allocation-stable replay with delayed ranks. With a
+16K prepared history capacity, query overlap reduces the DSA component time by
+12.8–14.0%. This component measurement does not establish the same reduction
+for the complete model's 1M history capacity: its fused indexer launches 188
+CTAs, compared with 16 in that component test.
+
+Research-only limits: concurrent-collective residency is checked during
+preparation but is not encoded as a native package admission requirement.
+The component test covers one row and one selection slice. Long-context
+indexer residency with concurrent query exchange, larger rows, and multiple
+slices require further qualification before general deployment. The target
+of approximately 64 tok/s has not been achieved.
 
 ## Implementation and qualification
 
@@ -13,8 +72,8 @@ SM120 GPUs with 96 GB each and the pinned target and draft checkpoints.
 |---|---|---|
 | Target and draft | Gated DSA, unrotated FP8 index queries, full-context MLA draft history, MoonViT images and shared cache transfers | Qualified at component level, including context-parallel selection and history transfers. |
 | Native package | Bounded preparation fixtures, deferred graph executables, compressed weight catalogs and parallel payload publication | Qualified through a TP16/C4/K7 BF16 package with 1024-token prefill: text, images, four concurrent images, concurrent arithmetic and 32K recall. |
-| Expert storage and dense precision | Lossless CSF expert scales; explicit `--online-mxfp8` conversion of the projections listed in the model guide | CSF is used by the native package. The MXFP8/4096 full-model configuration remains research-only until export and service tests complete. Target head, routers and vision retain checkpoint precision. |
-| TP16 communication | Ordinary preparation races DCP, phased exchange and fixed-neighbor ring gathers; selected geometry reaches capture | Qualified on sixteen RTX PRO 6000 Blackwell GPUs: nine ordinary tuner races and both bank origins across seven payload families, exact bytes, mixed replay, guards and counter rollover. Full-model performance with these changes is not yet qualified. |
+| Expert storage and dense precision | Lossless CSF expert scales; explicit `--online-mxfp8` conversion of the projections listed in the model guide | Target-only C1 qualification is recorded above. Compiled prefill and larger compiled model batches remain research-only. Target head, routers and vision retain checkpoint precision. |
+| TP16 communication | Ordinary preparation races DCP, phased exchange and fixed-neighbor ring gathers; selected geometry reaches capture | Qualified on sixteen RTX PRO 6000 Blackwell GPUs: ordinary tuner races, bank reuse, exact bytes, mixed replay, guards and counter rollover. Native C1 measurements above include these candidates; that combined result does not isolate each candidate's contribution. |
 
 The ring uses the existing channel storage and argument ABI. It relays one
 neighbor's byte payload per hop and preserves rank-ordered output placement.
@@ -62,7 +121,7 @@ installed files.
 | [Mutation regions](../tools/compiler-patches/torch-2.14.1-mutation-regions.patch) | Rebuild mutation-region IDs once after singleton auto-functionalization rewrites; other passes retain their checks. | Qualified: 20 CPU cases preserve FX, regions, outputs, aliases and stream/mempool metadata. |
 | [Scheduler membership](../tools/compiler-patches/torch-2.14.1-scheduler-membership.patch) | Query the existing ancestor, removed-operation and completed-operation sets directly during in-place reuse decisions. | Qualified: 40 CPU cases preserve decisions and real kernel argument bindings. |
 | [Event-triggered mutation checks](../tools/compiler-patches/torch-2.14.1-lazy-input-mutation-events.patch) | Defer input-version bookkeeping until event recording requires it; restart root tracing before recording and retain the complete existing checks on that trace. | Qualified: CPU mutation/restart cases and 18 CUDA event cases preserve FX, outputs, errors, side effects and event ordering. |
-| [No-clone custom-op decomposition](../tools/compiler-patches/torch-2.14.1-no-clone-custom-op-decomposition.patch) | Build the one-call replacement graph directly for eligible returnless custom operations; retain canonical fake execution, metadata and replacement handling. Tensor geometry must be static; existing FX integer operands remain runtime bindings. Views, clones, unsupported constants and symbol-producing cases retain canonical tracing. | Research-only for the complete model. Focused CPU and CUDA artifact tests pass; complete Kimi compilation has not completed with this patch. |
+| [No-clone custom-op decomposition](../tools/compiler-patches/torch-2.14.1-no-clone-custom-op-decomposition.patch) | Build the one-call replacement graph directly for eligible returnless custom operations; retain canonical fake execution, metadata and replacement handling. Tensor geometry must be static; existing FX integer operands remain runtime bindings. Views, clones, unsupported constants and symbol-producing cases retain canonical tracing. | Qualified for complete target-only C1 decode/resume compilation and native text serving. Compiled prefill and larger model batches remain unqualified. |
 
 The no-clone patch covers runtime integer handles, not just constant operands.
 CPU and CUDA checks compile, save, reload and rebind handles while preserving
@@ -70,7 +129,7 @@ caller mutations and physical alias coherence through writes to overlapping
 views. Canonical fake execution preserves layout checks and shape guards.
 Its full-model compilation-time benefit remains unqualified.
 
-Apply the three component-qualified patches in order after environment setup,
+Apply all four patches in order after environment setup,
 while that environment has no running preparation process:
 
 ```sh
@@ -78,19 +137,16 @@ k31_torch_site=$(.venv/bin/python -c 'import site; print(site.getsitepackages()[
 for k31_patch in \
   torch-2.14.1-mutation-regions.patch \
   torch-2.14.1-scheduler-membership.patch \
-  torch-2.14.1-lazy-input-mutation-events.patch
+  torch-2.14.1-lazy-input-mutation-events.patch \
+  torch-2.14.1-no-clone-custom-op-decomposition.patch
 do
   patch --fuzz=0 --directory "$k31_torch_site" -p1 \
     < "tools/compiler-patches/$k31_patch"
 done
 ```
 
-The fourth patch is separate for preparation qualification:
-
-```sh
-patch --fuzz=0 --directory "$k31_torch_site" -p1 \
-  < tools/compiler-patches/torch-2.14.1-no-clone-custom-op-decomposition.patch
-```
+These four patches are additional to the compatibility patches applied automatically
+by Ignition; the preparation command does not apply them itself.
 
 Keep a separate unpatched environment. Representative checks, run from the
 repository root, are:

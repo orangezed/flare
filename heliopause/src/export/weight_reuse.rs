@@ -276,6 +276,12 @@ impl Source {
                     "--reuse-weights requires the same recipe, checkpoint revision, and tensor-parallel size",
                 ));
             }
+            let scope = |value: &str| if value.is_empty() { "all".to_owned() } else { value.to_owned() };
+            if previous.online_mxfp8 != expected.online_mxfp8
+                || scope(&previous.online_mxfp8_scope) != scope(&expected.online_mxfp8_scope)
+            {
+                return Err(invalid("--reuse-weights requires the same online MXFP8 conversion scope"));
+            }
             return Ok(protection::verify(
                 &self.envelope,
                 &self.publishers,

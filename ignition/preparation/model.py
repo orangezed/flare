@@ -11,6 +11,7 @@ from types import MappingProxyType
 import torch
 
 from .execution import PreparedExecution
+from .frontend import DiagnosticAssets
 
 
 class PreparedModel(PreparedExecution):
@@ -104,6 +105,9 @@ class PreparedModel(PreparedExecution):
                 self.prepare_embedding_tables()
             config = {**self.server_config, **(options or {}), "bind": bind,
                       "template_defaults": {} if template_defaults is None else template_defaults}
+            assets = DiagnosticAssets(config["assets"])
+            self._close_resources = (*self._close_resources, assets)
+            config["assets"] = assets.descriptors
             manifest = self.manifest()
             torch.cuda.synchronize(self.device)
             try:

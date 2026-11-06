@@ -6,7 +6,7 @@
 import torch
 from b12x.attention import dense_mla
 
-from ignition.components.collectives import PreparedAllGather, PreparedLseReduceScatter
+from ignition.components.collectives import ConcurrentAllGather, PreparedAllGather, PreparedLseReduceScatter
 from ignition.components.dense_mla import PreparedDenseMLA
 from ignition.components.distributed_topk import PreparedDistributedTopK, selected_local_records
 from ignition.components.fp8_indexer import PreparedFP8Indexer
@@ -23,7 +23,7 @@ INDEX_HEADS, INDEX_DIM, TOPK = 32, 128, 2048
 class PreparedDSA:
     def __init__(self, weights, query_residual, key_input, weight_input, query, output, slots,
                  metadata, cache, index_cache, *, context, session, coordinator, name, workspace,
-                 buffers, allocator=None, eps=1e-5):
+                 buffers, allocator=None, eps=1e-5, overlap_query=False):
         self.metadata, self.query, self.output, self.slots = metadata, query, output, slots
         self.query_residual = query_residual
         self.eps = eps
@@ -34,6 +34,13 @@ class PreparedDSA:
         self.rows = rows
         self.step = min(rows, SELECTION_ROWS)
         device = query.device
+        self.overlap_query = bool(overlap_query)
+        self.query_transfers = []
+        if self.overlap_query:
+            if context is None or context.heads is context.candidates or not workspace.overlap:
+                raise ValueError("query overlap requires independent PCIe channels and an auxiliary stream")
+            if torch.cuda.get_device_properties(device).multi_processor_count < 128:
+                raise ValueError("two concurrent PCIe channels require at least 128 SMs")
 
         def allocate(key, shape, dtype):
             existing = buffers.get(key)
@@ -86,7 +93,7 @@ class PreparedDSA:
             if self.shards.world > 1:
                 merge = PreparedDistributedTopK(local, scores, selected,
                     world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
-                    session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor)
+                    session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor, workspace=workspace)
             gather = combine = None
             q, attended = query[begin:end], output[begin:end]
             if context is not None:
@@ -108,6 +115,8 @@ class PreparedDSA:
                 physical, counts, offsets, caps=caps,
                 scale=192**-.5, session=session, name=stage_name + ".sparse_attention", workspace=workspace, lse=lse)
             self.stages.append((begin, end, selector, merge, quantized, gather, attention, combine, lse))
+            self.query_transfers.append(ConcurrentAllGather(gather, stream=workspace.auxiliary_stream)
+                                        if self.overlap_query else None)
 
     def __call__(self):
         m, shards = self.metadata, self.shards
@@ -115,8 +124,11 @@ class PreparedDSA:
         self.key.copy_(torch.nn.functional.layer_norm(self.key_input.float(), (INDEX_DIM,),
             self.norm_weight.float(), self.norm_bias.float(), self.eps).to(self.key.dtype))
         self.stages[0][2].write_keys(self.key, self.slots)
-        for begin, end, selector, merge, quantized, gather, attention, combine, lse in self.stages:
+        for stage_index, (begin, end, selector, merge, quantized, gather, attention, combine, lse) in enumerate(self.stages):
             count = end - begin
+            if self.overlap_query:
+                quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
+                self.query_transfers[stage_index].start(quantized.view(count, -1))
             positions, pages = m.positions[begin:end], m.token_page_table[begin:end]
             expanded = pages[:, :, None] * 2 + self.page_halves
             self.pages[:count].copy_(torch.where(pages[:, :, None] >= 0, expanded, -1).flatten(1))
@@ -129,8 +141,11 @@ class PreparedDSA:
             self.physical[:count].copy_(physical)
             self.counts[:count].copy_(lengths)
             if gather is not None:
-                quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
-                gather(quantized.view(count, -1))
+                if self.overlap_query:
+                    self.query_transfers[stage_index].finish(quantized.view(count, -1), self.physical[:count])
+                else:
+                    quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
+                    gather(quantized.view(count, -1))
             attention()
             if combine is not None:
                 combine(attention.output, lse)

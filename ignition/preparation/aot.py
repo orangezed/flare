@@ -33,6 +33,7 @@ from .compilation import (DEFAULT_CACHE_ROOT, _INVOCATIONS, _OPTIONS, _Invocatio
                           _byte_storage, _storage_region, _lower_storage, _compiler_recursion)
 from .device_binding import bind_device, relocate_inductor, restore_device, restore_prepared_device
 from .host_memory import release_unused
+from .enqueue_order import compilation_options_identity
 
 _GUARD_LOCK = RLock()
 _GUARD_TENSOR_MODE = ContextVar("flare_guard_tensor_mode", default=None)
@@ -556,7 +557,7 @@ class ForwardCache:
         self.options = MappingProxyType(dict(_OPTIONS if options is None else options))
         properties = torch.cuda.get_device_properties(device)
         options = {name: value for name, value in self.options.items() if name != 'compile_threads'}
-        key = hashlib.sha256(pickle.dumps((namespace, options, torch_key(),
+        key = hashlib.sha256(pickle.dumps((namespace, compilation_options_identity(options), torch_key(),
             properties.name, properties.major, properties.minor, properties.multi_processor_count)))
         for source in (Path(__file__).resolve().parents[1], Path(flashinfer.__file__).resolve().parent):
             for path in sorted(source.rglob('*.py')):

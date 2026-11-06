@@ -25,7 +25,7 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
     checkpoints=(Checkpoint(alias="kimi-k3.1-pro", repository="moonshotai/Kimi-K3.1-Pro",
         revision="6d0a0202956796543364d666ab19c6ad1a494ee1", architecture="KimiK31ForConditionalGeneration",
         stored_bytes=1_561_217_377_280, device_bytes=1_496_756_986_630, draft_bytes=5_373_504_512),),
-    online_mxfp8=True, language_model_only=True,
+    online_mxfp8=True, online_mxfp8_scopes=("all", "kda-input"), language_model_only=True,
     # Gather threads are tuned independently; the attention components declare LSE's 512-thread geometry.
     b12x_environment=MappingProxyType({**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0"}),
     ranks=MappingProxyType({16: RankCosts(state_row_bytes=32_869_632, page_bytes=2_543_616,

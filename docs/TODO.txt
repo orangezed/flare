@@ -1,3 +1,7 @@
+[ ] Record the minimum SM residency required by concurrently captured PCIe
+    collectives in each rank's package requirements. Validate it before native
+    allocation; preparation-only admission does not protect loading elsewhere.
+
 [ ] Expose the selected deployment's rebuild metadata in flare inspect --json.
     Payload packages report rebuild: null even when DeploymentBody.rebuild is present.
 

@@ -87,6 +87,7 @@ class PreparationConfig:
     speculative_graph_budget: int = 64
     # Store eligible attention, shared-expert, latent MoE, and DSpark projections as MXFP8.
     online_mxfp8: bool = False
+    online_mxfp8_scope: str = "all"
     # Shared experts overlap routing and routed experts on an auxiliary stream.
     stream_overlap: bool = True
     # Ranks share each page's context (decode context parallel over every rank, KV interleave 1).
@@ -95,6 +96,10 @@ class PreparationConfig:
     vision: bool = True
 
     def __post_init__(self):
+        if self.online_mxfp8_scope not in ("all", "kda-input"):
+            raise ValueError("online MXFP8 scope must be all or kda-input")
+        if not self.online_mxfp8 and self.online_mxfp8_scope != "all":
+            raise ValueError("an MXFP8 conversion scope requires online MXFP8")
         if self.compile_kinds is not None:
             allowed = {"prefill", "scored_prefill", "decode", "resume", "vision", "speculative"}
             if (not self.compile_decoder or not isinstance(self.compile_kinds, tuple) or not self.compile_kinds
@@ -193,7 +198,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         headers = [shard.header_sha256 for shard in manifest.shards]
     with package_storage.transient():
         peers = None if group is None or package_storage.peer_storage is None else (group, package_storage.peer_storage)
-        weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, online_mxfp8=config.online_mxfp8,
+        weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, online_mxfp8=config.online_mxfp8, online_mxfp8_scope=config.online_mxfp8_scope,
                                     draft_checkpoint=config.draft_checkpoint, peers=peers,
                                     vision=config.vision)
         if weights.config.model_type == "kimi_k31":
@@ -282,7 +287,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity,
-            workload_schema="kimi3", numerical_policy="default", coordinator=coordinator,
+            workload_schema="kimi3", numerical_policy=("mxfp8-kda-input" if config.online_mxfp8 and config.online_mxfp8_scope == "kda-input" else "default"), coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
         session.__enter__()
         register_benchmark_state(session, pool.reserved_backing, storage=pool.reserved_backing,

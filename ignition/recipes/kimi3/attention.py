@@ -101,7 +101,8 @@ class PreparedMLA:
             self.sparse = PreparedDSA(weights, self.query_norm, self.local[:, index_begin:index_begin + 128],
                 self.local[:, index_begin + 128:index_begin + 160], self.absorbed, self.attended, self.slots,
                 metadata, cache, index_cache, context=context, session=session, coordinator=coordinator,
-                name=name, workspace=workspace, buffers=buffers.setdefault("selection", {}), allocator=allocator, eps=eps)
+                name=name, workspace=workspace, buffers=buffers.setdefault("selection", {}), allocator=allocator, eps=eps,
+                overlap_query=mode == "decode" and tokens == 1 and context is not None and workspace.overlap)
         elif world == 1:
             # Every rank holds every record: attend with this rank's heads; b12x quantizes the BF16 query.
             self.lengths = torch.zeros_like(metadata.lengths)
