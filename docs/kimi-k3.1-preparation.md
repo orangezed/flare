@@ -38,8 +38,8 @@ across ranks. No scheduler or target-head precision change is involved.
 Qualified conditions: sixteen RTX PRO 6000 Blackwell GPUs, 600 W limits,
 memory-clock offset +6000, TP16/DCP16, text only, C1, no MTP, 4096-token prefill
 capacity, lossless CSF expert scales, and `--online-mxfp8-scope kda-input`.
-Three requests used 221 prompt tokens and 4096 completion tokens at temperature
-1, top-p 0.95, and disabled top-k filtering. The native package was
+Three requests used 221 prompt tokens and 4096 completion tokens with low
+reasoning effort, temperature 1, top-p 0.95, and disabled top-k filtering. The native package was
 `gb202-tp16-202611070512`, prepared from Flare `51fbb0c3` and FlashInfer
 `7b9407038`, with staged sparse-context transfer and output-sharded latent
 projection during prefill.
@@ -149,11 +149,46 @@ the target head remains unchanged. The default `mtp` method retains K3.1 DSpark.
 
 Qualified: complete BF16 draft component graphs passed on TP1 and TP16 with
 actual checkpoint weights, two eight-row blocks, ring wrap, position 500001,
-partial/empty batches, poisoned scratch and repeated compiled replay. Native
-DFlash2 target-plus-draft acceptance and serving performance remain research-only.
+partial/empty batches, poisoned scratch and repeated compiled replay.
 The standalone check is `tools/kimi31_draft_probe.py`; its `--help` lists the
 required checkpoint and output paths. These component timings do not establish
 whole-model throughput. Vision row-sharding changes are not included.
+
+Native C1 DFlash2 and replicated BF16 vision are qualified in package
+`gb202-tp16-202611070736`, using Flare `9e70bde7` and FlashInfer `7b9407038`.
+Conditions match the target-only table above, with seven prepared drafts,
+adaptive verification, eight target-token capacity and one active image request.
+Target KDA inputs use MXFP8; the draft body and shared vocabulary head remain
+BF16. The later tuning-identity change does not alter model arithmetic.
+
+| Measurement | Result |
+|---|---:|
+| C1 decode, three runs | 79.01 / 80.23 / 82.88 tok/s |
+| Mean C1 decode | 80.71 tok/s |
+| Mean uncached 32K prefill, one output token | 1965.67 tok/s |
+| KV capacity | 1,777,664 tokens |
+| Native text/queue/recall checks | 8 passed |
+| Native image checks | 8 passed |
+
+The image checks cover replacement, cached image prefixes, ordered image pairs,
+an image-conditioned chunk boundary, and 256 through 65,536 patch capacities.
+The largest image produces 16,384 visual tokens. Native request capacity is
+1,048,576 tokens; this qualification did not test a full-length request.
+The decoder offered about 2.05–2.48 draft positions per progressing round and
+accepted 0.97–1.05, so the prepared K7 maximum does not mean every round verifies
+seven drafts. Wider rounds measured 24.70–25.67 ms by maximum rank-local CUDA
+events. The native throughput gain over the target-only package is 39.7%.
+
+Vision must remain compiled in this preparation: eager 65,536-patch position
+interpolation requested a 1 GiB temporary and exhausted VRAM in the combined
+model. Ordinary forward compilation preserves the outputs while avoiding that
+temporary. The compiled encoder matched the unchanged eager encoder bitwise;
+the native validation/publication wrapper published identical feature columns.
+Checks covered all capacities, repeated replay and a non-dyadic 250×262 patch
+grid. Their warmed peak was 288.25 MiB;
+preparing the complete publication catalog added at most 448.01 MiB in the
+component fixture. `tools/kimi31_vision_memory_probe.py --publication` exercises
+that path on one exposed GPU without loading the text decoder.
 
 Use ordinary export when adding a draft or when kernel preparation needs a
 weight layout absent from the cached package. `--reuse-weights` requires every

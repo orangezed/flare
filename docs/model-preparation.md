@@ -1060,6 +1060,36 @@ when the flag is omitted. `--no-mtp` omits draft weights
 and history; loading an existing package with `--mtp-draft-tokens 0` retains
 the prepared layout and selects ordinary execution.
 
+### DFlash2 with images, one concurrent request
+
+This configuration converts only the fused KDA input projections to MXFP8.
+The target vocabulary head, DFlash2 body and image encoder retain BF16. Keep
+vision compilation enabled: its fused forward avoids a large position-embedding
+temporary that can exhaust VRAM when target, draft and vision weights coexist.
+
+```sh
+.venv/bin/ignition export kimi-k3.1-pro --gpus 0-15 \
+  --max-concurrency 1 --image-concurrency 1 --prefill-chunk-size 4096 \
+  --speculative-method dflash2 --mtp-draft-tokens 7 \
+  --speculative-token-capacity 8 \
+  --online-mxfp8 --online-mxfp8-scope kda-input \
+  --collective-tuning static --autotune-effort default --compile-workers 32 \
+  --compile-kinds decode,resume,speculative,vision
+
+./flare/target/release/flare run moonshotai/Kimi-K3.1-Pro \
+  --gpus 0-15 --max-concurrency 1 --mtp-draft-tokens 7 \
+  --mtp-adaptive-verification --prefill-graph-capacities 128,4096 \
+  --kv-cache-limit memory --host 127.0.0.1 --port 8170
+```
+
+On sixteen RTX PRO 6000 Blackwell GPUs at 600 W with memory offset +6000,
+this configuration measured 80.71 tok/s mean C1 decode and 1965.67 tok/s
+uncached 32K prefill, with 1,777,664 KV tokens. Decode used low reasoning effort;
+the raw prefill request generated one output token. Both used temperature 1,
+top-p 0.95 and no top-k filter. The [qualification record](kimi-k3.1-preparation.md#gathered-sparse-prefill-and-mla-dflash2)
+identifies the package, three-run measurements and image checks. Larger
+concurrency has not been qualified for this DFlash2 configuration.
+
 Sampling defaults are temperature 1 and top-p 0.95 with no top-k filter.
 Reasoning defaults to `max`. Preserve assistant reasoning and tool calls in
 conversation history. The checkpoint encoder also accepts `low`, `medium`
