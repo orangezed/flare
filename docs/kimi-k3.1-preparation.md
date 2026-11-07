@@ -43,34 +43,32 @@ memory-clock offset +6000, TP16/DCP16, text only, C1, no MTP, 4096-token prefill
 capacity, lossless CSF expert scales, and `--online-mxfp8-scope kda-input`.
 Three requests used 221 prompt tokens and 4096 completion tokens with low
 reasoning effort, temperature 1, top-p 0.95, and disabled top-k filtering. The native package was
-`gb202-tp16-202611071135`, prepared from Flare `b0875e23` and FlashInfer
-`d9fd6ffde`, with staged sparse-context transfer and output-sharded latent
+`gb202-tp16-202611071438`, prepared from Flare `d1b1a87a` and FlashInfer
+`24c6e49f6`, with staged sparse-context transfer and output-sharded latent
 projection during prefill.
 
 | Measurement | Result |
 |---|---:|
-| C1 decode, three runs | 59.663 / 59.631 / 59.626 tok/s |
-| Mean C1 decode | 59.640 tok/s |
+| C1 decode, three runs | 59.527 / 59.618 / 59.617 tok/s |
+| Mean C1 decode | 59.587 tok/s |
 | KV capacity | 4,601,856 tokens |
-| Uncached 32K prefill, three runs | 2113.47 / 2090.34 / 2106.66 tok/s |
-| Mean uncached 32K prefill, including one output token | 2103.49 tok/s |
+| Uncached 32K prefill, three runs | 2353.29 / 2330.24 / 2357.24 tok/s |
+| Mean uncached 32K prefill, including one output token | 2346.93 tok/s |
 | Native text, queued-request and 32K recall checks | 8 passed |
 
 The run retained checkpoint expert scales losslessly in CSF form and used no
 learned draft. GPU clock settings were checked before measurement. No other
 model or preparation job ran during timing; dashboard polling processes were
-not running. Under the same conditions, package `gb202-tp16-202611070938`
-measured 58.660 tok/s decode and 1976.71 tok/s prefill. Deferring the shared
-expert until routing inputs are projected, together with autotuned IslandRS
-thread counts, improved decode by 1.67% and prefill by 6.4%. This native
-comparison does not isolate those two changes. KV capacity decreased by
-57,344 tokens (1.23%); fixed device-allocation capacities are unchanged, but
-loaded execution resources leave less cache memory on the limiting rank.
-The exact cause of that allocation difference has not been isolated.
+not running. Under the same conditions, package `gb202-tp16-202611071135`
+measured 59.640 tok/s decode and 2103.49 tok/s prefill. Allowing the collective
+tuner to choose local push and cross-island scatter/gather improved prefill by
+11.6%; decode differed by -0.09%, which does not establish a decode improvement.
+KV capacity was unchanged. This comparison does not isolate the two transport
+changes from each other.
 Raw measurements are in
-`/data/kimi31-support/bench-island-tuning-moe-c1/results.json` and
-`/data/kimi31-support/bench-island-tuning-moe-32k/results.json` on the measurement
-host. Native functional results are in `checks-island-tuning-moe.json` in the
+`/data/kimi31-support/bench-island-transport-c1/results.json` and
+`/data/kimi31-support/bench-island-transport-32k/results.json` on the measurement
+host. Native functional results are in `checks-island-transport.json` in the
 same parent directory.
 
 The pinned FlashInfer additionally implements pushed transfers within each
@@ -79,8 +77,8 @@ reuse the existing buffers and preserve the reduction's arithmetic order.
 Qualified component tests cover mixed protocols, poisoned storage, in-place
 outputs, nonfinite values, delayed ranks and generation rollover. The fixed-grid
 14 MiB race measured 1.190 ms with local push and cross-island scatter/gather,
-versus 1.447 ms with pull, at sixteen blocks and 1024 threads. Full-model
-performance with these transport variants remains research-only.
+versus 1.447 ms with pull, at sixteen blocks and 1024 threads. The native
+qualification above includes these transport variants.
 
 Compiled TP16 component tests preserve exact outputs, empty-context behavior,
 source lifetimes, and allocation-stable replay with delayed ranks. With a
