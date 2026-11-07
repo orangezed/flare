@@ -101,6 +101,35 @@ Native full-length requests, larger rows, and multiple concurrent selection
 slices require further qualification before general deployment. The target
 of approximately 64 tok/s has not been achieved.
 
+## Collective participation tuning
+
+Implemented: TP16 reductions use one fixed physical CUDA grid per ordered
+channel. The tuner selects the number of participating CTAs, thread count,
+and existing push/pull/scatter implementation for each message shape.
+Automatic grids fit one CTA per SM on every participating device, up to 64.
+Explicit launch overrides retain their declared participation.
+
+Every physical CTA advances the data-buffer generation. Only participating
+CTAs advance their communication epoch. Separating these counters keeps
+buffer selection consistent and prevents stale flags from satisfying a wait
+when an inactive CTA rejoins after a counter rollover. Reduction order and
+BF16 conversion boundaries are unchanged. Preparation tuning caches are
+invalidated; existing native packages retain their captured kernels and storage.
+
+Qualified: 109 CPU tests, five TP16 GPU tests, and ordinary Ignition/VMM
+preparation with cached selection. Coverage includes exact changing inputs,
+in-place output, tails, nonfinite values, delayed ranks, queued shape changes,
+long-inactive CTAs, and counter rollover. On sixteen RTX PRO 6000 Blackwell
+GPUs, the VMM preparation check selected 8 active CTAs for 112 KiB, 32 for
+1.75 MiB, and 64 for 14 MiB. The physical grid remained 64 CTAs.
+
+Native full-model performance with this tuning remains research-only until
+the exported package completes qualification. Component selections and raw
+checks are under `/data/kimi31-support/island-active-api/` and
+`island-active-api-cached/` on the measurement host. GPU test logs are
+`island-active-tuning-gpu-r2.log` and `island-active-protocol-gpu.log` in the
+same parent directory.
+
 ## Router and latent-projection overlap
 
 Implemented: Kimi's compact MoE routing path computes the latent-down projection
