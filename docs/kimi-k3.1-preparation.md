@@ -98,6 +98,46 @@ Native full-length requests, larger rows, and multiple concurrent selection
 slices require further qualification before general deployment. The target
 of approximately 64 tok/s has not been achieved.
 
+## Router and latent-projection overlap
+
+Implemented: Kimi's compact MoE routing path computes the latent-down projection
+on the existing auxiliary stream while the router computes FP32 logits on the
+main stream. Both read the same input. The projections join before the shared
+expert starts and before the collective consumes their outputs.
+`ConcurrentProjectionChain` declares the parallel plans and their scratch
+requirements. Weights, arithmetic, kernel tuning, and package compatibility
+are unchanged. The path applies to routing capacities of one through eight
+rows when stream overlap is enabled; larger prefill capacities keep their
+existing execution order.
+
+Qualified component conditions: one checkpoint MoE layer, TP16 on sixteen
+RTX PRO 6000 Blackwell GPUs at 600 W with memory offset +6000, CSF/A16 experts,
+BF16 projections, FP32 router output, and three seeded input tensors.
+Serial and overlapping schedules use the same tuned plans. Complete compiled
+MoE calls include the output reduction and alternate in forward/reverse order.
+Scratch is poisoned between correctness runs, outputs match bitwise, and
+allocation counters remain unchanged during replay.
+
+| Rows | Serial projections | Overlapping projections | Change |
+|---|---:|---:|---:|
+| 1 | 93.488 µs | 90.471 µs | -3.23% |
+| 8 | 192.708 µs | 186.998 µs | -2.96% |
+
+These are mean maximum-rank event intervals for the component. Full-model
+performance with this overlap remains research-only until native qualification
+completes. Raw samples are in
+`/data/kimi31-support/moe-projection-recipe-r2-c{1,8}/samples.json` on the
+measurement host. Reproduce the component check with sixteen idle GPUs:
+
+```sh
+.venv/bin/python -m qualify.kimi_moe_projection \
+  --checkpoint /path/to/Kimi-K3.1-Pro --rows 1 \
+  --output /tmp/kimi-moe-projections-c1
+```
+
+Use a separate output directory for `--rows 2`, `--rows 4`, or `--rows 8`.
+The preparation configuration can be selected with `--config PATH`.
+
 ## Gathered sparse prefill and MLA DFlash2
 
 Implemented: sparse prefill capacities of at least 4096 query rows pack each

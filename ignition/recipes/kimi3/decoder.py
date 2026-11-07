@@ -13,6 +13,7 @@ from ignition.components.collectives import PreparedChunkedAllGather, PreparedCh
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch
+from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.recurrent import DeltaMetadata, _commit_convolution
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.components.kda_speculation import PreparedKDAReplay
@@ -239,11 +240,19 @@ class PreparedLatentMoE:
                                   buffers=buffers.setdefault("shared", {}), allocator=allocator,
                                   workspace=workspace, parallel_plans=(self.router_projection.plan, self.down.plan,
                                       self.experts.plan, self.up.plan) if self.route_gather is not None else ())
+        self.concurrent_down = (ConcurrentProjectionChain((self.down,),
+            parallel_plans=(self.router_projection.plan,), session=session, workspace=workspace)
+            if self.route_gather is not None and workspace.overlap else None)
 
     def __call__(self, source):
+        if self.concurrent_down is not None:
+            self.concurrent_down.start(source)
         logits = self.router_projection(source)
         if self.route_gather is not None:
-            self.down(source)
+            if self.concurrent_down is not None:
+                self.concurrent_down.finish(source, logits)
+            else:
+                self.down(source)
             # Finish the compact projections before the shared-expert grid can
             # contend with them; its work overlaps the gather and routed experts.
             if self.shared.concurrent:
