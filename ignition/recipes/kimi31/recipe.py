@@ -6,7 +6,7 @@
 from dataclasses import replace
 from types import MappingProxyType
 
-from ignition.recipes.declaration import Checkpoint, RankCosts, SamplingDefaults, SamplingRange
+from ignition.recipes.declaration import Checkpoint, RankCosts, SamplingDefaults, SamplingRange, SpeculativeMethod
 from ignition.recipes.kimi3.config import LATENT_DSPARK_REPOSITORY, LATENT_DSPARK_REVISION
 from ignition.recipes.kimi3.recipe import RECIPE as KIMI3, prepare_variant
 
@@ -14,6 +14,12 @@ from ignition.recipes.kimi3.recipe import RECIPE as KIMI3, prepare_variant
 def prepare(snapshot, plan, **kwargs):
     from . import bootstrap
 
+    if plan.speculation is not None and plan.speculation.method == "dflash2":
+        from .dflash_config import REPOSITORY, REVISION
+        return prepare_variant(snapshot, plan, bootstrap=bootstrap, draft_repository=REPOSITORY,
+            draft_revision=REVISION, draft_directory="dflash2", **kwargs)
+    if plan.speculation is not None and plan.speculation.draft_head_quantization is not None:
+        raise ValueError("Kimi draft head conversion requires --speculative-method dflash2")
     return prepare_variant(snapshot, plan, bootstrap=bootstrap, draft_repository=LATENT_DSPARK_REPOSITORY,
                            draft_revision=LATENT_DSPARK_REVISION, **kwargs)
 
@@ -26,6 +32,11 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
         revision="6d0a0202956796543364d666ab19c6ad1a494ee1", architecture="KimiK31ForConditionalGeneration",
         stored_bytes=1_561_217_377_280, device_bytes=1_496_756_986_630, draft_bytes=5_373_504_512),),
     online_mxfp8=True, online_mxfp8_scopes=("all", "kda-input"), language_model_only=True,
+    draft_head_quantizations=("mxfp8", "nvfp4"),
+    speculation=replace(KIMI3.speculation, method="mtp"),
+    speculative_methods=MappingProxyType({"dflash2": SpeculativeMethod(MappingProxyType({
+        16: RankCosts(state_row_bytes=35_450_112, page_bytes=2_174_976, graph_bytes=9 << 29, page_tokens=128*16),
+    }), draft_bytes=5_569_622_016)}),
     # Gather threads are tuned independently; the attention components declare LSE's 512-thread geometry.
     b12x_environment=MappingProxyType({**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0"}),
     ranks=MappingProxyType({16: RankCosts(state_row_bytes=32_869_632, page_bytes=2_543_616,

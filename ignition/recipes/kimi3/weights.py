@@ -36,7 +36,7 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False, online_mxfp8_scope="all",
-             peers=None, vision=True):
+             peers=None, vision=True, draft_head_quantization=None):
         """``peers``, a host's Gloo group and peer storage, reads column-sharded projections once per host.
 
         ``draft_checkpoint`` loads the declared sliding-window or full-context MLA DSpark model.
@@ -62,8 +62,15 @@ class ModelWeights:
             from .dspark_weights import DraftWeights
 
             config = replace(config, draft=DSparkConfig.load(draft_checkpoint, config))
+            from ignition.recipes.kimi31.dflash_config import DFlash2Config
+
             extra = {}
-            if isinstance(config.draft, LatentDSparkConfig):
+            if isinstance(config.draft, DFlash2Config):
+                from ignition.recipes.kimi31.dflash_weights import DraftWeights
+                extra["draft_head_quantization"] = draft_head_quantization
+            elif draft_head_quantization is not None:
+                raise ValueError("Kimi draft head conversion requires the MLA DFlash2 draft")
+            elif isinstance(config.draft, LatentDSparkConfig):
                 from .latent_dspark import DraftWeights
 
                 extra["target_embedding"] = embedding

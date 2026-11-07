@@ -46,6 +46,10 @@ for _container, _fields in (
       'mlp', 'attention_conv', 'mlp_conv')),
     ('ignition.components.dflash2_weights.DraftWeights',
      ('projection', 'hidden_norm', 'context_kv', 'norm', 'layers', 'selector')),
+    ('ignition.recipes.kimi31.dflash_weights.LayerWeights',
+     ('attention', 'input_norm', 'post_attention_norm', 'mlp', 'attention_conv', 'mlp_conv')),
+    ('ignition.recipes.kimi31.dflash_weights.DraftWeights',
+     ('projection', 'hidden_norm', 'context_kv', 'norm', 'layers', 'selector', 'head')),
     # Recipe weight containers reached inside a declared layer/component.
     ('ignition.recipes.deepseek41.weights.ExpertWeights',
      ('router', 'correction', 'experts', 'shared', 'vision_correction')),
