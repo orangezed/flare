@@ -23,7 +23,7 @@ Changing it requires preparing the corresponding weight representation; do not
 use `--reuse-weights` with a package prepared under a different scope. Omitted
 scope metadata in an existing package means `all`.
 
-## C1 query-exchange qualification
+## Native target-only qualification
 
 The FlashInfer revision pinned by this branch includes the TP16 recursive
 gather used for C1 query exchange. The compiler patches described below are
@@ -33,46 +33,56 @@ Implemented: single-row decode exchanges the absorbed query on an auxiliary
 stream while sparse selection runs on the main stream. Native-call enqueue
 ordering survives whole-forward compilation; selection and query exchange join
 before attention. Sparse candidate selection uses a stable cutoff tie order
-across ranks. No scheduler or target-head precision change is involved.
+across ranks. The FP8 indexer retains its captured grid and scratch capacity,
+but only blocks with live pages participate in scoring and merging. One live
+block writes its result directly. No scheduler or target-head precision change
+is involved.
 
 Qualified conditions: sixteen RTX PRO 6000 Blackwell GPUs, 600 W limits,
 memory-clock offset +6000, TP16/DCP16, text only, C1, no MTP, 4096-token prefill
 capacity, lossless CSF expert scales, and `--online-mxfp8-scope kda-input`.
 Three requests used 221 prompt tokens and 4096 completion tokens with low
 reasoning effort, temperature 1, top-p 0.95, and disabled top-k filtering. The native package was
-`gb202-tp16-202611070512`, prepared from Flare `51fbb0c3` and FlashInfer
-`7b9407038`, with staged sparse-context transfer and output-sharded latent
+`gb202-tp16-202611070938`, prepared from Flare `a01f5348` and FlashInfer
+`dfca59c0d`, with staged sparse-context transfer and output-sharded latent
 projection during prefill.
 
 | Measurement | Result |
 |---|---:|
-| C1 decode, three runs | 57.802 / 57.784 / 57.785 tok/s |
-| Mean C1 decode | 57.791 tok/s |
+| C1 decode, three runs | 58.682 / 58.688 / 58.610 tok/s |
+| Mean C1 decode | 58.660 tok/s |
 | KV capacity | 4,659,200 tokens |
-| Uncached 32K prefill, three runs | 1981.07 / 1965.70 / 1980.25 tok/s |
-| Mean uncached 32K prefill, including one output token | 1975.68 tok/s |
+| Uncached 32K prefill, three runs | 1984.19 / 1960.96 / 1984.97 tok/s |
+| Mean uncached 32K prefill, including one output token | 1976.71 tok/s |
 | Native text, queued-request and 32K recall checks | 8 passed |
 
 The run retained checkpoint expert scales losslessly in CSF form and used no
 learned draft. GPU clock settings were checked before measurement. No other
 model or preparation job ran during timing; dashboard polling processes were
-not running. Under the same conditions, package `gb202-tp16-202611070235`
-measured 1724.61 tok/s prefill and 57.812 tok/s decode. The combined projection
-and reduction changes improved prefill by 14.6%; decode remained within 0.04%.
-This comparison does not isolate the two changes. The distributed-selection
-build without staged context measured 960.36 tok/s on this 32K workload.
+not running. Under the same conditions, package `gb202-tp16-202611070512`
+measured 57.791 tok/s decode and 1975.68 tok/s prefill. The build with live-page
+participation improved decode by 1.50%; prefill remained within 0.06%, with
+identical KV capacity. Raw measurements are in
+`/data/kimi31-support/bench-indexer-live-ctas-c1/results.json` and
+`/data/kimi31-support/bench-indexer-live-ctas-32k/results.json` on the measurement
+host. Native functional results are in `checks-indexer-live-ctas.json` in the
+same parent directory.
 
 Compiled TP16 component tests preserve exact outputs, empty-context behavior,
 source lifetimes, and allocation-stable replay with delayed ranks. With a
 16K prepared history capacity, query overlap reduces the DSA component time by
-12.8–14.0%. This component measurement does not establish the same reduction
-for the complete model's 1M history capacity: its fused indexer launches 188
-CTAs, compared with 16 in that component test.
+12.8–14.0%. The indexer participation change additionally passed 21 focused
+GPU cases, including changing row lengths, physical and logical IDs, poisoned
+scratch, and both merge protocols. A compiled TP16 DSA component with 1M
+prepared history capacity measured 124.70 to 111.91 microseconds at 1024 live
+tokens and 131.30 to 119.65 microseconds at 4224 tokens. Its 1M-token interval
+was 147.79 versus 147.37 microseconds. These component intervals include query
+exchange and selection but do not represent complete model steps.
 
 Research-only limits: concurrent-collective residency is checked during
 preparation but is not encoded as a native package admission requirement.
-The component test covers one row and one selection slice. Long-context
-indexer residency with concurrent query exchange, larger rows, and multiple
+The component test covers one row and one selection slice through 1M records.
+Native full-length requests, larger rows, and multiple concurrent selection
 slices require further qualification before general deployment. The target
 of approximately 64 tok/s has not been achieved.
 
@@ -328,8 +338,9 @@ unlocked clocks (active frequencies were not recorded), the 32-row 512 KiB-per-r
 
 ## Full-model validation and host continuation
 
-The MXFP8/4096 configuration is implemented but its serving speed and native KV
-capacity remain unqualified. A TP16/C4/K7 diagnostic export uses the ordinary
+The TP16/C4 configuration with all-scope MXFP8 and 4096-token prefill is
+implemented but its serving speed and native KV capacity remain unqualified.
+A TP16/C4/K7 diagnostic export uses the ordinary
 Ignition command with `--online-mxfp8`, `--prefill-chunk-size 4096`, four image
 slots and `--no-compile`. This flag skips complete-forward compilation;
 kernels are still prepared and CUDA graphs are captured for native serving.
