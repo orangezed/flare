@@ -43,32 +43,35 @@ memory-clock offset +6000, TP16/DCP16, text only, C1, no MTP, 4096-token prefill
 capacity, lossless CSF expert scales, and `--online-mxfp8-scope kda-input`.
 Three requests used 221 prompt tokens and 4096 completion tokens with low
 reasoning effort, temperature 1, top-p 0.95, and disabled top-k filtering. The native package was
-`gb202-tp16-202611071438`, prepared from Flare `d1b1a87a` and FlashInfer
+`gb202-tp16-202611071552`, prepared from Flare `b3ecc8d1` and FlashInfer
 `24c6e49f6`, with staged sparse-context transfer and output-sharded latent
 projection during prefill.
 
 | Measurement | Result |
 |---|---:|
-| C1 decode, three runs | 59.527 / 59.618 / 59.617 tok/s |
-| Mean C1 decode | 59.587 tok/s |
-| KV capacity | 4,601,856 tokens |
-| Uncached 32K prefill, three runs | 2353.29 / 2330.24 / 2357.24 tok/s |
-| Mean uncached 32K prefill, including one output token | 2346.93 tok/s |
+| C1 decode, three runs | 59.714 / 59.800 / 59.795 tok/s |
+| Mean C1 decode | 59.770 tok/s |
+| KV capacity | 4,659,200 tokens |
+| Uncached 32K prefill, three runs | 2359.94 / 2337.35 / 2363.15 tok/s |
+| Mean uncached 32K prefill, including one output token | 2353.48 tok/s |
 | Native text, queued-request and 32K recall checks | 8 passed |
 
 The run retained checkpoint expert scales losslessly in CSF form and used no
-learned draft. GPU clock settings were checked before measurement. No other
+learned draft. No other
 model or preparation job ran during timing; dashboard polling processes were
-not running. Under the same conditions, package `gb202-tp16-202611071135`
-measured 59.640 tok/s decode and 2103.49 tok/s prefill. Allowing the collective
-tuner to choose local push and cross-island scatter/gather improved prefill by
-11.6%; decode differed by -0.09%, which does not establish a decode improvement.
-KV capacity was unchanged. This comparison does not isolate the two transport
-changes from each other.
+not running. Under the same conditions, package `gb202-tp16-202611071438`,
+with serial router/latent projections and the same FlashInfer revision,
+measured 59.587 tok/s decode and 2346.93 tok/s prefill. The differences are
++0.31% and +0.28%, respectively. These small changes do not establish a
+material whole-model speedup from projection overlap. Requests used identical
+inputs and sampling settings, but generated token sequences differed; routed
+expert traffic therefore need not match. Loaded KV capacity increased by
+57,344 tokens; the cause of the small execution-resource allocation difference
+has not been isolated.
 Raw measurements are in
-`/data/kimi31-support/bench-island-transport-c1/results.json` and
-`/data/kimi31-support/bench-island-transport-32k/results.json` on the measurement
-host. Native functional results are in `checks-island-transport.json` in the
+`/data/kimi31-support/bench-router-latent-overlap-c1/results.json` and
+`/data/kimi31-support/bench-router-latent-overlap-32k/results.json` on the measurement
+host. Native functional results are in `checks-router-latent-overlap.json` in the
 same parent directory.
 
 The pinned FlashInfer additionally implements pushed transfers within each
@@ -123,9 +126,12 @@ allocation counters remain unchanged during replay.
 | 1 | 93.488 µs | 90.471 µs | -3.23% |
 | 8 | 192.708 µs | 186.998 µs | -2.96% |
 
-These are mean maximum-rank event intervals for the component. Full-model
-performance with this overlap remains research-only until native qualification
-completes. Raw samples are in
+These are mean maximum-rank event intervals for the component. Native functional
+qualification passed, but the component gain did not translate into a comparable
+whole-model throughput increase under the conditions above. The exported graph
+retains independent router and latent branches in all 92 MoE layers on all 16
+ranks. Different latent-projection precision settings and GPU topologies remain
+unqualified for this overlap. Raw component samples are in
 `/data/kimi31-support/moe-projection-recipe-r2-c{1,8}/samples.json` on the
 measurement host. Reproduce the component check with sixteen idle GPUs:
 
