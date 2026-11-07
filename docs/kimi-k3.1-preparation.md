@@ -1,6 +1,6 @@
 # Kimi K3.1 preparation
 
-Use Flare's `k31` branch with the FlashInfer revision pinned in `pyproject.toml`
+Use [Flare's `k31` branch](https://github.com/voipmonitor/flare/tree/k31) with the FlashInfer revision pinned in `pyproject.toml`
 and `uv.lock`. The matching kernel source is published in
 [`local-inference-lab/flashinfer`, branch `k31`](https://github.com/local-inference-lab/flashinfer/tree/k31).
 The [model preparation guide](model-preparation.md#kimi-k31-pro) provides the
@@ -25,11 +25,9 @@ scope metadata in an existing package means `all`.
 
 ## C1 query-exchange qualification
 
-The `astra/k31-query-overlap` Flare branch uses the companion FlashInfer branch
-`astra/k31-recursive-ready` (`762ada1fea4d9d2e544b768e3935da0906693cd1`). The
-repository lockfile still selects the earlier dependency baseline; install or
-explicitly select the companion checkout when reproducing this configuration.
-The compiler patches described below are also required.
+The FlashInfer revision pinned by this branch includes the TP16 recursive
+gather used for C1 query exchange. The compiler patches described below are
+also required; an unpatched preparation environment is not the qualified stack.
 
 Implemented: single-row decode exchanges the absorbed query on an auxiliary
 stream while sparse selection runs on the main stream. Native-call enqueue
@@ -65,6 +63,40 @@ The component test covers one row and one selection slice. Long-context
 indexer residency with concurrent query exchange, larger rows, and multiple
 slices require further qualification before general deployment. The target
 of approximately 64 tok/s has not been achieved.
+
+## Gathered sparse prefill and MLA DFlash2
+
+Implemented: sparse prefill capacities of at least 4096 query rows gather
+committed FP8 latent and index records, distribute selection rows across ranks,
+and exchange final selected positions. Smaller capacities retain distributed
+selection: full-history peer copies regress short chunks at long contexts.
+The full-context slabs require 708 MiB per rank at a 1,048,576-token capacity.
+
+Qualified: TP16 component checks cover 128 and 4096 rows, history through
+1,048,576 tokens, partial and empty inputs, poisoned scratch, allocation stability,
+compiled replay at 128 rows, and cross-rank selected-ID agreement. At 4096 rows
+and 32K history the attention component measured 7.63 ms versus 84.4 ms with
+distributed selection. Native full-model prefill performance remains unqualified.
+
+Implemented: `--speculative-method dflash2` selects
+`RadixArk/Kimi-K3.1-Dflash2-Preview` at its pinned recipe revision. Accepted
+context is stored in bounded latent rings; rejected proposals do not overwrite
+it. `--online-mxfp8-scope kda-input` leaves the draft body in BF16.
+`--draft-head-quantization mxfp8` optionally converts only the proposal head;
+the target head remains unchanged. The default `mtp` method retains K3.1 DSpark.
+
+Qualified: complete BF16 draft component graphs passed on TP1 and TP16 with
+actual checkpoint weights, two eight-row blocks, ring wrap, position 500001,
+partial/empty batches, poisoned scratch and repeated compiled replay. Native
+DFlash2 target-plus-draft acceptance and serving performance remain research-only.
+The standalone check is `tools/kimi31_draft_probe.py`; its `--help` lists the
+required checkpoint and output paths. These component timings do not establish
+whole-model throughput. Vision row-sharding changes are not included.
+
+Use ordinary export when adding a draft or when kernel preparation needs a
+weight layout absent from the cached package. `--reuse-weights` requires every
+requested semantic view to exist in the cache; it cannot recover layouts marked
+unavailable, and it does not skip checkpoint loading or GPU weight preparation.
 
 ## Implementation and qualification
 
