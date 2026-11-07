@@ -241,11 +241,13 @@ class PreparedLatentMoE:
                                       self.experts.plan, self.up.plan) if self.route_gather is not None else ())
 
     def __call__(self, source):
-        if self.shared.concurrent:
-            self.shared.start(source)
         logits = self.router_projection(source)
         if self.route_gather is not None:
             self.down(source)
+            # Finish the compact projections before the shared-expert grid can
+            # contend with them; its work overlaps the gather and routed experts.
+            if self.shared.concurrent:
+                self.shared.start(source)
             self.route_gather()
         elif self.prefill_route_gather is not None:
             self.down(source)
