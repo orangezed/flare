@@ -325,6 +325,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         arena = ScratchArena(device, overlap=config.stream_overlap)
         session.register_scratch(arena)
         graph_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
+        deferred_pool = package_storage.scratch_pool()
         with package_storage.scratch_pool() as scratch_pool:
             # Vision and text graphs execute serially and share disposable workspace.
             text_shape = (max(config.prefill_chunk_size, config.decode_tokens), weights.config.hidden)
@@ -349,7 +350,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                                activations=activation[:config.prefill_chunk_size], buffers=cursor)
             decode_storage = Scratch.allocate(config.decode_tokens, config.decode_samples, weights.config, shard.world_size,
                                               device, buffers=cursor)
-            vision_inputs = VisionInputs.allocate(device) if patches else None
             vision_storage = {}
             if context is not None and "mla" in weights.config.layers:
                 from .dcp import CONTEXT_WINDOW, RECORD_BYTES
@@ -364,11 +364,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 context = replace(context,
                     slab=torch.zeros((config.context, RECORD_BYTES), dtype=torch.float8_e4m3fn, device=device),
                     index_slab=torch.zeros((config.context // 64, 64 * 132), dtype=torch.uint8, device=device))
-        vision_prefill = vision_state = None
+        vision_inputs = vision_prefill = vision_state = None
         if patches:
             vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
-            vision_state = VisionState(inputs, vision_prefill, requests, image_slots=config.image_concurrency,
-                                       image_token=163605, features=FEATURES, hidden=HIDDEN // shard.world_size)
+            # Frontend uploads and published features are not kernel-tuning
+            # operands. Keep their addresses while deferring physical backing.
+            with deferred_pool:
+                vision_inputs = VisionInputs.allocate(device)
+                vision_state = VisionState(inputs, vision_prefill, requests, image_slots=config.image_concurrency,
+                                           image_token=163605, features=FEATURES, hidden=HIDDEN // shard.world_size)
         vision_buffers = {} if not patches else {**vision_inputs.buffers(), **vision_prefill.buffers()}
         buffers = dict(inputs.buffers(), **vision_buffers, **commands.buffers(),
             **{name: getattr(admission, name) for name in admission.__dataclass_fields__},
@@ -380,8 +384,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
     forwards, signatures, metadata = {}, {}, {}
     vision_encoders = []
+    # Completed AttnRes blocks are only consumed by complete model forwards,
+    # never by the private inputs used for kernel tuning.
+    with deferred_pool:
+        residual_blocks = torch.zeros((max_tokens,
+            -(-len(weights.layers) // weights.config.text["attn_res_block_size"]),
+            weights.config.hidden), dtype=torch.bfloat16, device=device)
+    residual = dict(blocks=residual_blocks,
+                    prefix=cursor.zeros((max_tokens, weights.config.hidden), torch.bfloat16))
     decoder_buffers = DecoderStorage.allocate(weights.config, shard, device, allocator=cursor, scratch={
-        "total": total, "kda": {"output": kda_output},
+        "residual": residual, "total": total, "kda": {"output": kda_output},
         "mla": {"output": mla_output}, "dsa": {"output": mla_output}, "moe": {"output": moe_output},
         **({"auxiliary": auxiliary[0]} if drafting else {})})
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
@@ -491,17 +503,23 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()),
                         enabled=enabled)
-    with phase(progress, "Prepare and tune kernels") as stage, transient:
-        contextual = (partial(resolve_reference_attention, encoders=vision_encoders, coordinator=coordinator)
-                      if any(encoder.reference_attention_name is not None for encoder in vision_encoders) else None)
-        tuning = session.tune(show_progress=progress is not None, console=stage.console, contextual=contextual,
-                              finalist_policies={} if contextual is not None else None)
+    deferred_pool.release_backing()
+    try:
+        with phase(progress, "Prepare and tune kernels") as stage, transient:
+            contextual = (partial(resolve_reference_attention, encoders=vision_encoders, coordinator=coordinator)
+                          if any(encoder.reference_attention_name is not None for encoder in vision_encoders) else None)
+            tuning = session.tune(show_progress=progress is not None, console=stage.console, contextual=contextual,
+                                  finalist_policies={} if contextual is not None else None)
+    finally:
+        deferred_pool.materialize()
     stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
     if config.compile_decoder:
         scratch_pool.release_backing()
+        deferred_pool.release_backing()
 
     def materialize():
         scratch_pool.materialize()
+        deferred_pool.materialize()
         # Snapshot destinations coexist with live rows during maintenance capture,
         # but no tuning fixture accesses them. Grow before any complete forward.
         package_storage.grow("STATE_ROWS", capture_state_rows)
@@ -523,6 +541,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             compile_kinds=("prefill", "scored_prefill", "decode", "resume", "vision", "speculative"))
     finally:
         scratch_pool.materialize()
+        deferred_pool.materialize()
     session.freeze()
     pool.clear_for_preparation()
     torch.cuda.synchronize(device)
@@ -577,6 +596,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, collective,
                    vocabulary_collective, embedding_collective, router_collective, route_collective, prefill_collective,
-                   vision_inputs, vision_prefill, vision_state, vision_storage, scratch_pool, shared_scratch, graph_buffers,
+                   vision_inputs, vision_prefill, vision_state, vision_storage, deferred_pool, scratch_pool, shared_scratch, graph_buffers,
                    speculation, context_collective, markov_collective, latent_runtimes,
                    draft_context_collective, convolution_collective, vision_collectives))

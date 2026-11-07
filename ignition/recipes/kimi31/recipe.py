@@ -25,6 +25,7 @@ def prepare(snapshot, plan, **kwargs):
 
 
 RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepare=prepare,
+    context=262144,
     # https://huggingface.co/moonshotai/Kimi-K3.1-Pro#3-evaluation-results
     sampling_defaults=SamplingDefaults(temperature=1., top_p=.95, top_k=-1,
                                       ranges={"top_p": SamplingRange(.95, 1.)}),

@@ -209,7 +209,10 @@ class PreparedRankGroup:
         if self._closed:
             return
         try:
-            self.supervisor.begin_shutdown(60000)
+            # Preparation teardown releases thousands of compiled modules and
+            # graph owners on the CPU after GPU work has drained. Serving keeps
+            # its shorter drain deadline; both cleanup paths remain bounded.
+            self.supervisor.begin_shutdown(60000 if self._started else 600000)
             if not self._started:
                 for control in self.controls:
                     control.send("close")
