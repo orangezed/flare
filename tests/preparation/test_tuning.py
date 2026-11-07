@@ -23,6 +23,8 @@ from ignition.preparation.tuning import (
     declare,
     register_finalizer,
     _local_tuning_catalog,
+    _tuning_declarations,
+    _common_tuning_names,
 )
 
 
@@ -71,7 +73,7 @@ def backend(monkeypatch):
         assert type(kwargs["autotune"]) is bool and kwargs["compile_workers"] == 0
         self.autotune = kwargs["autotune"]
         self.prime = kwargs.get("prime", True)
-        self.device = SimpleNamespace(ordinal=0)
+        self.device = SimpleNamespace(ordinal=0, identity="test-device")
         self.namespace = FrozenMapping(namespace)
         self._stop = Event()
         self.compile_workers = 0
@@ -1603,6 +1605,174 @@ def test_local_tuning_catalog_preserves_semantics_without_bound_device_ordinals(
     collective = declaration("reduce")
     collective.collective = object()
     assert _local_tuning_catalog((first, collective)) == _local_tuning_catalog((first,))
+
+
+def test_common_tuning_keeps_heterogeneous_dependency_components_together():
+    first = [declaration(name) for name in ("target", "producer", "head", "dependent", "reduce", "tail")]
+    peer = [declaration(item.name) for item in first]
+    for requests in (first, peer):
+        requests[2].dependencies = ("producer",)
+        requests[3].dependencies = ("head",)
+        requests[4].collective = object()
+        requests[5].dependencies = ("reduce",)
+    peer[2].plan.query = 256
+    assert _common_tuning_names(tuple(map(_tuning_declarations, (first, peer)))) == {"target"}
+
+
+@pytest.mark.parametrize("difference", ["query", "override", "finalists", "missing", "dependency"])
+def test_common_tuning_preserves_each_rank_declaration_contract(difference):
+    first = [declaration(name) for name in ("target", "source", "consumer")]
+    peer = [declaration(item.name) for item in first]
+    for requests in (first, peer):
+        requests[2].dependencies = ("source",)
+    if difference == "query":
+        peer[1].plan.query = 256
+    elif difference == "override":
+        peer[1].plan.override = {"tile": 16}
+    elif difference == "finalists":
+        peer[1].finalist_policy = "different-family-contract"
+    elif difference == "missing":
+        peer.pop()
+    else:
+        peer[2].dependencies = ()
+    assert _common_tuning_names(tuple(map(_tuning_declarations, (first, peer)))) == {"target"}
+
+
+def test_common_tuning_rejects_missing_dependency_on_every_rank():
+    first, peer = declaration("target"), declaration("target")
+    peer.dependencies = ("absent",)
+    with pytest.raises(ValueError, match="unknown preparation dependency"):
+        _common_tuning_names((_tuning_declarations((first,)), _tuning_declarations((peer,))))
+
+
+@pytest.mark.parametrize("seed", range(16))
+def test_common_tuning_partition_is_maximal_and_dependency_closed(seed):
+    import random
+
+    rng = random.Random(seed)
+    catalogs = []
+    for rank in range(3):
+        requests = [declaration(f"op{index}") for index in range(12)]
+        for index, request in enumerate(requests):
+            request.dependencies = tuple(f"op{before}" for before in range(index) if rng.random() < .08)
+            if rng.random() < .15:
+                request.plan.query += rank
+            if rng.random() < .05:
+                request.collective = object()
+        catalogs.append(_tuning_declarations(requests))
+    common = _common_tuning_names(catalogs)
+    # Independent fixed-point oracle removes any component touching a mismatch.
+    records = [{item[0]: item[1:] for item in catalog} for catalog in catalogs]
+    expected = {name for name, value in records[0].items()
+                if not value[-1] and all(peer[name] == value for peer in records[1:])}
+    while True:
+        previous = set(expected)
+        for catalog in catalogs:
+            for name, _, dependencies, _, _ in catalog:
+                members = {name, *dependencies}
+                if not members <= expected:
+                    expected.difference_update(members)
+        if expected == previous:
+            break
+    assert common == expected
+    for catalog in catalogs:
+        for name, _, dependencies, _, _ in catalog:
+            assert all((name in common) == (dependency in common) for dependency in dependencies)
+
+
+@pytest.mark.parametrize("with_local", [False, True])
+@pytest.mark.parametrize("with_collective", [False, True])
+@pytest.mark.parametrize("with_context", [False, True])
+def test_heterogeneous_catalog_shares_common_races_and_resets_before_context(
+        backend, monkeypatch, with_local, with_collective, with_context):
+    import torch.distributed as dist
+
+    events, _ = backend
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda device: SimpleNamespace(is_integrated=False, name="GB202"))
+    monkeypatch.setattr(dist, "get_rank", lambda: 1)
+    shards, coordinated, agreed = [], [], []
+    monkeypatch.setattr(PreparationSession, "configure_tuning_shard",
+                        lambda self, rank, ranks: shards.append((rank, ranks)))
+    requests = [declaration("target"), declaration("reference", size=256)]
+    peer = [declaration(item.name, size=item.plan.query) for item in requests]
+    if with_local:
+        requests += [declaration("source"), declaration("head", size=32)]
+        peer += [declaration("source"), declaration("head", size=64)]
+        requests[-1].dependencies = peer[-1].dependencies = ("source",)
+    if with_collective:
+        for group in (requests, peer):
+            for name in ("reduce1", "reduce2"):
+                request = declaration(name)
+                request.collective = object()
+                group.append(request)
+    control_group = object()
+
+    def gather(values, local, *, group):
+        assert group is control_group
+        values[:] = [_tuning_declarations(peer), local]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+
+    def prepare(session, batch, *, progress, autotune):
+        names = {item.name for item in batch}
+        assert all(set(item.dependencies) <= names for item in batch)
+        coordinated.append((session._sharded, tuple(item.name for item in batch)))
+        return PreparationSession.prepare(session, batch, autotune=autotune)
+
+    coordinator = SimpleNamespace(ranks=(0, 1), group=control_group, barrier=lambda: None,
+        local_ranks=2, spans_hosts=False, same_on_every_rank=lambda value: value == "test-device",
+        agree_selections=lambda selections: agreed.append(tuple(item["name"] for item in selections)),
+        prepare=prepare)
+    session = make_session(device=0, checkpoint="heterogeneous-catalog", coordinator=coordinator)
+    session.declare(tuple(requests))
+    reserved = []
+    reserve = session._reserve_scratch
+
+    def reserve_all(batch):
+        reserved.append(tuple(item.name for item in batch))
+        return reserve(batch)
+
+    monkeypatch.setattr(session, "_reserve_scratch", reserve_all)
+
+    def contextual(session, recorded, finalists):
+        assert not session._sharded and shards[-1] == (1, (1,))
+        assert set(recorded) == {item.name for item in requests}
+        return {}, {}
+
+    report = session.tune(contextual=contextual if with_context else None, finalist_policies={})
+    assert shards == [(1, (0, 1)), (1, (1,))]
+    assert reserved == [tuple(item.name for item in requests)]
+    assert coordinated[0] == (True, ("reference", "target"))
+    assert agreed == [("target", "reference")]
+    assert report["requests"] == len(requests)
+    batches = [event[2] for event in events if event[0] == "prepare"]
+    assert batches[0] == ("reference", "target")
+    if with_local or with_collective:
+        assert batches[1] == tuple(item.name for item in requests[2:])
+    else:
+        assert len(batches) == 1
+    if with_collective:
+        assert coordinated[1] == (False, tuple(item.name for item in requests[2:]))
+    session.close()
+
+
+def test_common_local_jobs_keep_integrated_gpu_compiler_budget(backend, monkeypatch):
+    import ignition.preparation.tuning as tuning
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: SimpleNamespace(is_integrated=True))
+    coordinator = SimpleNamespace(barrier=lambda: None)
+    session = make_session(device=0, checkpoint="local-job-budget", coordinator=coordinator)
+    requests = tuple(declaration(f"op{i}") for i in range(7))
+    monkeypatch.setattr(tuning, "_REQUESTS_PER_JOB", 2)
+    jobs = session._jobs(requests, local_only=True)
+    assert tuple(map(len, jobs)) == (2, 2, 2, 1)
+    requests[1].dependencies = ("op0",)
+    requests[2].dependencies = ("op1",)
+    jobs = session._jobs(requests, local_only=True)
+    assert any({"op0", "op1", "op2"} <= {item.name for item in job} for job in jobs)
+    assert all(set(item.dependencies) <= {value.name for value in job} for job in jobs for item in job)
+    session.close()
 
 
 @pytest.mark.parametrize("mode", ["static", "runtime"])

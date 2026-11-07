@@ -32,7 +32,7 @@ _COLLECTIVES_PER_JOB = 96
 _REQUESTS_PER_JOB = 192
 
 
-def _local_tuning_catalog(requests):
+def _tuning_declarations(requests):
     def identity(plan):
         if isinstance(plan, _CompositePlan):
             return (plan.component_id, plan.composite_semantic_version, plan.capacity_metadata,
@@ -40,8 +40,40 @@ def _local_tuning_catalog(requests):
         # Bound device ordinals differ across ranks but do not change the race.
         return _declaration_key(plan)[:-1]
 
-    return tuple((request.name, identity(request.plan), request.dependencies)
-                 for request in requests if request.collective is None)
+    return tuple((request.name, identity(request.plan), request.dependencies,
+                  request.finalist_policy, request.collective is not None) for request in requests)
+
+
+def _local_tuning_catalog(requests):
+    return tuple(item for item in _tuning_declarations(requests) if not item[-1])
+
+
+def _common_tuning_names(catalogs):
+    """Find identical local dependency components across every participating rank.
+
+    A dependency cannot cross preparation batches. Union edges from every rank
+    so a rank-specific consumer also keeps its otherwise common producer local.
+    Components containing collectives retain their original rendezvous order.
+    """
+    records = [{item[0]: item[1:] for item in catalog} for catalog in catalogs]
+    parent = {name: name for rank in records for name in rank}
+
+    def root(name):
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    for rank in records:
+        for name, (_, dependencies, _, _) in rank.items():
+            for dependency in dependencies:
+                if dependency not in rank:
+                    raise ValueError(f"unknown preparation dependency {dependency!r} of {name!r}")
+                parent[root(dependency)] = root(name)
+    common = {name for name, record in records[0].items()
+              if not record[-1] and all(rank.get(name) == record for rank in records[1:])}
+    local_roots = {root(name) for name in parent if name not in common}
+    return frozenset(name for name in common if root(name) not in local_roots)
 
 
 def _prepare_compiler_toolchain():
@@ -160,7 +192,7 @@ class RecordedPreparationSession(PreparationSession):
 
         return torch.cuda.get_device_properties(self.device.ordinal).is_integrated
 
-    def _jobs(self, requests):
+    def _jobs(self, requests, *, local_only=False):
         """Split tuning into jobs on an integrated GPU, whose compiler processes share system memory.
 
         b12x's compiler processes keep every program they compile, about 2.4 MB each, and
@@ -182,7 +214,7 @@ class RecordedPreparationSession(PreparationSession):
         for index, request in enumerate(requests):
             for dependency in request.dependencies:
                 parent[root(names[dependency])] = root(index)
-        collective = self._coordinator is not None
+        collective = self._coordinator is not None and not local_only
         total = sum(request.collective is not None for request in requests) if collective else len(requests)
         per_job = _COLLECTIVES_PER_JOB if collective else _REQUESTS_PER_JOB
         last = max(0, (total - 1) // per_job)
@@ -448,6 +480,7 @@ class RecordedPreparationSession(PreparationSession):
             if self._stop.is_set():
                 raise RuntimeError("full serving preparation requires enabled, uncancelled b12x tuning")
             requests = tuple(self._recorded_requests.values())
+            common_names = None
             if self.tuning_replica is not None:
                 import torch.distributed as dist
                 from .tuning_replicas import ReplicaPreparation
@@ -471,8 +504,15 @@ class RecordedPreparationSession(PreparationSession):
                     (torch.cuda.get_device_properties(self.device.ordinal).name, _local_tuning_catalog(requests)))
                 if self._sharded:
                     self.configure_tuning_shard(dist.get_rank(), self._coordinator.ranks)
-                elif self._coordinator.spans_hosts:
-                    self._coordinator.share_selections(self._selection_cache())
+                else:
+                    if self._coordinator.same_on_every_rank(self.device.identity):
+                        catalogs = [None] * len(self._coordinator.ranks)
+                        dist.all_gather_object(catalogs, _tuning_declarations(requests),
+                                               group=self._coordinator.group)
+                        common_names = _common_tuning_names(catalogs)
+                    if self._coordinator.spans_hosts:
+                        self._coordinator.share_selections(self._selection_cache())
+            uniform_sharding = self._sharded
             scratch_arena = self._reserve_scratch(requests)
             release_unused()
             # Compiler pools share the memory and CPUs of ranks on this host only.
@@ -490,9 +530,20 @@ class RecordedPreparationSession(PreparationSession):
                 bounded = max(1, bounded)
             if bounded < self.compile_workers:
                 self.configure_compile_workers(bounded)
-            jobs = self._jobs(requests)
+            if common_names is None:
+                jobs = tuple((job, self._sharded) for job in self._jobs(requests))
+            else:
+                common = tuple(sorted((item for item in requests if item.name in common_names),
+                                      key=lambda item: item.name))
+                local = tuple(item for item in requests if item.name not in common_names)
+                jobs = tuple((job, True) for job in self._jobs(common, local_only=True) if job)
+                jobs += tuple((job, False) for job in self._jobs(local) if job)
             with self._tuning_clocks():
-                for index, job in enumerate(jobs, 1):
+                for index, (job, sharded) in enumerate(jobs, 1):
+                    if sharded != self._sharded:
+                        rank = dist.get_rank()
+                        self.configure_tuning_shard(rank, self._coordinator.ranks if sharded else (rank,))
+                        self._sharded = sharded
                     # A completed b12x job stops its live display. Each job needs its own lifecycle.
                     with ExitStack() as display_stack:
                         update = progress
@@ -509,6 +560,12 @@ class RecordedPreparationSession(PreparationSession):
                                     progress(status)
 
                         results.append(self._prepare_job(job, progress=update, autotune=self.autotune))
+            # Context alternatives are rank-local prepared overrides, not another
+            # distributed candidate race. Leave no multi-rank cache handshake armed.
+            if self._sharded and (common_names is not None or contextual is not None):
+                rank = dist.get_rank()
+                self.configure_tuning_shard(rank, (rank,))
+                self._sharded = False
             if self._stop.is_set():
                 raise RuntimeError("b12x tuning was cancelled before serving preparation completed")
             context_report = None
@@ -538,8 +595,12 @@ class RecordedPreparationSession(PreparationSession):
                     "source": selection.source,
                     "config": request.plan.contract.config_payload(selection.config).to_dict(),
                     "coverage": dict(coverage.get(request.name, {}))})
-            if self._coordinator is not None and (self._sharded or self._coordinator.spans_hosts):
-                self._coordinator.agree_selections(selections)
+            if self._coordinator is not None:
+                if common_names is not None:
+                    self._coordinator.agree_selections(
+                        [item for item in selections if item["name"] in common_names])
+                elif uniform_sharding or self._coordinator.spans_hosts:
+                    self._coordinator.agree_selections(selections)
             self._tune_status = "finalizing"
             if self._scratch_arena is not None:
                 if self._scratch_arena.nbytes != scratch_arena["candidate_reserved_bytes"]:
