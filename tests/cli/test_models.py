@@ -102,6 +102,33 @@ def test_kimi_exl3_reports_conversion_savings_without_enabling_conversion(tmp_pa
     assert raw["text_config"]["quantization_config"]["dense_format"] == "bf16"
 
 
+def test_kimi_conversion_estimate_counts_sharded_mla_and_duplicated_latent_views(tmp_path):
+    from ignition.recipes import _exl3_mxfp8_savings
+
+    write_exl3_checkpoint(tmp_path, declared_bytes=797_000_000_000)
+    raw = json.loads((ROOT / "tests/fixtures/kimi31/config.json").read_text())
+    raw["quantization_config"] = raw["text_config"]["quantization_config"] = {
+        "quant_method": "exl3", "dense_format": "bf16",
+        "exl3": {"manifest": "exl3-manifest.json", "weight_file_bytes": 797_000_000_000}}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    c = raw["text_config"]
+    hidden, layers = c["hidden_size"], c["num_hidden_layers"]
+    kda = len(c["linear_attn_config"]["kda_layers"])
+    channels = c["linear_attn_config"]["num_heads"] * 128
+    mla_channels = c["num_attention_heads"] * 128
+    base = hidden * (3 * kda * channels + 2 * (kda * channels + (layers-kda) * mla_channels)
+        + 3 * (layers-c["first_k_dense_replace"]) * c["num_shared_experts"] * c["moe_intermediate_size"])
+    mla = (layers-kda) * (c["q_lora_rank"] * c["num_attention_heads"]
+        * (c["qk_nope_head_dim"] + c["qk_rope_head_dim"])
+        + hidden * (c["q_lora_rank"] + c["kv_lora_rank"] + c["qk_rope_head_dim"]))
+    latent_pair = (layers-c["first_k_dense_replace"]) * 4 * hidden * c["routed_expert_hidden_size"]
+    assert _exl3_mxfp8_savings(tmp_path) == 2 * (base+mla) * 3 // 8 + latent_pair // 16
+    model = resolve(str(tmp_path))
+    # The estimate must not silently enable conversion or alter source size.
+    assert model.recipe.weights_bytes(model.checkpoint, 8, None) == 99_625_000_000
+    assert model.checkpoint.stored_bytes == 797_000_000_000
+
+
 def test_exl3_cache_does_not_accept_a_layer_path_outside_checkpoint(tmp_path):
     write_exl3_checkpoint(tmp_path)
     model = resolve(str(tmp_path))

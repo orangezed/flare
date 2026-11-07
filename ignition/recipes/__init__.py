@@ -244,7 +244,7 @@ def _replacement(qualified: Checkpoint, repository: str, revision: str, stored_b
 
 
 def _exl3_mxfp8_savings(metadata):
-    """Estimate Kimi's aligned KDA/attention/shared projection savings, excluding routed experts."""
+    """Estimate converted Kimi projection storage without changing execution precision."""
     if _exl3_quantization(metadata) is None:
         return 0
     raw = json.loads((metadata / "config.json").read_text())
@@ -261,10 +261,20 @@ def _exl3_mxfp8_savings(metadata):
     elements = hidden * (3 * kda_layers * kda_columns
         + 2 * (kda_layers * kda_columns + (layers - kda_layers) * attention_columns)
         + 3 * (layers - c["first_k_dense_replace"]) * c["num_shared_experts"] * c["moe_intermediate_size"])
+    # MLA's query expansion and query/KV input projections are sharded, converted
+    # once, and retained without an additional BF16 copy by load_attention.
+    mla_layers = layers - kda_layers
+    elements += mla_layers * (c["q_lora_rank"] * c["num_attention_heads"]
+        * (c["qk_nope_head_dim"] + c["qk_rope_head_dim"])
+        + hidden * (c["q_lora_rank"] + c["kv_lora_rank"] + c["qk_rope_head_dim"]))
+    # Two BF16 latent matrices become three MXFP8 views: latent-down keeps both
+    # row and column partitions. Credit only 1/16 of the original pair's bytes
+    # as net savings, retaining margin for that duplication, scales and padding.
+    latent_bytes = (layers - c["first_k_dense_replace"]) * 4 * hidden * c["routed_expert_hidden_size"]
     # Use 37.5% of BF16 bytes rather than the ideal 48.4% reduction. The remainder
     # covers scale layouts, alignment, and replicated retained tensors. Actual KV
     # allocation is still derived from measured free memory after preparation.
-    return 2 * elements * 3 // 8
+    return 2 * elements * 3 // 8 + latent_bytes // 16
 
 
 def _hub_metadata(repository: str, revision: str | None, hub_cache: Path | None) -> tuple[Path, Path]:

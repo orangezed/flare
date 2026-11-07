@@ -141,6 +141,17 @@ def test_tp8_preparation_keeps_context_parallel_page_geometry():
         replace(config, devices=(0,) * 8)
 
 
+@pytest.mark.parametrize("concurrency,expected", [(1, 3), (2, 3), (3, 5), (4, 5), (8, 9)])
+def test_tuning_rows_cover_recurrence_without_snapshot_destinations(concurrency, expected):
+    from ignition.components.capacity import request_capacity
+    from ignition.recipes.kimi3.bootstrap import PreparationConfig
+
+    config = PreparationConfig(devices=tuple(range(8)), max_active=concurrency, vision=False)
+    assert config.tuning_state_rows == expected
+    assert config.tuning_state_rows >= 1 + request_capacity(concurrency)
+    assert config.tuning_state_rows >= 3  # Null, one prefill state and its checkpoint.
+
+
 def test_exl3_rejects_shards_that_split_intermediate_hadamard_blocks(raw):
     raw["text_config"]["quantization_config"] = {"quant_method": "exl3", "dense_format": "bf16",
         "exl3": {"manifest": "exl3-manifest.json"}}

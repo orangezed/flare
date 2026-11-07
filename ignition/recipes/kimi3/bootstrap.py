@@ -146,6 +146,11 @@ class PreparationConfig:
         return -(-self.prefill_chunk_size // self.page_tokens) + 2 * request_capacity(self.max_active)
 
     @property
+    def tuning_state_rows(self):
+        """Null plus live decode rows, or one prefill row and its checkpoint."""
+        return max(3, 1 + request_capacity(self.max_active))
+
+    @property
     def speculative_round_shapes(self):
         from ignition.components.capacity import parallel_speculative_shapes
 
@@ -201,13 +206,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     drafting = weights.draft is not None
     max_tokens = max(config.prefill_chunk_size, config.decode_tokens)
     state_rows = slots + snapshots
+    capture_state_rows = min(state_rows + 1, 1 + 2 * slots)
     pages = config.preparation_pages
     total_memory = minimum_across_ranks(torch.cuda.mem_get_info(device)[1], group)
     with phase(progress, "Allocate model state"):
         pool = ContinuationPool.for_model(weights.config, shard.world_size, state_rows + 1, pages, device,
             speculative_tokens=config.draft_tokens, storage=package_storage,
             maximum_pages=total_memory // page_bytes(weights.config),
-            maximum_rows=total_memory // layout.row_bytes, backed_slots=min(state_rows + 1, 1 + 2 * slots))
+            maximum_rows=total_memory // layout.row_bytes,
+            backed_slots=min(capture_state_rows, config.tuning_state_rows))
         vocabulary = weights.config.vocabulary
         requests = DeviceRequestState.allocate(device, vocab_size=vocabulary, capacity=slots)
         inputs = BatchInputs.allocate(max_tokens, blocks, device, capacity=slots)
@@ -495,6 +502,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
 
     def materialize():
         scratch_pool.materialize()
+        # Snapshot destinations coexist with live rows during maintenance capture,
+        # but no tuning fixture accesses them. Grow before any complete forward.
+        package_storage.grow("STATE_ROWS", capture_state_rows)
+        pool.memory_capacity[0] = capture_state_rows
         if vision_inputs is not None:
             vision_inputs.vision_slot.fill_(-1)
         pool.clear_for_preparation()
