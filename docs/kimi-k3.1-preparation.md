@@ -66,17 +66,25 @@ of approximately 64 tok/s has not been achieved.
 
 ## Gathered sparse prefill and MLA DFlash2
 
-Implemented: sparse prefill capacities of at least 4096 query rows gather
-committed FP8 latent and index records, distribute selection rows across ranks,
-and exchange final selected positions. Smaller capacities retain distributed
-selection: full-history peer copies regress short chunks at long contexts.
-The full-context slabs require 708 MiB per rank at a 1,048,576-token capacity.
+Implemented: sparse prefill capacities of at least 4096 query rows pack each
+rank's committed FP8 latent and index records into one shared buffer. Captured
+reductions bracket peer reads before ranks reuse that buffer. KV and continuation
+storage remain private: the loader does not need to grant peer access to thousands
+of aliased cache allocations after its memory budget has been committed.
+
+Selection rows are distributed across ranks; ranks exchange final selected
+positions. Smaller capacities retain distributed selection because full-history
+copies regress short chunks at long contexts. At TP16 and 1,048,576-token capacity,
+the full-context slabs require 708 MiB per rank and shared staging uses 45 MiB
+(46 MiB with the measured CUDA allocation granularity).
 
 Qualified: TP16 component checks cover 128 and 4096 rows, history through
 1,048,576 tokens, partial and empty inputs, poisoned scratch, allocation stability,
-compiled replay at 128 rows, and cross-rank selected-ID agreement. At 4096 rows
-and 32K history the attention component measured 7.63 ms versus 84.4 ms with
-distributed selection. Native full-model prefill performance remains unqualified.
+compiled replay at 128 rows, and cross-rank selected-ID agreement. TP2 and
+TP16 checks also cover delayed ranks and twelve queued transfers with changing
+history. Latent bytes, index bytes and FP32 scale bits are checked exactly;
+attention outputs retain their independent numerical reference check. Native
+full-model prefill performance and startup memory use remain unqualified.
 
 Implemented: `--speculative-method dflash2` selects
 `RadixArk/Kimi-K3.1-Dflash2-Preview` at its pinned recipe revision. Accepted

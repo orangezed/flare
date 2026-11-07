@@ -284,14 +284,17 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     selection_rows if sparse else 0, draft_rows), heads=heads, head_dim=512,
                                            query_head_dim=RECORD_BYTES, ipc=package_storage.peer_storage),
                 coordinator=coordinator,
-                peers=pool.share_pages(package_storage, group), slab=None,
+                peers=pool.share_pages(package_storage, group) if "mla" in weights.config.layers else {}, slab=None,
                 candidates=(create_all_gather_runtime(group, device, max_rows=selection_rows,
                     columns=4 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None),
                 prefill_layout="query_split" if sparse else "dcp",
-                index_peers=pool.share_pages(package_storage, group, suffix=".index") if sparse else None,
                 selections=(create_all_gather_runtime(group, device,
                     max_rows=min(32, (config.prefill_chunk_size + shard.world_size - 1) // shard.world_size),
                     columns=2 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None))
+            if sparse and config.prefill_chunk_size >= 4096:
+                from .dsa_context import ContextStaging
+                context = replace(context, staging=ContextStaging(group, package_storage.peer_storage,
+                    device, config.context, shard.world_size, collective))
         # Every MLA step gathers each rank's query and KV latent rows, padded to 16 bytes: one exchange for up to
         # eight rows, as vLLM's b12x latent transport carries, and one that prefill steps use in chunks.
         text = weights.config.text
@@ -536,11 +539,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         speculation.kda_records.corrections, speculation.kda_records.keys_and_gates]
     return PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'output_res_score', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
-        close_resources=(() if scoring is None else (scoring,)),
+        close_resources=(*(() if scoring is None else (scoring,)),
+                         *(() if context is None or context.staging is None else (context.staging,))),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges([prefill_storage, decode_storage, graph_buffers.chunks,
             None if speculation is None else speculation.sampling_buffers.chunks, arena.tensor, metadata,
-                                           *(() if context is None else (context.slab, context.index_slab)),
+                                           *(() if context is None else (context.slab, context.index_slab,
+                                               () if context.staging is None else context.staging.scratch_tensors())),
                                            *(() if not patches else (vision_storage, vision_state.arena)),
                                            decoder_buffers.scratch_tensors(), *draft_disposable]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,

@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(os.getenv("FLARE_RUN_TP_CUDA_TESTS") != "1", rea
 def _rank(rank, rendezvous, world, rows, compiled_case, destination):
     from ignition.components.fp8_indexer import _write_keys
     from ignition.components.paged_batch import Metadata
-    from ignition.preparation.collectives import CollectivePreparation, create_all_gather_runtime, create_head_exchange
+    from ignition.preparation.collectives import CollectivePreparation, create_all_gather_runtime, create_all_reduce_runtime, create_head_exchange
     from ignition.preparation.capture import capture_forwards
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.package_storage import PackageStorage
@@ -28,6 +28,7 @@ def _rank(rank, rendezvous, world, rows, compiled_case, destination):
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.dcp import ContextParallel, ContextShards, write_records
     from ignition.recipes.kimi3.dsa import PreparedDSA
+    from ignition.recipes.kimi3.dsa_context import ContextStaging
 
     torch.set_num_threads(2)
     torch.set_grad_enabled(False)
@@ -60,10 +61,6 @@ def _rank(rank, rendezvous, world, rows, compiled_case, destination):
                                        group="KV_INDEX", maximum=block_count * 2, units=1)
         storage.grow("KV_PAGES", block_count)
         storage.grow("KV_INDEX", block_count * 2)
-        regions = {x.address: x for x in storage.dynamic_regions}
-        pointer_sets = storage.peer_storage.share_regions(dist.group.WORLD,
-            [regions[latent.data_ptr()], regions[index.data_ptr()]])
-        peers, index_peers = [torch.tensor(p, dtype=torch.int64, device=device) for p in pointer_sets]
         coordinator = CollectivePreparation(dist.group.WORLD)
         candidates = create_all_gather_runtime(dist.group.WORLD, device, max_rows=32,
             columns=4 * topk * world, ipc=storage.peer_storage)
@@ -73,8 +70,11 @@ def _rank(rank, rendezvous, world, rows, compiled_case, destination):
             head_dim=512, query_head_dim=576, ipc=storage.peer_storage)
         slab = torch.zeros((maximum, 576), dtype=torch.float8_e4m3fn, device=device)
         index_slab = torch.zeros((maximum // 64, 64 * 132), dtype=torch.uint8, device=device)
+        barriers = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=1,
+            hidden_size=7168, ipc=storage.peer_storage)
+        staging = ContextStaging(dist.group.WORLD, storage.peer_storage, device, maximum, world, barriers)
         context = ContextParallel(shards, exchange, coordinator, {}, slab, candidates=candidates,
-                                  index_slab=index_slab, selections=selections)
+                                  index_slab=index_slab, selections=selections, staging=staging)
         with RecordedPreparationSession(device=device, checkpoint=f"kimi-gathered-tp{world}",
                 workload_schema=f"sparse-prefill-{rows}", numerical_policy="fp8", coordinator=coordinator,
                 compile_workers=16) as session:
@@ -86,7 +86,7 @@ def _rank(rank, rendezvous, world, rows, compiled_case, destination):
                 op = PreparedDSA(weights, residual, key_input, head_weights, query, output, slots, metadata,
                     latent, index, context=replace(context, prefill_layout=layout), session=session,
                     coordinator=coordinator, name="dsa." + layout, workspace=arena, buffers={},
-                    mode="prefill", latent=current_latent, peers=peers, index_peers=index_peers)
+                    mode="prefill", latent=current_latent)
                 ops[layout] = (op, output)
             session.tune(show_progress=False)
             local_positions = torch.arange(maximum // world, device=device)
@@ -125,6 +125,10 @@ def _rank(rank, rendezvous, world, rows, compiled_case, destination):
                     index_slab.fill_(255)
                     ops[layout][1].fill_(float("nan"))
                     dist.barrier()
+                    if layout == "query_split":
+                        staging.local.fill_(12345)
+                        if rank == world - 1:
+                            time.sleep(.01)
                     before = torch.cuda.memory_stats()["allocation.all.allocated"]
                     graphs[layout].replay()
                     torch.cuda.synchronize()
@@ -176,6 +180,49 @@ def _rank(rank, rendezvous, world, rows, compiled_case, destination):
                 outcomes.append(result)
                 if rank == 0:
                     print(json.dumps(result), flush=True)
+            # Queue changing histories without a host barrier between replays.
+            # The final reduction must protect staging while another rank lags.
+            set_inputs(32768, rows)
+            patterns = (0x30, 0x38, 0x40)
+            expected = torch.empty((len(patterns), *ops["query_split"][1].shape),
+                                   dtype=torch.float32, device=device)
+            for number, pattern in enumerate(patterns):
+                cache_bytes = latent.view(torch.uint8)
+                cache_bytes.fill_(pattern)
+                index.fill_(pattern)
+                dist.barrier()
+                graphs["query_split"].replay()
+                expected[number].copy_(ops["query_split"][1])
+                torch.cuda.synchronize()
+                dist.barrier()
+            observed = torch.empty((12, *ops["query_split"][1].shape), dtype=torch.float32, device=device)
+            sample_positions = torch.cat((torch.arange(world, device=device),
+                128 * world + torch.arange(world, device=device),
+                32768 - rows - world + torch.arange(world, device=device)))
+            observed_latents = torch.empty((12, sample_positions.numel(), 576), dtype=torch.uint8, device=device)
+            observed_indices = torch.empty((12, sample_positions.numel(), 132), dtype=torch.uint8, device=device)
+            key_columns = (sample_positions % 64)[:, None] * 128 + torch.arange(128, device=device)[None]
+            scale_columns = 8192 + (sample_positions % 64)[:, None] * 4 + torch.arange(4, device=device)[None]
+            dist.barrier()
+            if rank == world - 1:
+                time.sleep(.03)
+            for number in range(12):
+                latent.view(torch.uint8).fill_(patterns[number % len(patterns)])
+                index.fill_(patterns[number % len(patterns)])
+                graphs["query_split"].replay()
+                observed[number].copy_(ops["query_split"][1])
+                observed_latents[number].copy_(slab.view(torch.uint8)[sample_positions])
+                observed_indices[number, :, :128].copy_(index_slab[sample_positions[:, None] // 64, key_columns])
+                observed_indices[number, :, 128:].copy_(index_slab[sample_positions[:, None] // 64, scale_columns])
+            torch.cuda.synchronize()
+            for number in range(12):
+                assert (observed_latents[number] == patterns[number % len(patterns)]).all(), (rank, number, "latent bytes")
+                assert (observed_indices[number] == patterns[number % len(patterns)]).all(), (rank, number, "index bytes")
+                torch.testing.assert_close(observed[number], expected[number % len(patterns)], rtol=.03, atol=.002)
+            dist.barrier()
+            if rank == 0:
+                print(json.dumps(dict(queued_replays=12, delayed_rank=True, changing_history=True, exact_transfer_bytes=True,
+                                      capacity=rows, compiled=compiled_case)), flush=True)
             set_inputs(32768, rows)
             head_weights.zero_()
             hashes = set()
@@ -196,6 +243,8 @@ def _rank(rank, rendezvous, world, rows, compiled_case, destination):
                                       distinct_tie_selections=len(hashes), rank_agreement=True)), flush=True)
             for graph in graphs.values():
                 graph.reset()
+        staging.close()
+        barriers.close()
         selections.close()
         candidates.close()
         exchange.close()
@@ -208,6 +257,6 @@ def _rank(rank, rendezvous, world, rows, compiled_case, destination):
                          ids=["eager128", "eager1024", "eager4096", "compiled128", "compiled4096"])
 def test_gathered_sparse_prefill(tmp_path, rows, compiled_case):
     world = torch.cuda.device_count()
-    assert world in (4, 8, 16)
+    assert world in (2, 4, 8, 16)
     mp.spawn(_rank, args=((tmp_path/"gloo").as_uri(), world, rows, compiled_case, tmp_path/"timings.json"),
              nprocs=world, join=True)

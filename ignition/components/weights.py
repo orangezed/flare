@@ -157,17 +157,11 @@ class SharedColumnReads:
     """
 
     def __init__(self, group, peer_storage, device, capacity):
-        import torch
-        import torch.distributed as dist
+        from ignition.preparation.peer_storage import SharedDeviceBuffer
 
-        self.group, self.peer_storage, self.device = group, peer_storage, torch.device(device)
-        self.rank, self.world = dist.get_rank(group), dist.get_world_size(group)
-        self.capacity = capacity
-        self.pointer = peer_storage.cudaMalloc(capacity)
-        handles = [None] * self.world
-        dist.all_gather_object(handles, peer_storage.cudaIpcGetMemHandleBytes(self.pointer), group=group)
-        self.bases = [self.pointer if rank == self.rank else peer_storage.cudaIpcOpenMemHandleBytes(handle)
-                      for rank, handle in enumerate(handles)]
+        self.buffer = SharedDeviceBuffer(group, peer_storage, device, capacity)
+        self.group, self.peer_storage, self.device = self.buffer.group, peer_storage, self.buffer.device
+        self.rank, self.world, self.capacity = self.buffer.rank, self.buffer.world, capacity
 
     def reader(self, index):
         return index % self.world
@@ -179,9 +173,7 @@ class SharedColumnReads:
         nbytes = prod(shape) * dtype.itemsize
         if offset < 0 or offset % 256 or offset + nbytes > self.capacity:
             raise ValueError("shared column staging lies outside its aligned capacity")
-        storage = torch._C._construct_storage_from_data_pointer(self.bases[rank] + offset, self.device, nbytes)
-        strides = tuple(prod(shape[index + 1:]) for index in range(len(shape)))
-        return torch.empty(0, dtype=dtype, device=self.device).set_(storage, 0, shape, strides)
+        return self.buffer.view(rank, offset, shape, dtype)
 
     def read_columns(self, loader, source, columns, out):
         """Fill ``out`` with ``source[:, columns]``: ranks read disjoint blocks of whole rows and copy their columns.
@@ -215,20 +207,11 @@ class SharedColumnReads:
         return out
 
     def exchange(self):
-        """Complete this rank's staging or copies on its GPU, then wait for every rank."""
-        import torch
-        import torch.distributed as dist
-
-        torch.cuda.synchronize(self.device)
-        dist.barrier(group=self.group)
+        """Complete staging or copies on each rank during checkpoint preparation."""
+        self.buffer.exchange()
 
     def close(self):
-        self.exchange()
-        for rank, base in enumerate(self.bases):
-            if rank != self.rank:
-                self.peer_storage.cudaIpcCloseMemHandle(base)
-        self.exchange()
-        self.peer_storage.cudaFree(self.pointer)
+        self.buffer.close()
 
 
 def _record_nvfp4_linear_provenance(values, prefix, *, r0, r1, c0, c1):

@@ -11,7 +11,8 @@ from ignition.components.fp8_indexer import PreparedFP8Indexer
 from ignition.preparation.scratch import GraphBufferPool
 
 from .config import PAGE_TOKENS
-from .dcp import RECORD_BYTES, pull_context, pull_index_context, write_records
+from .dcp import RECORD_BYTES, write_records
+from .dsa_context import PreparedContextTransfer
 from .projections import prepare_projection
 
 
@@ -26,12 +27,12 @@ class PreparedGatheredDSA:
 
     def __init__(self, weights, residual, key_input, head_weights, query, output, slots,
                  metadata, cache, index_cache, *, context, session, coordinator, name,
-                 workspace, buffers, latent, peers, index_peers, eps):
-        if (metadata.starts.numel() != 1 or latent is None or peers is None or index_peers is None
+                 workspace, buffers, latent, eps):
+        if (metadata.starts.numel() != 1 or latent is None or context.staging is None
                 or context.slab is None or context.index_slab is None or context.selections is None):
             raise ValueError("query-sharded sparse prefill requires one request and shared index/latent context")
         self.metadata, self.context, self.output = metadata, context, output
-        self.peers, self.index_peers, self.latent, self.slots = peers, index_peers, latent, slots
+        self.latent, self.slots = latent, slots
         self.query, self.residual, self.key_input, self.head_weights = query, residual, key_input, head_weights
         self.norm_weight, self.norm_bias, self.eps = weights["index_norm"], weights["index_bias"], eps
         rows, heads, _ = query.shape
@@ -62,6 +63,8 @@ class PreparedGatheredDSA:
         self.selected = zeros((self.local_rows, 2048), torch.int32)
         self.gathered = zeros((self.local_rows, world * 2048), torch.int32)
         self.window = zeros((2,), torch.int64)
+        self.transfer = PreparedContextTransfer(cache, index_cache, metadata, self.window[1:],
+            context=context, session=session, coordinator=coordinator, name=name + ".context")
         self.selector = PreparedFP8Indexer(self.local_query, self.local_weights, context.index_slab,
             self.pages, self.lengths, self.active, self.selected, mode="decode", session=session,
             name=name + ".index", workspace=workspace, buffers=cursor, rotation="none")
@@ -94,8 +97,7 @@ class PreparedGatheredDSA:
             self.slots, self.index_cache.stride(0), False, num_warps=4)
         self.window[0:1].zero_()
         self.window[1:].copy_(m.starts * (m.lengths > 0))
-        pull_context(self.peers, m.page_table[0], self.window, c.slab.view(torch.int32), c.shards)
-        pull_index_context(self.index_peers, m.page_table[0], self.window[1:], c.index_slab, c.shards)
+        self.transfer()
         write_records(self.latent, m.positions, c.slab)
         self.selector.write_keys(self.key, m.positions)
         self.pages.copy_(self.page_ids[None])

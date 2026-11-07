@@ -6,6 +6,7 @@
 import ctypes as C
 import os
 import pickle
+from math import prod
 
 try:
     from multiprocessing.reduction import DupFd
@@ -135,3 +136,54 @@ class PeerStorage(CudaRTLibrary):
         context, _ = flare_heliopause.current_context()
         ranges = [(address, size) for address, size in self.owned.items() if address not in self.dynamic]
         flare_heliopause.export_reset_peer_storage(context, ranges, self)
+
+
+class SharedDeviceBuffer:
+    """One contiguous peer-visible allocation per rank, retained through graph drain.
+
+    Views borrow this object's storage. Synchronization between producers and
+    consumers during replay belongs in their captured graphs; the host barriers
+    here are used only for preparation and destruction.
+    """
+
+    def __init__(self, group, peer_storage, device, capacity):
+        import torch
+        import torch.distributed as dist
+
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("shared device buffer capacity must be a positive byte count")
+        self.group, self.peer_storage, self.device = group, peer_storage, torch.device(device)
+        self.rank, self.world = dist.get_rank(group), dist.get_world_size(group)
+        self.capacity = capacity
+        self.pointer = peer_storage.cudaMalloc(capacity)
+        self.extent = peer_storage.owned[self.pointer]
+        peer_storage.cudaMemset(self.pointer, 0, self.extent)
+        handles = [None] * self.world
+        dist.all_gather_object(handles, peer_storage.cudaIpcGetMemHandleBytes(self.pointer), group=group)
+        self.bases = [self.pointer if rank == self.rank else peer_storage.cudaIpcOpenMemHandleBytes(handle)
+                      for rank, handle in enumerate(handles)]
+
+    def view(self, rank, offset, shape, dtype):
+        import torch
+
+        nbytes = prod(shape) * dtype.itemsize
+        if offset < 0 or offset % dtype.itemsize or offset + nbytes > self.extent:
+            raise ValueError("shared tensor view exceeds its aligned allocation")
+        storage = torch._C._construct_storage_from_data_pointer(self.bases[rank] + offset, self.device, nbytes)
+        strides = tuple(prod(shape[index + 1:]) for index in range(len(shape)))
+        return torch.empty(0, dtype=dtype, device=self.device).set_(storage, 0, shape, strides)
+
+    def exchange(self):
+        import torch
+        import torch.distributed as dist
+
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.group)
+
+    def close(self):
+        self.exchange()
+        for rank, base in enumerate(self.bases):
+            if rank != self.rank:
+                self.peer_storage.cudaIpcCloseMemHandle(base)
+        self.exchange()
+        self.peer_storage.cudaFree(self.pointer)

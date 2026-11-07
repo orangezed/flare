@@ -297,8 +297,6 @@ class PreparedDecoder:
                             index_cache=pool.index(index) if kind == "dsa" else None,
                             eps=config.text["rms_norm_eps"],
                             peers=context.peers.get(index) if context is not None else None,
-                            index_peers=(context.index_peers.get(index)
-                                         if context is not None and context.index_peers is not None else None),
                             coordinator=coordinator,
                             # The smallest latent exchange that carries the step, else the largest in chunks.
                             latents=next((r for r in latent_runtimes if source.shape[0] <= r.max_batch_size),
