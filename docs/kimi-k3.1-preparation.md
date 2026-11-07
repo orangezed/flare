@@ -40,15 +40,23 @@ memory-clock offset +6000, TP16/DCP16, text only, C1, no MTP, 4096-token prefill
 capacity, lossless CSF expert scales, and `--online-mxfp8-scope kda-input`.
 Three requests used 221 prompt tokens and 4096 completion tokens at temperature
 1, top-p 0.95, and disabled top-k filtering. The native package was
-`gb202-tp16-202611062201`.
+`gb202-tp16-202611070235` (staged sparse-context transfer).
 
 | Measurement | Result |
 |---|---:|
-| C1 decode, three runs | 57.756 / 57.714 / 57.678 tok/s |
-| Mean C1 decode | 57.716 tok/s |
-| KV capacity | 5,066,752 tokens |
-| Uncached 32K prefill, HTTP completion including one output token | 960.36 tok/s |
+| C1 decode, three runs | 57.816 / 57.810 / 57.812 tok/s |
+| Mean C1 decode | 57.812 tok/s |
+| KV capacity | 4,659,200 tokens |
+| Uncached 32K prefill, three runs | 1715.13 / 1730.53 / 1728.16 tok/s |
+| Mean uncached 32K prefill, including one output token | 1724.61 tok/s |
 | Native text, queued-request and 32K recall checks | 8 passed |
+
+The run retained checkpoint expert scales losslessly in CSF form and used no
+learned draft. GPU clock settings were checked before measurement. No other
+model or preparation job ran during timing; dashboard polling processes were
+not running. The preceding distributed-selection build measured 960.36 tok/s
+on this 32K workload. The observed prefill improvement is 79.6%; no decode gain
+is attributed to the transport change.
 
 Compiled TP16 component tests preserve exact outputs, empty-context behavior,
 source lifetimes, and allocation-stable replay with delayed ranks. With a
@@ -84,7 +92,10 @@ compiled replay at 128 rows, and cross-rank selected-ID agreement. TP2 and
 TP16 checks also cover delayed ranks and twelve queued transfers with changing
 history. Latent bytes, index bytes and FP32 scale bits are checked exactly;
 attention outputs retain their independent numerical reference check. Native
-full-model prefill performance and startup memory use remain unqualified.
+TP16/C1 target-only startup, memory and serving are qualified by the table above.
+Its package contains 192 peer regions, including one fixed staging allocation
+per rank, and no peer-visible dynamic KV allocation. The 3,000 tok/s prefill
+target has not been achieved.
 
 Implemented: `--speculative-method dflash2` selects
 `RadixArk/Kimi-K3.1-Dflash2-Preview` at its pinned recipe revision. Accepted
