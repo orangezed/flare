@@ -11,7 +11,7 @@ from b12x.preparation import PreparedCall
 
 from ignition.preparation.fixtures import varlen_attention as fixtures
 from ignition.preparation.scratch import planned_scratch, prime_owners
-from ignition.preparation.tuning import declare, register_finalizer
+from ignition.preparation.tuning import declare, register_context_plan, register_finalizer
 
 
 class PreparedVarlenAttention:
@@ -58,6 +58,7 @@ class PreparedVarlenAttention:
                 ),
             ),
         )
+        register_context_plan(session, name, self)
         register_finalizer(session, self.rebind, workspace=workspace)
 
     def rebind(self):

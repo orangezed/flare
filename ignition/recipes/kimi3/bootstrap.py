@@ -6,6 +6,7 @@
 
 import contextlib
 from dataclasses import dataclass, replace
+from functools import partial
 import hashlib
 import json
 from pathlib import Path
@@ -49,7 +50,8 @@ from .contract import prepare as prepare_contract
 from .decoder import DecoderStorage, PreparedDecoder, Scratch
 from .pool import ContinuationPool, continuation_layout, page_bytes
 from .weights import ModelWeights
-from .vision import PATCH_CAPACITIES, FEATURES, HIDDEN, PreparedVision, VisionInputs, VisionScratch
+from .vision import (PATCH_CAPACITIES, FEATURES, HIDDEN, PreparedVision, VisionInputs, VisionScratch,
+                     resolve_reference_attention)
 from .vision_state import PreparedVisionGeneration
 from ignition.components.vision_state import PrefillVisionInputs, VisionState
 
@@ -250,9 +252,23 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 markov_collective = create_all_gather_runtime(group, device, max_rows=slots,
                     columns=2 * weights.config.vocabulary, ipc=package_storage.peer_storage)
         # Prefill rows beyond a channel's capacity gather in chunks, as they reduce.
+        router_columns = 2 * shard.world_size * ((weights.config.text["num_experts"] // shard.world_size + 31) // 32 * 32)
         router_collective = create_all_gather_runtime(group, device, max_rows=channel_rows,
-            columns=2 * shard.world_size * ((weights.config.text["num_experts"] // shard.world_size + 31) // 32 * 32),
+            columns=router_columns,
             ipc=package_storage.peer_storage)
+        vision_collectives = {}
+        if config.vision and weights.vision.shard.world_size > 1:
+            from .vision import HEAD_SIZE, INTERMEDIATE, VISION_HEADS
+
+            # Vision and text execute serially. Reuse channels with identical column geometry.
+            available = {weights.config.hidden: embedding_collective, router_columns: router_collective}
+            padded_heads = -(-VISION_HEADS // shard.world_size) * shard.world_size * HEAD_SIZE
+            for columns in sorted({1024, padded_heads, INTERMEDIATE, HIDDEN}):
+                runtime = available.get(columns)
+                if runtime is None:
+                    runtime = create_all_gather_runtime(group, device, max_rows=min(1024, channel_rows),
+                        columns=columns, ipc=package_storage.peer_storage)
+                vision_collectives[columns] = runtime
         route_collective = (create_route_runtime(group, device, ipc=package_storage.peer_storage)
                             if shard.world_size > 1 else None)
         context = None
@@ -311,11 +327,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 text_shapes += ((text_shape[0], len(weights.config.draft.auxiliary_layers) * text_shape[1]),)
             patches = PATCH_CAPACITIES if config.vision else ()
             cursor = graph_buffers.cursor()
-            shared_scratch = cursor.zeros((max(max(patches, default=0) * 3 * weights.config.vision["qkv_hidden_size"],
+            shared_scratch = cursor.zeros((max(0 if not patches else
+                VisionScratch.workspace_elements(max(patches), weights.vision.shard),
                 sum(rows * columns for rows, columns in text_shapes)),), torch.bfloat16)
             if patches:
                 # Reserve the largest vision slabs before smaller text allocations share their chunks.
-                VisionScratch.allocate(max(patches), device, work=shared_scratch, buffers=cursor)
+                VisionScratch.allocate(max(patches), device, shard=weights.vision.shard,
+                                       work=shared_scratch, buffers=cursor)
                 cursor = graph_buffers.cursor()
                 shared_scratch = cursor.zeros(shared_scratch.shape, torch.bfloat16)
             activation, total, kda_output, moe_output, *auxiliary = scratch_views(shared_scratch, text_shapes)
@@ -354,6 +372,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
         ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
     forwards, signatures, metadata = {}, {}, {}
+    vision_encoders = []
     decoder_buffers = DecoderStorage.allocate(weights.config, shard, device, allocator=cursor, scratch={
         "total": total, "kda": {"output": kda_output},
         "mla": {"output": mla_output}, "dsa": {"output": mla_output}, "moe": {"output": moe_output},
@@ -426,14 +445,24 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 forward.prepare()
                 add(name, forward, "speculative", batch, width, (*inputs.buffers(), "sampling_grammar_mask"), enabled=True, packed_tokens=packed)
 
+        def vision_gather(source, output, *, name):
+            from ignition.components.collectives import PreparedAllGather
+
+            return PreparedAllGather(source, output, runtime=vision_collectives[output.shape[1]],
+                session=session, coordinator=coordinator, name=name)
+
         for capacity in reversed(patches):
             name = f"vision{capacity}"
             with scratch_pool:
                 cursor = graph_buffers.cursor()
                 work = cursor.zeros(shared_scratch.shape, torch.bfloat16)
-                vision_storage[capacity] = VisionScratch.allocate(capacity, device, work=work, buffers=cursor)
+                vision_storage[capacity] = VisionScratch.allocate(capacity, device, shard=weights.vision.shard,
+                                                                 work=work, buffers=cursor)
             encoder = PreparedVision(weights.vision, vision_storage[capacity], vision_inputs,
-                session=session, workspace=arena, name=name, buffers=cursor)
+                session=session, workspace=arena, name=name, buffers=cursor,
+                gather_factory=vision_gather if weights.vision.shard.world_size > 1 else None,
+                chunk_rows=min(1024, channel_rows))
+            vision_encoders.append(encoder)
             forward = PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence,
                                                 feature_range=shard.partition(HIDDEN), buffers=cursor)
             add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
@@ -456,7 +485,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()),
                         enabled=enabled)
     with phase(progress, "Prepare and tune kernels") as stage, transient:
-        tuning = session.tune(show_progress=progress is not None, console=stage.console)
+        contextual = (partial(resolve_reference_attention, encoders=vision_encoders, coordinator=coordinator)
+                      if any(encoder.reference_attention_name is not None for encoder in vision_encoders) else None)
+        tuning = session.tune(show_progress=progress is not None, console=stage.console, contextual=contextual,
+                              finalist_policies={} if contextual is not None else None)
     stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
     if config.compile_decoder:
         scratch_pool.release_backing()
@@ -536,4 +568,4 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                    vocabulary_collective, embedding_collective, router_collective, route_collective, prefill_collective,
                    vision_inputs, vision_prefill, vision_state, vision_storage, scratch_pool, shared_scratch, graph_buffers,
                    speculation, context_collective, markov_collective, latent_runtimes,
-                   draft_context_collective, convolution_collective))
+                   draft_context_collective, convolution_collective, vision_collectives))

@@ -169,6 +169,8 @@ class QuantizedProjection:
         encoded=None,
         rhs_prefetch_ready: bool = False,
         allow_bf16_atomic_reduction: bool | None = None,
+        retain_packed_weights: bool = False,
+        output_partition: tuple[int, int, int] | None = None,
         buffers=None,
     ) -> None:
         from b12x.gemm.blockscaled._a16 import NVFP4LinearWeight, _overlap, _weight_parts
@@ -199,6 +201,15 @@ class QuantizedProjection:
         self.workspace = workspace
         self.encoded = self.quantizer_plan = None
         self.sm103 = sm103_projection.is_sm103(source.device)
+        if type(retain_packed_weights) is not bool:
+            raise TypeError("packed-weight retention must be a boolean")
+        if retain_packed_weights and (
+                self.sm103 or not isinstance(weight, MXFP8LinearWeight) or activation_mode != "a16"):
+            raise ValueError("packed-weight retention requires b12x MXFP8 weights with A16 activations")
+        if output_partition is not None and (
+                retain_packed_weights or self.sm103 or not isinstance(weight, MXFP8LinearWeight)
+                or activation_mode != "a16"):
+            raise ValueError("logical output partitions require expanded b12x MXFP8 A16 projections")
         if source_activation != "identity" and (self.sm103 or not isinstance(weight, NVFP4LinearWeight)):
             raise ValueError("rounded SwiGLU projection requires b12x NVFP4 execution")
         if mxfp8_min_amax is not None or encoded is not None:
@@ -322,7 +333,17 @@ class QuantizedProjection:
                                                workspace=None if isinstance(workspace, ScratchArena) else workspace)
             if workspace is None or isinstance(workspace, ScratchArena):
                 query = replace(query, workspace_form="provided", workspace_nbytes=None)
-            self.plan = blockscaled.plan(query)
+            if output_partition is not None:
+                query = replace(query, output_partition=output_partition,
+                                expected_m=source.numel() // source.shape[-1])
+            override = None
+            if retain_packed_weights:
+                from b12x.gemm.blockscaled._tuning import TUNING
+
+                # The packed A16 reduction keeps one arithmetic schedule across
+                # output-row partitions; expanding into cuBLAS can change it.
+                override = replace(TUNING.default_config(query, None), a16_backend="packed")
+            self.plan = blockscaled.plan(query, override=override)
         values, scales, gain, _ = _weight_parts(weight)
         if self.sm103 and scales.dtype == torch.float8_e8m0fnu:
             # Operators receive UE8M0 scales as bytes, as b12x's own packed operators do.

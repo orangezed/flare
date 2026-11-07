@@ -13,6 +13,7 @@ from .vision import FEATURES
 class PreparedVisionGeneration:
     def __init__(self, encoder, state, completion, frame, sequence, *, feature_range, buffers=None):
         self.encoder, self.state = encoder, state
+        self.compilation_variant = encoder.compilation_variant
         self.feature_columns = torch.arange(*feature_range, device=state.arena.device)
         shape = (encoder.scratch.patches.shape[0] // 4, state.arena.shape[2])
         self.features = (torch.empty(shape, dtype=state.arena.dtype, device=state.arena.device) if buffers is None

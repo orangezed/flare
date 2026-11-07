@@ -54,7 +54,10 @@ class ModelWeights:
             layers = tuple(loader.load_layer(i) for i in range(len(config.layers)))
         if vision:
             from .vision import VisionWeights
-            vision = VisionWeights.load(manifest, device, progress=progress)
+            # Preserve the replicated BF16 checkpoint path. Sharded vision uses
+            # packed MXFP8 projections and an unpartitioned attention schedule.
+            vision = VisionWeights.load(manifest, device, progress=progress,
+                                        shard=shard if online_mxfp8 else None, online_mxfp8=online_mxfp8)
         else:
             vision = None
         draft = None

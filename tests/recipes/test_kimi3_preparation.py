@@ -4,6 +4,7 @@
 """Kimi K3 and K3.1 preparation preserve explicit vision capacity."""
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,3 +44,24 @@ def test_vision_keeps_its_default_and_explicit_capacity(config_type, active, cap
 def test_vision_rejects_capacity_outside_active_requests(config_type, capacity):
     with pytest.raises(ValueError, match="image concurrency"):
         config_type(max_active=4, image_concurrency=capacity)
+
+
+def test_preparation_preserves_declared_context_above_estimated_physical_capacity(config_type, monkeypatch):
+    from ignition.recipes.kimi3.recipe import prepare_variant
+    from ignition.preparation import rank_group
+
+    monkeypatch.setattr(rank_group, "prepare_group", lambda snapshot, config, *args, **kwargs: config)
+
+    plan = SimpleNamespace(speculation=None, collective_tuning="static", collective_ladder=None,
+        prompt_logprobs=False, compile_workers=1, autotune_effort="default", tuning_replica=None,
+        native_dense_activations=False, lock_gpu_clocks=False, world_size=8, context=48128, checkpoint=None,
+        recipe=SimpleNamespace(context=1048576), concurrency=1, image_concurrency=0,
+        prefill_chunk=1024, snapshots=1, costs=SimpleNamespace(state_row_bytes=1),
+        headroom_bytes=0, reserve_bytes=0, online_mxfp8=True, stream_overlap=True,
+        context_parallel=True, language_model_only=True)
+    bootstrap = SimpleNamespace(PreparationConfig=config_type,
+        prepare_rank=lambda snapshot, config, **kwargs: config)
+    prepared = prepare_variant("checkpoint", plan, bootstrap=bootstrap,
+        draft_repository="unused", draft_revision="unused", compile_forwards=True,
+        kernel_cache=None, progress=None)
+    assert prepared.context == 1048576
