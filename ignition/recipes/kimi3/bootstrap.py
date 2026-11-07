@@ -58,6 +58,19 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 REDUCE_ROWS = 1024
 
 
+def target_tuning_identity(config, headers, world_size):
+    """Scope kernel selections to target geometry, independently of attached drafts.
+
+    The target-only descriptor retains its empty draft field. Each operator's
+    encoded query, invocation and candidate programs distinguish additional
+    draft shapes and arithmetic contracts inside the selection cache.
+    """
+    return hashlib.sha256(json.dumps({
+        "config": config.text, "headers": headers, "vision": config.vision,
+        "draft": None, "world_size": world_size,
+        "contract": "kimi3.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
+
+
 @dataclass(frozen=True)
 class PreparationConfig:
     collective_tuning: str = "static"
@@ -306,10 +319,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         latent_runtimes = tuple(create_head_exchange(group, device, max_rows=rows, heads=shard.world_size,
                                                      head_dim=-(-latent // 8) * 8, ipc=package_storage.peer_storage)
                                 for rows in sorted({min(8, max_tokens), channel_rows}))
-        identity = hashlib.sha256(json.dumps({
-            "config": weights.config.text, "headers": headers, "vision": weights.config.vision,
-            "draft": None if not drafting else weights.config.draft.raw,
-            "world_size": shard.world_size, "contract": "kimi3.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
+        identity = target_tuning_identity(weights.config, headers, shard.world_size)
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
