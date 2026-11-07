@@ -43,35 +43,33 @@ memory-clock offset +6000, TP16/DCP16, text only, C1, no MTP, 4096-token prefill
 capacity, lossless CSF expert scales, and `--online-mxfp8-scope kda-input`.
 Three requests used 221 prompt tokens and 4096 completion tokens with low
 reasoning effort, temperature 1, top-p 0.95, and disabled top-k filtering. The native package was
-`gb202-tp16-202611071552`, prepared from Flare `b3ecc8d1` and FlashInfer
-`24c6e49f6`, with staged sparse-context transfer and output-sharded latent
+`gb202-tp16-202611071810`, prepared from Flare `efb35c38` and FlashInfer
+`c05fa240f`, with staged sparse-context transfer and output-sharded latent
 projection during prefill.
 
 | Measurement | Result |
 |---|---:|
-| C1 decode, three runs | 59.714 / 59.800 / 59.795 tok/s |
-| Mean C1 decode | 59.770 tok/s |
+| C1 decode, three runs | 59.796 / 59.737 / 59.758 tok/s |
+| Mean C1 decode | 59.764 tok/s |
 | KV capacity | 4,659,200 tokens |
-| Uncached 32K prefill, three runs | 2359.94 / 2337.35 / 2363.15 tok/s |
-| Mean uncached 32K prefill, including one output token | 2353.48 tok/s |
+| Uncached 32K prefill, three runs | 2428.31 / 2411.25 / 2438.45 tok/s |
+| Mean uncached 32K prefill, including one output token | 2426.00 tok/s |
 | Native text, queued-request and 32K recall checks | 8 passed |
 
 The run retained checkpoint expert scales losslessly in CSF form and used no
 learned draft. No other
 model or preparation job ran during timing; dashboard polling processes were
-not running. Under the same conditions, package `gb202-tp16-202611071438`,
-with serial router/latent projections and the same FlashInfer revision,
-measured 59.587 tok/s decode and 2346.93 tok/s prefill. The differences are
-+0.31% and +0.28%, respectively. These small changes do not establish a
-material whole-model speedup from projection overlap. Requests used identical
+not running. Under the same conditions, package `gb202-tp16-202611071552`,
+with fixed collective participation, measured 59.770 tok/s decode and
+2353.48 tok/s prefill. The differences are -0.01% and +3.08%, respectively:
+prefill improved while decode remained effectively unchanged. KV capacity
+was unchanged. Requests used identical
 inputs and sampling settings, but generated token sequences differed; routed
-expert traffic therefore need not match. Loaded KV capacity increased by
-57,344 tokens; the cause of the small execution-resource allocation difference
-has not been isolated.
+expert traffic therefore need not match.
 Raw measurements are in
-`/data/kimi31-support/bench-router-latent-overlap-c1/results.json` and
-`/data/kimi31-support/bench-router-latent-overlap-32k/results.json` on the measurement
-host. Native functional results are in `checks-router-latent-overlap.json` in the
+`/data/kimi31-support/bench-island-active-tuning-c1/results.json` and
+`/data/kimi31-support/bench-island-active-tuning-32k/results.json` on the measurement
+host. Native functional results are in `checks-island-active-tuning.json` in the
 same parent directory.
 
 The pinned FlashInfer additionally implements pushed transfers within each
@@ -123,9 +121,20 @@ long-inactive CTAs, and counter rollover. On sixteen RTX PRO 6000 Blackwell
 GPUs, the VMM preparation check selected 8 active CTAs for 112 KiB, 32 for
 1.75 MiB, and 64 for 14 MiB. The physical grid remained 64 CTAs.
 
-Native full-model performance with this tuning remains research-only until
-the exported package completes qualification. Component selections and raw
-checks are under `/data/kimi31-support/island-active-api/` and
+Native C1 decode and 32K prefill are qualified under the conditions above.
+The package's serialized kernel arguments confirm these prefill choices on
+all sixteen ranks:
+
+| Payload | Physical CTAs | Active CTAs | Threads per CTA |
+|---|---:|---:|---:|
+| 0.875 MiB | 64 | 16 | 768 |
+| 1.75 MiB | 64 | 32 | 768 |
+| 14 MiB | 64 | 64 | 512 or 1024, according to the prepared call |
+
+The C1 decode graph retains hierarchical reductions; it has no IslandRS calls.
+Other native serving capacities remain unqualified for this tuning.
+Component selections and raw checks are under
+`/data/kimi31-support/island-active-api/` and
 `island-active-api-cached/` on the measurement host. GPU test logs are
 `island-active-tuning-gpu-r2.log` and `island-active-protocol-gpu.log` in the
 same parent directory.
@@ -155,9 +164,11 @@ allocation counters remain unchanged during replay.
 | 1 | 93.488 µs | 90.471 µs | -3.23% |
 | 8 | 192.708 µs | 186.998 µs | -2.96% |
 
-These are mean maximum-rank event intervals for the component. Native functional
-qualification passed, but the component gain did not translate into a comparable
-whole-model throughput increase under the conditions above. The exported graph
+These are mean maximum-rank event intervals for the component. The native
+projection comparison used packages `gb202-tp16-202611071438` and
+`gb202-tp16-202611071552`: 59.587 versus 59.770 tok/s, a 0.31% difference.
+Native functional qualification passed, but that small difference does not
+establish a comparable whole-model gain. The exported graph
 retains independent router and latent branches in all 92 MoE layers on all 16
 ranks. Different latent-projection precision settings and GPU topologies remain
 unqualified for this overlap. Raw component samples are in
