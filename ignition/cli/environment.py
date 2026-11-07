@@ -11,6 +11,7 @@ and compiler processes inherit the result.
 
 import hashlib
 import os
+import sys
 from importlib import util
 from pathlib import Path
 
@@ -37,6 +38,9 @@ def apply(configuration, gpus, b12x=()) -> None:
     patches.apply()
     kernel_cache = configuration.directory("kernel_cache")
     os.environ.update({
+        # Inductor otherwise prepends Torch's site-packages ahead of editable
+        # FlashInfer and native-extension roots selected by the parent process.
+        "TORCH_CUSTOM_PYTHONPATH": os.pathsep.join(sys.path),
         "CUDA_VISIBLE_DEVICES": ",".join(gpu.uuid for gpu in gpus),
         "HF_HUB_CACHE": str(configuration.directory("hub_cache")),
         "B12X_COMPILE_CACHE_DIR": str(kernel_cache / "b12x"),

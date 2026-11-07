@@ -67,6 +67,11 @@ layouts captured when they were prepared.
 
 ## Environment setup
 
+Preparation preserves the parent's Python import-path order in Inductor workers
+through `TORCH_CUSTOM_PYTHONPATH`. An explicitly selected FlashInfer checkout
+therefore remains ahead of an installed copy in both the rank process and its
+compiler workers. This is dependency setup, not a serving configuration option.
+
 Set up the preparation environment and build the native CLI:
 
 ```sh
