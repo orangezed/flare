@@ -40,23 +40,27 @@ memory-clock offset +6000, TP16/DCP16, text only, C1, no MTP, 4096-token prefill
 capacity, lossless CSF expert scales, and `--online-mxfp8-scope kda-input`.
 Three requests used 221 prompt tokens and 4096 completion tokens at temperature
 1, top-p 0.95, and disabled top-k filtering. The native package was
-`gb202-tp16-202611070235` (staged sparse-context transfer).
+`gb202-tp16-202611070512`, prepared from Flare `51fbb0c3` and FlashInfer
+`7b9407038`, with staged sparse-context transfer and output-sharded latent
+projection during prefill.
 
 | Measurement | Result |
 |---|---:|
-| C1 decode, three runs | 57.816 / 57.810 / 57.812 tok/s |
-| Mean C1 decode | 57.812 tok/s |
+| C1 decode, three runs | 57.802 / 57.784 / 57.785 tok/s |
+| Mean C1 decode | 57.791 tok/s |
 | KV capacity | 4,659,200 tokens |
-| Uncached 32K prefill, three runs | 1715.13 / 1730.53 / 1728.16 tok/s |
-| Mean uncached 32K prefill, including one output token | 1724.61 tok/s |
+| Uncached 32K prefill, three runs | 1981.07 / 1965.70 / 1980.25 tok/s |
+| Mean uncached 32K prefill, including one output token | 1975.68 tok/s |
 | Native text, queued-request and 32K recall checks | 8 passed |
 
 The run retained checkpoint expert scales losslessly in CSF form and used no
 learned draft. GPU clock settings were checked before measurement. No other
 model or preparation job ran during timing; dashboard polling processes were
-not running. The preceding distributed-selection build measured 960.36 tok/s
-on this 32K workload. The observed prefill improvement is 79.6%; no decode gain
-is attributed to the transport change.
+not running. Under the same conditions, package `gb202-tp16-202611070235`
+measured 1724.61 tok/s prefill and 57.812 tok/s decode. The combined projection
+and reduction changes improved prefill by 14.6%; decode remained within 0.04%.
+This comparison does not isolate the two changes. The distributed-selection
+build without staged context measured 960.36 tok/s on this 32K workload.
 
 Compiled TP16 component tests preserve exact outputs, empty-context behavior,
 source lifetimes, and allocation-stable replay with delayed ranks. With a
@@ -93,9 +97,48 @@ TP16 checks also cover delayed ranks and twelve queued transfers with changing
 history. Latent bytes, index bytes and FP32 scale bits are checked exactly;
 attention outputs retain their independent numerical reference check. Native
 TP16/C1 target-only startup, memory and serving are qualified by the table above.
-Its package contains 192 peer regions, including one fixed staging allocation
+Its package contains 208 peer regions, including one fixed staging allocation
 per rank, and no peer-visible dynamic KV allocation. The 3,000 tok/s prefill
 target has not been achieved.
+
+Implemented: prefill computes complete latent output columns from the full
+BF16 input, using the output-row weight partitions already loaded for decode.
+One prepared all-gather carries those BF16 values together with the exact FP32
+router bytes. A shared 1024-row send/receive pair uses 11,698,176 bytes per TP16
+rank. Expert selection, post-expert normalization and shared-expert scheduling
+retain their existing behavior. This removes 184 latent-down reductions from a
+4096-token prefill graph.
+
+Qualified component conditions: K3.1 checkpoint layer 1, sixteen RTX PRO 6000
+GPUs, checkpoint BF16 latent and router weights, and complete compiled
+projection/transport/routing calls. GPU timing includes extraction, packing,
+unpacking and expert selection; each sample uses the slowest rank.
+
+| Rows | Column-sharded projection and reduction | Output-sharded projection and gather |
+|---:|---:|---:|
+| 128 | 0.172 ms | 0.109 ms |
+| 1024 | 1.063 ms | 0.477 ms |
+| 4096 | 4.188 ms | 1.850 ms |
+
+Router logits, selected experts and weights matched exactly. At 4096 rows,
+relative latent error against the full-K FP32 projection rounded to BF16 fell
+from about 0.00325 to 0.00010: gathering complete columns avoids rounding the
+column-sharded partial dots. These are component numerical checks, not a
+model-quality score. `tools/kimi31_routing_probe.py` reproduces the comparison
+from a checkpoint path; a repeat with an empty Inductor cache passed.
+`tests/recipes/test_kimi3_latent_gather_cuda.py` checks exact transport bits,
+partial chunks, poisoned shared storage, changing inputs, allocation stability,
+and eager/compiled graph replay. The native result is reported above.
+One diagnostic attempt stalled with some ranks releasing resources and others
+waiting for GPU work; its log did not record a cause. Complete
+repeats, including the empty-cache run and native serving checks, passed. The
+cause of that diagnostic failure remains unidentified.
+
+FlashInfer also batches four independent stride positions before consuming
+peer loads in the TP16 island reduction. Addition order and BF16 conversions
+remain unchanged. Its paired 14 MiB, 512-thread, 16-CTA component test decreased
+from 1.683–1.687 ms to 1.577 ms. Exact ordered-reference tests cover scalar and
+batched tails, delayed ranks and queued replay with changing inputs.
 
 Implemented: `--speculative-method dflash2` selects
 `RadixArk/Kimi-K3.1-Dflash2-Preview` at its pinned recipe revision. Accepted
