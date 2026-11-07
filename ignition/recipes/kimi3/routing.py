@@ -22,6 +22,62 @@ _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
 
 
+class PreparedLatentShardGather:
+    """Gather latent-output column partitions and FP32 router logits in chunks.
+
+    Each rank owns output columns of both projections. Router bytes travel in
+    BF16 views without conversion. Serial layers reuse the supplied send and
+    receive buffers; each chunk is consumed before the next overwrites them.
+    """
+
+    def __init__(self, local_down, local_router, latent, logits, *, runtime,
+                 session, coordinator, name, buffers, allocator=None):
+        from ignition.components.collectives import PreparedAllGather
+
+        rows, self.down_columns = local_down.shape
+        self.world = runtime.world_size
+        self.router_columns = local_router.shape[1]
+        self.columns = self.down_columns + 2 * self.router_columns
+        if (local_down.dtype != torch.bfloat16 or local_router.dtype != torch.float32
+                or latent.shape != (rows, self.world * self.down_columns)
+                or logits.shape != (rows, self.world * self.router_columns)
+                or latent.dtype != torch.bfloat16 or logits.dtype != torch.float32
+                or local_router.shape[0] != rows
+                or not all(value.is_contiguous() and value.device == local_down.device
+                           for value in (local_down, local_router, latent, logits))):
+            raise ValueError("latent routing requires matching contiguous BF16 latent and FP32 router partitions")
+        self.local_down, self.local_router = local_down, local_router
+        self.latent, self.logits = latent, logits
+        chunk_rows = min(rows, runtime.max_batch_size)
+
+        def allocate(field, columns):
+            if field not in buffers or buffers[field].shape[0] < chunk_rows:
+                shape = (chunk_rows, columns)
+                buffers[field] = (torch.zeros(shape, dtype=torch.bfloat16, device=local_down.device)
+                                  if allocator is None else allocator.zeros(shape, torch.bfloat16))
+            return buffers[field][:chunk_rows]
+
+        self.send = allocate("send", self.columns)
+        self.received = allocate("received", self.columns * self.world)
+        self.bounds = [(begin, min(rows, begin + chunk_rows)) for begin in range(0, rows, chunk_rows)]
+        self.parts = [PreparedAllGather(self.send[:end-begin], self.received[:end-begin],
+            runtime=runtime, session=session, coordinator=coordinator, name=f"{name}.{index}")
+            for index, (begin, end) in enumerate(self.bounds)]
+
+    def __call__(self):
+        for (begin, end), part in zip(self.bounds, self.parts, strict=True):
+            count = end - begin
+            self.send[:count, :self.down_columns].copy_(self.local_down[begin:end])
+            self.send[:count, self.down_columns:].copy_(self.local_router[begin:end].view(torch.bfloat16))
+            part(self.send[:count])
+            received = self.received[:count].view(count, self.world, self.columns)
+            self.latent[begin:end].view(count, self.world, self.down_columns).copy_(
+                received[:, :, :self.down_columns])
+            self.logits[begin:end].view(count, self.world, self.router_columns).view(torch.bfloat16).copy_(
+                received[:, :, self.down_columns:])
+        return self.latent
+
+
 def create_route_runtime(group, device, *, ipc=None):
     """Allocate the b12x exchange that carries 1-8 rows of K3 latent and router shards."""
     import torch.distributed as dist

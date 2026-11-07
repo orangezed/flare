@@ -268,6 +268,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             ipc=package_storage.peer_storage)
         route_collective = (create_route_runtime(group, device, ipc=package_storage.peer_storage)
                             if shard.world_size > 1 else None)
+        prefill_route_collective = (create_head_exchange(group, device, max_rows=channel_rows,
+            heads=shard.world_size,
+            head_dim=(weights.config.text["routed_expert_hidden_size"] + 2 * weights.config.text["num_experts"]) // shard.world_size,
+            ipc=package_storage.peer_storage) if shard.world_size > 1 else None)
         context = None
         if config.context_parallel and shard.world_size > 1:
             from .dcp import RECORD_BYTES, ContextParallel, ContextShards
@@ -378,7 +382,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
         route_runtime=route_collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
-        vision_state=vision_state, context=context, latent_runtimes=latent_runtimes)
+        vision_state=vision_state, context=context, latent_runtimes=latent_runtimes,
+        prefill_route_runtime=prefill_route_collective)
     speculation = None
     if drafting:
         from .dspark import SpeculativePreparation
@@ -550,7 +555,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                            decoder_buffers.scratch_tensors(), *draft_disposable]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, collective,
-                   vocabulary_collective, embedding_collective, router_collective, route_collective,
+                   vocabulary_collective, embedding_collective, router_collective, route_collective, prefill_route_collective,
                    vision_inputs, vision_prefill, vision_state, vision_storage, scratch_pool, shared_scratch, graph_buffers,
                    speculation, context_collective, markov_collective, latent_runtimes,
                    draft_context_collective, convolution_collective))
