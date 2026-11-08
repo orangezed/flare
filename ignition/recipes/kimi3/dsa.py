@@ -58,8 +58,16 @@ class PreparedDSA:
             return buffers[key][:shape[0]]
 
         self.index_query = allocate("index_query", (rows, INDEX_HEADS, INDEX_DIM), torch.bfloat16)
+        from ignition.components.weights import OutputPartitionedBF16Weight
+        self.partitioned = isinstance(weights["index_query"], OutputPartitionedBF16Weight)
+        self.local_index_query = self.index_query
+        if self.partitioned:
+            if context is None or context.paired_queries is None or self.gathered_context:
+                raise ValueError("partitioned index decode requires paired context-parallel query exchange")
+            self.local_index_query = allocate("index_query_local",
+                (rows, INDEX_HEADS//self.shards.world, INDEX_DIM), torch.bfloat16)
         self.key = allocate("index_key", (rows, INDEX_DIM), torch.bfloat16)
-        self.project = prepare_projection(query_residual, weights["index_query"], self.index_query.view(rows, -1),
+        self.project = prepare_projection(query_residual, weights["index_query"], self.local_index_query.view(rows, -1),
             session=session, name=name + ".index_query", workspace=workspace)
         capacity = self.step
         self.pages = allocate("index_pages", (capacity, metadata.token_page_table.shape[1] * 2), torch.int32)
@@ -103,7 +111,7 @@ class PreparedDSA:
                     world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
                     session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor,
                     workspace=workspace)
-            gather = combine = None
+            gather = combine = paired = None
             q, attended = query[begin:end], output[begin:end]
             if self.gathered_context:
                 quantized = cursor.zeros(q.shape, torch.float8_e4m3fn)
@@ -113,8 +121,16 @@ class PreparedDSA:
                 q = cursor.zeros((count, heads * self.shards.world, RECORD_BYTES), torch.float8_e4m3fn)
                 attended = cursor.zeros((count, heads * self.shards.world, 512), torch.bfloat16)
                 lse = cursor.zeros((count, heads * self.shards.world), torch.float32)
-                gather = PreparedAllGather(quantized.view(count, -1), q.view(count, -1), runtime=context.heads,
-                    coordinator=coordinator, session=session, name=stage_name + ".gather_heads")
+                if self.partitioned:
+                    from ignition.components.peer_rows import PreparedPairedGather
+
+                    paired = PreparedPairedGather(quantized.view(count, -1),
+                        self.local_index_query[begin:end].view(count, -1), q.view(count, -1),
+                        self.index_query[begin:end].view(count, -1), runtime=context.paired_queries,
+                        session=session, coordinator=coordinator, name=stage_name + ".queries", buffers=cursor)
+                else:
+                    gather = PreparedAllGather(quantized.view(count, -1), q.view(count, -1), runtime=context.heads,
+                        coordinator=coordinator, session=session, name=stage_name + ".gather_heads")
                 combine = PreparedLseReduceScatter(attended, lse, output[begin:end], runtime=context.heads,
                     session=session, coordinator=coordinator, name=stage_name + ".combine", threads=512, block_limit=8)
             else:
@@ -126,7 +142,7 @@ class PreparedDSA:
             attention = PreparedDenseMLA(q, cache_records, attended,
                 physical, counts, offsets, caps=caps,
                 scale=192**-.5, session=session, name=stage_name + ".sparse_attention", workspace=workspace, lse=lse)
-            self.stages.append((begin, end, selector, merge, quantized, gather, attention, combine, lse))
+            self.stages.append((begin, end, selector, merge, quantized, gather, attention, combine, lse, paired))
 
     def __call__(self):
         if self.prefill is not None:
@@ -136,13 +152,16 @@ class PreparedDSA:
         self.key.copy_(torch.nn.functional.layer_norm(self.key_input.float(), (INDEX_DIM,),
             self.norm_weight.float(), self.norm_bias.float(), self.eps).to(self.key.dtype))
         self.stages[0][2].write_keys(self.key, self.slots)
-        for begin, end, selector, merge, quantized, gather, attention, combine, lse in self.stages:
+        for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired in self.stages:
             count = end - begin
             positions, pages = m.positions[begin:end], m.token_page_table[begin:end]
             expanded = pages[:, :, None] * 2 + self.page_halves
             self.pages[:count].copy_(torch.where(pages[:, :, None] >= 0, expanded, -1).flatten(1))
             self.lengths[:count].copy_(shards.local_tokens((positions + 1).clamp_min(0)).to(torch.int32))
             self.active.copy_(self.lengths[:count].max().reshape(1))
+            if paired is not None:
+                quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
+                paired(quantized.view(count, -1), self.local_index_query[begin:end].view(count, -1))
             selector()
             selected = self.local[:count] if merge is None else merge()
             if self.gathered_context:
@@ -161,7 +180,7 @@ class PreparedDSA:
                     rank=shards.owner, page_size=PAGE_TOKENS)
             self.physical[:count].copy_(physical)
             self.counts[:count].copy_(lengths)
-            if quantized is not None:
+            if quantized is not None and paired is None:
                 quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
             if gather is not None:
                 gather(quantized.view(count, -1))

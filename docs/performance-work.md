@@ -202,11 +202,19 @@ indexer batches reuse packed queries and scales. The bounded decoder suffix
 gathers into destinations disjoint from the full prefill. Candidate rows follow
 the suffix capacity when hierarchical selection starts after that boundary.
 Verification compressor values and gates remain separate through acceptance.
-GLM's mHC carry and Kimi's named private buffers still require a stage-lifetime
-review. Nemotron reuses a cursor across serialized heterogeneous blocks.
-DeepSeek V4.1, MiMo, and Kimi draft-context projections retain dedicated
-intermediate tensors;
-review their consumption and history updates before sharing decoder storage.
+Kimi's serialized KDA, MLA, DSA, dense MLP, and routed MoE stages share private
+storage beyond persistent residuals, reductions, and draft auxiliary features.
+Each stage retains disjoint operands until its output reduction completes.
+K3.1 DFlash2 context projections reuse that private storage after the target
+finishes. With MXFP8 draft projections on SM120/SM121, accepted prefill retains
+the draft's 1024-token auxiliary suffix plus 256 rows of alignment capacity;
+the two context GEMMs retain the enclosing row geometry's reduction schedule
+and the suffix's row placement. Verification features and draft
+history remain complete. Native graph execution must serialize these uses.
+GLM's mHC carry still requires a stage-lifetime review. Nemotron reuses a cursor
+across serialized heterogeneous blocks. DeepSeek V4.1 and MiMo draft-context
+projections retain dedicated intermediate tensors; review their consumption and
+history updates before sharing decoder storage.
 
 Allocated scratch bytes are an upper bound, not a measurement of simultaneously
 live values. Typed chunk rounding, tensor views, graph-created temporaries,

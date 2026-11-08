@@ -36,7 +36,7 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False,
-             peers=None, vision=True, draft_head_quantization=None):
+             peers=None, vision=True, draft_head_quantization=None, index_partitioning=False):
         """``peers``, a host's Gloo group and peer storage, reads column-sharded projections once per host.
 
         ``draft_checkpoint`` loads the declared sliding-window or full-context MLA DSpark model.
@@ -44,7 +44,7 @@ class ModelWeights:
         """
         before = torch.cuda.memory_allocated(device)
         with KimiWeightLoader(manifest, device, shard=shard, progress=progress, online_mxfp8=online_mxfp8,
-                              peers=peers) as loader:
+                              peers=peers, index_partitioning=index_partitioning) as loader:
             config = replace(loader.config, draft=None)
             embedding = loader.linear(f"{PREFIX}.embed_tokens", columns=shard.partition(config.hidden, alignment=64))
             norm, res_norm, res_proj = loader.load_tensors(tuple(f"{PREFIX}.{n}.weight" for n in
@@ -84,13 +84,16 @@ class ModelWeights:
 
 
 class KimiWeightLoader(DirectWeightLoader):
-    def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, online_mxfp8=False, peers=None):
+    def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, online_mxfp8=False, peers=None,
+                 index_partitioning=False):
         super().__init__(manifest, device, prefixes=prefixes, progress=progress)
         self.peers, self.shared_columns = peers, None
         self.config, self.shard = ModelConfig.load(manifest.snapshot), shard
         # Online conversion stores attention, shared-expert, and latent projections as E4M3 values
         # with E8M0 block-32 scales; their activations stay BF16.
         self.online_mxfp8 = online_mxfp8
+        self.index_partitioning = (index_partitioning and shard.world_size > 1
+                                   and torch.cuda.get_device_capability(device) in ((12, 0), (12, 1)))
         self.config.validate_shard(shard)
         self.scale_scratch = None
         if self.config.text["quantization_config"].get("quant_method") == "exl3":
@@ -188,10 +191,17 @@ class KimiWeightLoader(DirectWeightLoader):
             width = sum(x.shape[0] for x in latent)
             suffix = ()
             if self.config.layers[index] == "dsa":
-                # Index heads are replicated: each context rank scores its own keys with all heads.
                 # The key and head-weight projections share the layer input with the MLA projections.
                 suffix = (self.linear(a + ".indexer.wk"), self.linear(a + ".indexer.weights_proj"))
-                attention["index_query"] = self.linear(a + ".indexer.wq_b")
+                full_index = self.linear(a + ".indexer.wq_b")
+                if self.index_partitioning:
+                    from ignition.components.weights import OutputPartitionedBF16Weight
+
+                    first, end = shard.partition(32)
+                    attention["index_query"] = OutputPartitionedBF16Weight(
+                        full_index[first*128:end*128].clone(), full_index.shape[0], full_index.cpu())
+                else:
+                    attention["index_query"] = full_index
                 attention["index_norm"] = self.load_tensor(a + ".indexer.k_norm.weight")
                 attention["index_bias"] = self.load_tensor(a + ".indexer.k_norm.bias")
             attention["latent_gate"] = torch.cat((*latent, gate.new_zeros((-width % 8, gate.shape[1])), gate, *suffix))

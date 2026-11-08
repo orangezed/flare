@@ -47,7 +47,7 @@ from ignition.progress import phase
 from .config import PAGE_TOKENS, LatentDSparkConfig
 from ignition.recipes.kimi31.dflash_config import DFlash2Config
 from .contract import prepare as prepare_contract
-from .decoder import DecoderStorage, PreparedDecoder, Scratch
+from .decoder import DecoderStorage, PreparedDecoder, Scratch, retained_auxiliary_rows
 from .pool import ContinuationPool, continuation_layout, page_bytes
 from .weights import ModelWeights
 from .vision import (PATCH_CAPACITIES, FEATURES, HIDDEN, PreparedVision, VisionInputs, VisionScratch,
@@ -191,7 +191,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         peers = None if group is None or package_storage.peer_storage is None else (group, package_storage.peer_storage)
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, online_mxfp8=config.online_mxfp8,
                                     draft_checkpoint=config.draft_checkpoint, peers=peers,
-                                    vision=config.vision, draft_head_quantization=config.draft_head_quantization)
+                                    vision=config.vision, draft_head_quantization=config.draft_head_quantization,
+                                    index_partitioning=config.context_parallel)
         if weights.config.model_type == "kimi_k31":
             from ignition.recipes.kimi31.recipe import RECIPE
         del manifest
@@ -302,6 +303,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 selections=(create_all_gather_runtime(group, device,
                     max_rows=min(32, (config.prefill_chunk_size + shard.world_size - 1) // shard.world_size),
                     columns=2 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None))
+            from ignition.components.weights import OutputPartitionedBF16Weight
+            if any(isinstance(layer["attention"].get("index_query"), OutputPartitionedBF16Weight)
+                   for layer in weights.layers):
+                from ignition.components.peer_rows import SharedPeerRows
+
+                context = replace(context,
+                    paired_queries=create_all_gather_runtime(group, device, max_rows=selection_rows,
+                        columns=(heads * RECORD_BYTES + 32 * 128 * 2)//2, ipc=package_storage.peer_storage),
+                    index_exchange=SharedPeerRows(group, device, rows=config.prefill_chunk_size,
+                        row_bytes=(32//shard.world_size)*132, ipc=package_storage.peer_storage))
         # Every MLA step gathers each rank's query and KV latent rows, padded to 16 bytes: one exchange for up to
         # eight rows, as vLLM's b12x latent transport carries, and one that prefill steps use in chunks.
         text = weights.config.text
@@ -332,7 +343,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             # KDA and MLA layers execute serially and share their attention output.
             text_shapes = (text_shape,) * 4
             if drafting:
-                text_shapes += ((text_shape[0], len(weights.config.draft.auxiliary_layers) * text_shape[1]),)
+                auxiliary_rows = max(config.decode_tokens,
+                    retained_auxiliary_rows(weights, config.prefill_chunk_size, mode="prefill"))
+                text_shapes += ((auxiliary_rows, len(weights.config.draft.auxiliary_layers) * text_shape[1]),)
             patches = PATCH_CAPACITIES if config.vision else ()
             cursor = graph_buffers.cursor()
             shared_scratch = cursor.zeros((max(0 if not patches else
@@ -408,7 +421,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         if isinstance(weights.config.draft, DFlash2Config):
             from ignition.recipes.kimi31.dflash import SpeculativePreparation
             extra = dict(latent_runtime=latent_runtimes[0], context_latent_runtime=draft_context_collective,
-                         convolution_runtime=convolution_collective)
+                         convolution_runtime=convolution_collective,
+                         context_buffers=cursor.fork())
         speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage, completion=completion,
             frame=frame, sequence=sequence, session=session, workspace=arena, collectives=collectives,
             decoder_buffers=decoder_buffers, draft_tokens=config.draft_tokens, context_runtime=context_collective,
@@ -503,6 +517,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()),
                         enabled=enabled)
+    from ignition.components.weights import OutputPartitionedBF16Weight
+    for layer in weights.layers:
+        index_weight = layer["attention"].get("index_query")
+        if isinstance(index_weight, OutputPartitionedBF16Weight):
+            index_weight.reference_cpu = None
     deferred_pool.release_backing()
     try:
         with phase(progress, "Prepare and tune kernels") as stage, transient:
@@ -586,11 +605,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     return PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'output_res_score', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         close_resources=(*(() if scoring is None else (scoring,)),
-                         *(() if prefill_collective is None else (prefill_collective,))),
+                         *(() if prefill_collective is None else (prefill_collective,)),
+                         *(() if context is None or context.index_exchange is None else
+                           (context.index_exchange, context.paired_queries))),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges([prefill_storage, decode_storage, graph_buffers.chunks,
             None if speculation is None else speculation.sampling_buffers.chunks, arena.tensor, metadata,
                                            *(() if context is None else (context.slab, context.index_slab)),
+                                           *(() if context is None or context.index_exchange is None else
+                                             (context.index_exchange.staging,)),
                                            *(() if not patches else (vision_storage, vision_state.arena)),
                                            decoder_buffers.scratch_tensors(), *draft_disposable]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,

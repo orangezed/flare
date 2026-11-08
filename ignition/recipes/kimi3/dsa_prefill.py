@@ -3,12 +3,18 @@
 """Sparse prefill with gathered FP8 context and query-row-sharded index selection."""
 
 import torch
-from b12x.attention import dense_mla
+from b12x.attention import dense_mla, dsa_indexer
+from b12x.attention.dsa_indexer import glm_pool
+from b12x.preparation import PreparedCall
 
 from ignition.components.collectives import PreparedAllGather
 from ignition.components.dense_mla import PreparedDenseMLA
 from ignition.components.fp8_indexer import PreparedFP8Indexer
+from ignition.components.indexer import PreparedSparseIndexer
+from ignition.components.peer_rows import PreparedOwnerRows
+from ignition.components.weights import OutputPartitionedBF16Weight
 from ignition.preparation.scratch import GraphBufferPool
+from ignition.preparation.tuning import declare
 
 from .config import PAGE_TOKENS
 from .dcp import RECORD_BYTES, pull_context, pull_index_context, write_records
@@ -18,8 +24,9 @@ from .projections import prepare_projection
 class PreparedGatheredDSA:
     """Each rank selects a disjoint strided subset of query rows over the whole context.
 
-    Only final selected positions cross ranks. Every rank then attends its original
-    heads to the gathered FP8 latents. Past context is immutable; current-chunk keys
+    Partitioned index weights exchange exact quantized query fields before selection.
+    Final selected positions cross ranks; every rank attends its original heads
+    to the gathered FP8 latents. Past context is immutable; current-chunk keys
     and latents are available on every rank and written directly into the slab.
     Selection buffers are reused between slices and graph capacities.
     """
@@ -46,15 +53,21 @@ class PreparedGatheredDSA:
         cursor = buffers["gathered_prefill_pool"].cursor()
         def zeros(shape, dtype=torch.bfloat16):
             return cursor.zeros(shape, dtype)
-        self.index_query = zeros((rows, 32, 128))
+        self.partitioned = isinstance(weights["index_query"], OutputPartitionedBF16Weight)
+        local_heads = 32//world if self.partitioned else 32
+        if self.partitioned and (context.index_exchange is None or rows % world):
+            raise ValueError("partitioned index prefill requires complete owner rows and peer query staging")
+        self.index_query = zeros((rows, local_heads, 128))
         self.key = zeros((rows, 128))
         self.project = prepare_projection(residual, weights["index_query"], self.index_query.view(rows, -1),
             session=session, name=name + ".index_query", workspace=workspace)
         self.row_ids = torch.arange(self.local_rows, dtype=torch.int64, device=device) * world
         self.global_ids = torch.arange(self.step, dtype=torch.int64, device=device)
         self.selected_rows = zeros((self.local_rows,), torch.int64)
-        self.local_query = zeros((self.local_rows, 32, 128))
-        self.local_weights = zeros((self.local_rows, 32))
+        self.local_query = zeros((self.local_rows, 32, 128),
+                                 torch.float8_e4m3fn if self.partitioned else torch.bfloat16)
+        self.local_weights = zeros((self.local_rows, 32),
+                                   torch.float32 if self.partitioned else torch.bfloat16)
         self.lengths = zeros((self.local_rows,), torch.int32)
         self.active = zeros((1,), torch.int32)
         self.pages = zeros((self.local_rows, context.index_slab.shape[0]), torch.int32)
@@ -62,9 +75,30 @@ class PreparedGatheredDSA:
         self.selected = zeros((self.local_rows, 2048), torch.int32)
         self.gathered = zeros((self.local_rows, world * 2048), torch.int32)
         self.window = zeros((2,), torch.int64)
-        self.selector = PreparedFP8Indexer(self.local_query, self.local_weights, context.index_slab,
-            self.pages, self.lengths, self.active, self.selected, mode="decode", session=session,
-            name=name + ".index", workspace=workspace, buffers=cursor, rotation="none")
+        if self.partitioned:
+            self.head_columns = torch.arange(local_heads, device=device, dtype=torch.int64)
+            self.local_quantized = zeros((rows, local_heads, 128), torch.float8_e4m3fn)
+            self.query_scales = zeros((rows, local_heads), torch.float32)
+            self.folded_weights = zeros((rows, local_heads), torch.float32)
+            self.owned_query = zeros((rows//world, 32, 128), torch.float8_e4m3fn)
+            self.owned_weights = zeros((rows//world, 32), torch.float32)
+            self.query_arguments = (self.index_query.view(-1,128), self.local_quantized.view(-1,128),
+                                    self.query_scales.view(-1), self.folded_weights.view(-1))
+            self.query_plan = glm_pool.plan_queries(*self.query_arguments, rotation="none")
+            declare(session, (self.query_plan.request(name=name+".index_quantize", prepare_call=lambda state:
+                PreparedCall(run=lambda: state.quantize(*self.query_arguments))),))
+            self.exchange = PreparedOwnerRows(self.local_quantized.view(rows,-1), self.folded_weights,
+                self.owned_query.view(rows//world,-1), self.owned_weights, shared=context.index_exchange,
+                session=session, coordinator=coordinator, name=name+".index_queries", buffers=cursor)
+            index_caps = dsa_indexer.Caps(device=device, num_q_heads=32, max_q_rows=self.local_rows,
+                max_page_table_width=self.pages.shape[1], topk=2048, mode="decode")
+            self.selector = PreparedSparseIndexer(self.local_query,self.local_weights,context.index_slab,
+                self.pages,self.lengths,self.active,self.selected,caps=index_caps,session=session,
+                name=name+".index.select",workspace=workspace)
+        else:
+            self.selector = PreparedFP8Indexer(self.local_query, self.local_weights, context.index_slab,
+                self.pages, self.lengths, self.active, self.selected, mode="decode", session=session,
+                name=name + ".index", workspace=workspace, buffers=cursor, rotation="none")
         # The cache writer is also used on the committed sharded index pool.
         self.index_cache = index_cache
         self.gather = PreparedAllGather(self.selected.view(torch.float32), self.gathered.view(torch.float32),
@@ -87,6 +121,11 @@ class PreparedGatheredDSA:
 
         m, c = self.metadata, self.context
         self.project(self.residual)
+        if self.partitioned:
+            columns = self.head_columns + c.shards.owner * self.head_columns.numel()
+            self.folded_weights.copy_(self.head_weights[:, columns])
+            glm_pool.quantize_queries(*self.query_arguments, plan=self.query_plan)
+            self.exchange(self.local_quantized.view(self.rows,-1), self.folded_weights)
         self.key.copy_(torch.nn.functional.layer_norm(self.key_input.float(), (128,),
             self.norm_weight.float(), self.norm_bias.float(), self.eps).to(torch.bfloat16))
         torch.library.wrap_triton(_write_keys)[(self.rows,)](self.key,
@@ -97,13 +136,20 @@ class PreparedGatheredDSA:
         pull_context(self.peers, m.page_table[0], self.window, c.slab.view(torch.int32), c.shards)
         pull_index_context(self.index_peers, m.page_table[0], self.window[1:], c.index_slab, c.shards)
         write_records(self.latent, m.positions, c.slab)
-        self.selector.write_keys(self.key, m.positions)
+        torch.library.wrap_triton(_write_keys)[(self.rows,)](self.key,
+            c.index_slab.view(torch.float8_e4m3fn), c.index_slab.view(torch.float32),
+            m.positions, c.index_slab.stride(0), False, num_warps=4)
         self.pages.copy_(self.page_ids[None])
         for begin in range(0, self.rows, self.step):
             self.selected_rows.copy_(begin + self.row_ids + c.shards.owner)
             safe = self.selected_rows.clamp_max(self.rows - 1)
-            self.local_query.copy_(self.index_query[safe])
-            self.local_weights.copy_(self.head_weights[safe])
+            if self.partitioned:
+                first = begin//self.world
+                self.local_query.copy_(self.owned_query[first:first+self.local_rows])
+                self.local_weights.copy_(self.owned_weights[first:first+self.local_rows])
+            else:
+                self.local_query.copy_(self.index_query[safe])
+                self.local_weights.copy_(self.head_weights[safe])
             self.lengths.copy_(torch.where(self.selected_rows < self.rows, (m.positions[safe] + 1).clamp_min(0), 0))
             self.active.copy_(self.lengths.max().reshape(1))
             self.selector()

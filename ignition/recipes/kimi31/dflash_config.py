@@ -9,6 +9,8 @@ import math
 REPOSITORY = "RadixArk/Kimi-K3.1-Dflash2-Preview"
 REVISION = "ea257b38a8ee755b65287bb8ccd0938b519ce26b"
 WEIGHT_BYTES = 5_569_622_016
+# Preserve the original token's tensor-core row placement when retaining a suffix.
+CONTEXT_ROW_ALIGNMENT = 256
 
 
 @dataclass(frozen=True)

@@ -1039,7 +1039,11 @@ Target conversion covers the K3 projection set described above. In sparse
 attention, the fused latent/gate projection also contains the index key and
 index head-weight projections (`indexer.wk` and `indexer.weights_proj`), so
 those weights convert together. The separate index query projection
-(`indexer.wq_b`) retains BF16. The full-context draft converts its context
+(`indexer.wq_b`) retains BF16. On SM120/SM121 with context parallelism it is
+sharded by output heads. Its projection inherits the full-width matrix's
+selected reduction schedule; prefill exchanges already-quantized index queries,
+and decode packs index queries with the MLA query gather. This changes storage
+and communication layout without adding quantization. The full-context draft converts its context
 projection, fused query/KV input projection, query expansion, attention output,
 and MLP gate/up/down projections. Its separate target-feedback KV projection,
 batched key/value projections, normalization and Markov weights retain BF16.

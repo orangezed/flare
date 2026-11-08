@@ -4,7 +4,7 @@
 
 """Kimi K3 attention residuals and latent MoE composed into complete forwards."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import triton
@@ -73,6 +73,7 @@ class DecoderStorage:
     hidden_columns: torch.Tensor
     latent_begin: torch.Tensor
     allocator: object = None
+    stage_allocators: dict = field(default_factory=dict)
 
     @classmethod
     def allocate(cls, config, shard, device, *, scratch=None, allocator=None):
@@ -83,6 +84,14 @@ class DecoderStorage:
 
     def scratch_tensors(self):
         return tuple(self.scratch.values())
+
+    def stage_allocator(self, name):
+        """Serial attention and MLP stages share storage beyond persistent decoder values."""
+        if self.allocator is None:
+            return None
+        if name not in self.stage_allocators:
+            self.stage_allocators[name] = self.allocator.fork()
+        return self.stage_allocators[name]
 
 
 @dataclass(frozen=True)
@@ -102,6 +111,20 @@ class Scratch:
 
     def rows(self, tokens, rows):
         return type(self)(self.activations[:tokens], self.hidden[:rows], self.local_logits[:rows], self.logits[:rows])
+
+
+def retained_auxiliary_rows(weights, tokens, *, mode):
+    """Bound accepted-prefill features where the projection preserves enclosing-row arithmetic."""
+    from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+    from ignition.components.sm103_projection import is_sm103
+    from ignition.recipes.kimi31.dflash_config import DFlash2Config
+
+    if (mode == "prefill" and isinstance(weights.config.draft, DFlash2Config)
+            and weights.draft is not None and isinstance(weights.draft.projection, MXFP8LinearWeight)
+            and not is_sm103(weights.embedding.device)):
+        from ignition.recipes.kimi31.dflash_config import CONTEXT_ROW_ALIGNMENT
+        return min(tokens, weights.config.draft.window + CONTEXT_ROW_ALIGNMENT)
+    return tokens
 
 
 class PreparedMLP:
@@ -300,11 +323,28 @@ class PreparedDecoder:
             committed = -(-len(weights.layers) // config.text["attn_res_block_size"])
             self.buffers["residual"] = dict(blocks=zeros((tokens, committed, hidden)), prefix=zeros(source.shape))
         self.auxiliary = None
+        if "total" not in self.buffers:
+            self.buffers["total"] = zeros(source.shape)
+        self.auxiliary_layers = config.draft.auxiliary_layers if weights.draft is not None else ()
+        self.auxiliary_count = None
+        self.auxiliary_window, self.auxiliary_alignment = None, 1
+        if self.auxiliary_layers:
+            auxiliary_rows = retained_auxiliary_rows(weights, tokens, mode=mode)
+            if auxiliary_rows < tokens:
+                if metadata.lengths.numel() != 1 or config.draft.auxiliary_source != "attention_input":
+                    raise ValueError("bounded Kimi draft features require a single accepted prefill and attention-input taps")
+                self.auxiliary_count = metadata.lengths
+                from ignition.recipes.kimi31.dflash_config import CONTEXT_ROW_ALIGNMENT
+                self.auxiliary_window = config.draft.window
+                self.auxiliary_alignment = CONTEXT_ROW_ALIGNMENT
+            if "auxiliary" not in self.buffers:
+                self.buffers["auxiliary"] = zeros((auxiliary_rows, len(self.auxiliary_layers) * hidden))
+            self.auxiliary = self.buffers["auxiliary"][:auxiliary_rows]
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.layer{index}"
             kind = config.layers[index]
             kwargs = dict(mode=mode, session=session, name=prefix + ".attention", workspace=workspace,
-                          buffers=self.buffers.setdefault(kind, {}), allocator=allocator)
+                          buffers=self.buffers.setdefault(kind, {}), allocator=buffers.stage_allocator(kind))
             attention = (PreparedKDA(w["attention"], source, pool.recurrent(index), self.delta,
                 eps=config.text["rms_norm_eps"], records=kda_records.layer(index) if mode == "verify" else None,
                 **kwargs) if kind == "kda" else
@@ -325,7 +365,7 @@ class PreparedDecoder:
                 if "output" in self.buffers.get("moe", {}):
                     dense.setdefault("output", self.buffers["moe"]["output"])
                 mlp = PreparedMLP(w["mlp"], source, session=session, name=prefix + ".mlp", buffers=dense,
-                                  allocator=allocator)
+                                  allocator=buffers.stage_allocator("dense"))
             else:
                 # Shared experts write the sum buffer, which the preceding mixture consumed and the MoE
                 # reduction overwrites only after their output is added.
@@ -334,17 +374,17 @@ class PreparedDecoder:
                 mlp = PreparedLatentMoE(w, source, config, weights.shard, runtime=runtime,
                     router_runtime=router_runtime, route_runtime=route_runtime if mode != "prefill" else None,
                     coordinator=coordinator, session=session, name=prefix + ".moe", workspace=workspace,
-                    buffers=self.buffers.setdefault("moe", {}), storage=buffers, allocator=allocator,
+                    buffers=self.buffers.setdefault("moe", {}), storage=buffers, allocator=buffers.stage_allocator("moe"),
                     accumulation_buffers=accumulation_buffers)
             # The sum buffer is consumed before the next attention or MLP reduction.
-            if "total" not in self.buffers:
-                self.buffers["total"] = zeros(source.shape)
             total = self.buffers["total"][:source.shape[0]]
             reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedPromotedAllReduce
             reduction_args = {} if accumulation_buffers is None else dict(accumulation_buffers=accumulation_buffers)
             reduce = reduction(source, total, runtime=runtime, coordinator=coordinator,
                                session=session, name=prefix + ".reduce", **reduction_args)
             self.layers.append((w, attention, mlp, reduce))
+        if allocator is not None:
+            allocator.join(*buffers.stage_allocators.values())
         # The running block sum and committed blocks persist through one forward; every forward
         # rewrites them from its embeddings before reading them.
         r = self.buffers["residual"]
@@ -356,14 +396,6 @@ class PreparedDecoder:
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator, name=name + ".prompt")
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
-        # DSpark's context: the AttnRes mixture each auxiliary layer receives, before its input norm. Plans
-        # without the draft keep none.
-        self.auxiliary_layers = (config.draft.auxiliary_layers
-                                 if weights.draft is not None else ())
-        if self.auxiliary_layers:
-            if "auxiliary" not in self.buffers:
-                self.buffers["auxiliary"] = zeros((tokens, len(self.auxiliary_layers) * hidden))
-            self.auxiliary = self.buffers["auxiliary"][:tokens]
         self.replay = None
         if mode == "verify":
             indices = kda_records.layers
@@ -408,7 +440,9 @@ class PreparedDecoder:
                 column = self.auxiliary_layers.index(index) * self.residual.prefix.shape[1]
                 mixture = self.auxiliary[:, column:column + self.residual.prefix.shape[1]]
             hidden = self.residual.mix(delta, mode, sources=committed, write=index // size if boundary else -1,
-                score=w["attention_res_score"], norm=w["input_layernorm"], eps=eps, output_eps=eps, mixture=mixture)
+                score=w["attention_res_score"], norm=w["input_layernorm"], eps=eps, output_eps=eps, mixture=mixture,
+                mixture_count=self.auxiliary_count if mixture is not None else None,
+                mixture_window=self.auxiliary_window, mixture_alignment=self.auxiliary_alignment)
             attended = reduce(attention(hidden))
             hidden = self.residual.mix(attended, REPLACE if boundary else ADD, sources=committed + boundary, write=-1,
                 score=w["mlp_res_score"], norm=w["post_attention_layernorm"], eps=eps, output_eps=eps,

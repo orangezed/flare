@@ -88,7 +88,16 @@ class PreparedContext:
         c, shard = weights.config.draft, weights.shard
         rows, h = auxiliary.shape[0], weights.config.hidden
         self.window, self.world, self.eps = c.window, shard.world_size, c.text["rms_norm_eps"]
-        cursor = buffers.cursor()
+        cursor = buffers.cursor() if isinstance(buffers, GraphBufferPool) else buffers.fork()
+        self.compact_offsets = self.compact_positions = None
+        if rows < metadata.positions.numel():
+            from .dflash_config import CONTEXT_ROW_ALIGNMENT
+            if metadata.starts.numel() != 1 or rows != self.window + CONTEXT_ROW_ALIGNMENT:
+                raise ValueError("bounded Kimi draft features must cover one prefill suffix window")
+            self.row_alignment = CONTEXT_ROW_ALIGNMENT
+            self.compact_offsets = torch.arange(rows, device=auxiliary.device)
+            self.compact_positions = cursor.full((rows,), -1, metadata.positions.dtype)
+        reference_rows = metadata.positions.numel() if self.compact_positions is not None else None
         self.local = cursor.zeros((rows, h//shard.world_size), torch.bfloat16)
         self.projected = cursor.zeros((rows, h), torch.bfloat16)
         self.normalized = cursor.zeros((rows, h), torch.bfloat16)
@@ -98,11 +107,13 @@ class PreparedContext:
         self.latent = cursor.zeros((rows, 576), torch.bfloat16)
         self.slots = cursor.full((rows,), -1, torch.int64)
         self.project = prepare_projection(auxiliary, weights.draft.projection, self.local,
-            session=session, name=name+".project", workspace=workspace, activation_mode="a16")
+            session=session, name=name+".project", workspace=workspace, activation_mode="a16",
+            reference_rows=reference_rows)
         self.gather = PreparedChunkedAllGather(self.local, self.projected, runtime=runtime,
             coordinator=coordinator, session=session, name=name+".gather")
         self.project_kv = prepare_projection(self.normalized, weights.draft.context_kv, self.kv_local,
-            session=session, name=name+".kv", workspace=workspace, activation_mode="a16")
+            session=session, name=name+".kv", workspace=workspace, activation_mode="a16",
+            reference_rows=reference_rows)
         self.gather_kv = PreparedChunkedAllGather(self.kv_local, self.kv, runtime=latent_runtime,
             coordinator=coordinator, session=session, name=name+".kv_gather")
         self.rotary = YarnRotary(weights.config, auxiliary.device)
@@ -110,10 +121,23 @@ class PreparedContext:
 
     def __call__(self, auxiliary, counts):
         m, c = self.metadata, self.weights.config.draft
-        offset = m.positions - m.starts[m.requests]
-        count = counts[m.requests]
-        live = (m.positions >= 0) & (offset >= 0) & (offset < count) & (offset >= (count-self.window).clamp_min(0))
-        self.slots.copy_(torch.where(live, m.state_rows[m.requests]*self.window + m.positions.remainder(self.window), -1))
+        if self.compact_positions is None:
+            positions = m.positions
+            offset = positions - m.starts[m.requests]
+            count = counts[m.requests]
+            live = (positions >= 0) & (offset >= 0) & (offset < count) & (offset >= (count-self.window).clamp_min(0))
+            states = m.state_rows[m.requests]
+        else:
+            count = counts[0].long()
+            begin = (count-self.window).clamp_min(0)
+            origin = begin // self.row_alignment * self.row_alignment
+            offsets = origin + self.compact_offsets
+            indices = (m.query_start_loc[0] + offsets).clamp(0, m.positions.numel() - 1)
+            positions = m.positions[indices]
+            live = (offsets >= begin) & (offsets < count) & (positions >= 0)
+            self.compact_positions.copy_(torch.where(live, positions, -1))
+            positions, states = self.compact_positions, m.state_rows[0]
+        self.slots.copy_(torch.where(live, states*self.window + positions.remainder(self.window), -1))
         self.gather(self.project(auxiliary))
         rms_norm_columns(self.projected, self.weights.draft.hidden_norm, self.normalized, self.eps)
         self.gather_kv(self.project_kv(self.normalized))
@@ -123,11 +147,12 @@ class PreparedContext:
         for index, layer in enumerate(self.weights.draft.layers):
             self.latent.view(-1, self.world, 576//self.world).copy_(kv[:, :, index])
             rms_norm_columns(self.latent[:, :512], layer.attention["kv_norm"], self.latent[:, :512], self.eps)
-            self.rotary.apply(self.latent, m.positions)
+            self.rotary.apply(self.latent, positions)
             write_records(self.latent, self.slots, self.histories[index])
 
     def scratch_tensors(self):
-        return (self.local, self.projected, self.normalized, self.kv_local, self.kv, self.latent, self.slots)
+        tensors = (self.local, self.projected, self.normalized, self.kv_local, self.kv, self.latent, self.slots)
+        return tensors if self.compact_positions is None else (*tensors, self.compact_positions)
 
 
 class DraftAttention:
@@ -209,7 +234,7 @@ class DraftAttention:
 class SpeculativePreparation:
     def __init__(self, weights, pool, requests, inputs, scratch, *, completion, frame, sequence, session, workspace,
                  collectives, decoder_buffers, draft_tokens, context_runtime, page_tokens,
-                 latent_runtime, context_latent_runtime, convolution_runtime):
+                 latent_runtime, context_latent_runtime, convolution_runtime, context_buffers=None):
         self.page_tokens = page_tokens
         self.weights, self.tables, self.pool = weights, None, pool
         self.requests, self.inputs, self.scratch = requests, inputs, scratch
@@ -225,7 +250,8 @@ class SpeculativePreparation:
             return PreparedDecoder(weights, scratch, metadata, pool, mode=mode, buffers=decoder_buffers,
                 kda_records=self.kda_records if mode == "verify" else None, **{**collectives, **kwargs})
         self.block_size, self.logit_offset = draft_tokens+1, 1
-        self.context_buffers = GraphBufferPool(pool.backing.device, chunk_bytes=2 << 20)
+        self.context_buffers = (GraphBufferPool(pool.backing.device, chunk_bytes=2 << 20)
+                                if context_buffers is None else context_buffers)
         self.draft_buffers = GraphBufferPool(pool.backing.device, chunk_bytes=2 << 20)
         self.draft_scratch = DraftScratch.allocate(weights.config, weights.shard,
             requests.capacity*self.block_size, self.block_size, pool.backing.device, self.draft_buffers)

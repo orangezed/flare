@@ -22,10 +22,18 @@ from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import benchmark_resource, declare, register_context_plan, register_finalizer
 
 
-def prepare_projection(source, weight, output, *, session, name, workspace, activation_mode="auto", staging=None):
+def prepare_projection(source, weight, output, *, session, name, workspace, activation_mode="auto", staging=None,
+                       reference_rows=None):
     """Bind a projection without changing its checkpoint weight representation."""
     from .block_fp8 import BlockFP8Projection, BlockFP8Weight
-    from .weights import GroupedLinearWeights
+    from .weights import GroupedLinearWeights, OutputPartitionedBF16Weight
+
+    if isinstance(weight, OutputPartitionedBF16Weight):
+        from .partitioned_projection import PreparedOutputPartitionProjection
+
+        if reference_rows is not None:
+            raise ValueError("BF16 output partitions cannot also compact input rows")
+        return PreparedOutputPartitionProjection(source, weight, output, session=session, name=name, workspace=workspace)
 
     if isinstance(weight, GroupedLinearWeights):
         return PreparedProjectionGroup(source, weight, output, session=session, name=name, workspace=workspace,
@@ -35,7 +43,7 @@ def prepare_projection(source, weight, output, *, session, name, workspace, acti
     if isinstance(weight, BlockFP8Weight):
         return BlockFP8Projection(source, weight, output, session=session, name=name)
     return QuantizedProjection(source, weight, output, session=session, name=name,
-                               workspace=workspace, activation_mode=activation_mode)
+                               workspace=workspace, activation_mode=activation_mode, reference_rows=reference_rows)
 
 
 class PreparedProjectionGroup:
@@ -171,6 +179,7 @@ class QuantizedProjection:
         allow_bf16_atomic_reduction: bool | None = None,
         retain_packed_weights: bool = False,
         output_partition: tuple[int, int, int] | None = None,
+        reference_rows: int | None = None,
         buffers=None,
     ) -> None:
         from b12x.gemm.blockscaled._a16 import NVFP4LinearWeight, _overlap, _weight_parts
@@ -210,6 +219,10 @@ class QuantizedProjection:
                 retain_packed_weights or self.sm103 or not isinstance(weight, MXFP8LinearWeight)
                 or activation_mode != "a16"):
             raise ValueError("logical output partitions require expanded b12x MXFP8 A16 projections")
+        if reference_rows is not None and (
+                retain_packed_weights or self.sm103 or not isinstance(weight, MXFP8LinearWeight)
+                or activation_mode != "a16"):
+            raise ValueError("reference row geometry requires expanded b12x MXFP8 A16 projections")
         if source_activation != "identity" and (self.sm103 or not isinstance(weight, NVFP4LinearWeight)):
             raise ValueError("rounded SwiGLU projection requires b12x NVFP4 execution")
         if mxfp8_min_amax is not None or encoded is not None:
@@ -335,6 +348,9 @@ class QuantizedProjection:
                 query = replace(query, workspace_form="provided", workspace_nbytes=None)
             if output_partition is not None:
                 query = replace(query, output_partition=output_partition,
+                                expected_m=source.numel() // source.shape[-1])
+            if reference_rows is not None:
+                query = replace(query, reference_rows=reference_rows,
                                 expected_m=source.numel() // source.shape[-1])
             override = None
             if retain_packed_weights:

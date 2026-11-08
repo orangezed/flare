@@ -44,6 +44,7 @@ for _container, _fields in (
     # Shared Ignition weight containers: only these fields hold stored weights.
     ('ignition.components.weights.MLPWeights', ('gate_up', 'down')),
     ('ignition.components.weights.GroupedLinearWeights', ('parts',)),
+    ('ignition.components.weights.OutputPartitionedBF16Weight', ('values',)),
     ('ignition.components.dflash2_weights.DraftLayerWeights',
      ('qkv', 'output', 'query_norm', 'key_norm', 'input_norm', 'post_attention_norm',
       'mlp', 'attention_conv', 'mlp_conv')),
@@ -148,6 +149,28 @@ class GroupedLinearWeights:
 
     parts: tuple[object, ...]
     widths: tuple[int, ...]
+
+
+@dataclass
+class OutputPartitionedBF16Weight:
+    """Stored output rows plus a CPU-only full matrix used to select reference arithmetic.
+
+    Only ``values`` is a checkpoint weight in the runtime package. Preparation
+    releases ``reference_cpu`` after declaring the graph catalog; tuning fixtures
+    retain it until their private trials finish.
+    """
+
+    values: torch.Tensor
+    logical_out_features: int
+    reference_cpu: torch.Tensor | None
+
+    @property
+    def out_features(self):
+        return self.values.shape[0]
+
+    @property
+    def in_features(self):
+        return self.values.shape[1]
 
 
 class SharedColumnReads:

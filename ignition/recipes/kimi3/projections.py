@@ -9,6 +9,12 @@ from ignition.components.linear import QuantizedProjection, UnquantizedProjectio
 
 
 def prepare_projection(source, weight, output, *, session, name, workspace):
+    from ignition.components.weights import OutputPartitionedBF16Weight
+
+    if isinstance(weight, OutputPartitionedBF16Weight):
+        from ignition.components.partitioned_projection import PreparedOutputPartitionProjection
+
+        return PreparedOutputPartitionProjection(source, weight, output, session=session, name=name, workspace=workspace)
     if isinstance(weight, torch.Tensor):
         return UnquantizedProjection(source, weight, output, session=session, name=name)
     return QuantizedProjection(source, weight, output, session=session, name=name,

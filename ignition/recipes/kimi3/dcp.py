@@ -186,3 +186,5 @@ class ContextParallel:
     index_peers: dict | None = None
     index_slab: torch.Tensor | None = None
     selections: object = None
+    paired_queries: object = None
+    index_exchange: object = None
