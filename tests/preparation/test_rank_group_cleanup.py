@@ -8,7 +8,7 @@ import torch.distributed as dist
 from ignition.preparation.rank_group import PreparedRankGroup
 
 
-@pytest.mark.parametrize("started,deadline", [(False, 600000), (True, 60000)])
+@pytest.mark.parametrize("started,deadline", [(False, 300000), (True, 60000)])
 def test_cleanup_deadline_preserves_serving_drain(monkeypatch, started, deadline):
     destroyed = Mock()
     monkeypatch.setattr(dist, "destroy_process_group", destroyed)

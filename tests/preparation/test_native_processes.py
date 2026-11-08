@@ -31,6 +31,12 @@ if mode == 'normal':
         peer.stdin.write(b'q'); peer.stdin.flush()
     supervisor.finish_shutdown()
     assert all(peer.wait() == 0 for peer in peers)
+elif mode == 'preparation':
+    supervisor.begin_shutdown(300000)
+    for peer in peers:
+        peer.stdin.write(b'q'); peer.stdin.flush()
+    supervisor.finish_shutdown()
+    assert all(peer.wait() == 0 for peer in peers)
 elif mode == 'crash':
     peers[0].kill()
     time.sleep(60)
@@ -49,7 +55,7 @@ def terminated(pid):
         return True
 
 
-@pytest.mark.parametrize("mode", ["normal", "crash", "deadline", "orphan"])
+@pytest.mark.parametrize("mode", ["normal", "preparation", "crash", "deadline", "orphan"])
 def test_rank_group_shutdown_and_failure_do_not_leave_live_peers(mode):
     driver = subprocess.Popen([sys.executable, "-u", "-c", DRIVER], text=True,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -57,7 +63,7 @@ def test_rank_group_shutdown_and_failure_do_not_leave_live_peers(mode):
     try:
         peers = json.loads(driver.stdout.readline())
         _, error = driver.communicate(mode + "\n", timeout=10)
-        assert driver.returncode == (0 if mode in ("normal", "orphan") else 1), error
+        assert driver.returncode == (0 if mode in ("normal", "preparation", "orphan") else 1), error
         if mode == "crash":
             assert "exited before coordinated shutdown" in error
         if mode == "deadline":
