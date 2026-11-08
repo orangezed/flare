@@ -27,7 +27,8 @@ from ignition.components.paged_resume import PreparedResume
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
-                                              create_all_reduce_runtime, create_dma_all_reduce_runtime, create_head_exchange)
+                                              create_all_reduce_runtime, create_single_round_all_reduce_runtime,
+                                              create_head_exchange)
 from .routing import create_route_runtime
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.capture import capture_forwards
@@ -226,19 +227,18 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
-        # Prefill activations reduce in chunks of the rows decode and verification already need a channel for: a
-        # channel sized for whole prefill chunks would stage 448 MiB per rank for 4096 rows.
+        # Serial embedding and context gathers share bounded row staging.
         channel_rows = max(min(max_tokens, REDUCE_ROWS), config.decode_tokens)
-        from b12x.comm.pcie.pcie_dma import SUPPORTED_WORLD_SIZES
+        from b12x.comm.pcie.pcie_twoshot_bf16 import SUPPORTED_WORLD_SIZES
 
-        # Large prefill reductions have their own copy-engine channel. The SM
-        # channel holds only decode/verification rows and small control reductions.
+        # Prefill uses complete FP32 owner sums over original BF16 inputs. Keep
+        # decode/verification and small control reductions on their own channel.
         reduction_rows = config.decode_tokens if shard.world_size in SUPPORTED_WORLD_SIZES else channel_rows
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
             max_tokens=reduction_rows, hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
-        prefill_collective = (create_dma_all_reduce_runtime(group, device,
-            max_tokens=min(config.prefill_chunk_size, REDUCE_ROWS), hidden_size=weights.config.hidden,
-            element_bytes=4, wire_mode="0", ipc=package_storage.peer_storage)
+        prefill_collective = (create_single_round_all_reduce_runtime(group, device,
+            max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
+            ipc=package_storage.peer_storage)
             if shard.world_size in SUPPORTED_WORLD_SIZES else None)
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
@@ -407,11 +407,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
     forwards, signatures, metadata = {}, {}, {}
     vision_encoders = []
-    residual = dict(blocks=residual_blocks,
-                    prefix=cursor.zeros((max_tokens, weights.config.hidden), torch.bfloat16))
+    # The first residual mixture replaces its prefix with the embedding. That
+    # activation has no subsequent consumer, so it can hold the running sum.
+    residual = dict(blocks=residual_blocks, prefix=activation)
     decoder_buffers = DecoderStorage.allocate(weights.config, shard, device, allocator=cursor, scratch={
         "residual": residual, "total": total, "kda": {"output": kda_output},
         "mla": {"output": mla_output}, "dsa": {"output": mla_output}, "moe": {"output": moe_output},
+        "local_embedding": cursor.zeros((max_tokens, weights.embedding.shape[1]), torch.bfloat16),
         **({"auxiliary": auxiliary[0]} if drafting else {})})
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
@@ -556,12 +558,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     capture_order = (*vision_names, *(name for name in forwards if name not in vision_names))
     capture_catalog = {name: forwards[name] for name in capture_order}
     try:
-        graphs, compiled = capture_forwards(capture_catalog, signatures, session=session, device=device,
-            stream=stream, pool=graph_pool, collective=collective, coordinator=coordinator,
-            compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
-            retain_graphs=config.retain_graphs, materialize=materialize,
-            warmup_storage=package_storage,
-            compile_kinds=("prefill", "scored_prefill", "decode", "resume", "vision", "speculative"))
+        communication = contextlib.nullcontext() if prefill_collective is None else prefill_collective.capture()
+        with communication:
+            graphs, compiled = capture_forwards(capture_catalog, signatures, session=session, device=device,
+                stream=stream, pool=graph_pool, collective=collective, coordinator=coordinator,
+                compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
+                retain_graphs=config.retain_graphs, materialize=materialize,
+                warmup_storage=package_storage,
+                compile_kinds=("prefill", "scored_prefill", "decode", "resume", "vision", "speculative"))
     finally:
         scratch_pool.materialize()
         deferred_pool.materialize()

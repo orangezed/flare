@@ -306,7 +306,12 @@ class PreparedDecoder:
                 buffers.scratch[key] = (torch.zeros(count, dtype=torch.float32, device=source.device)
                     if allocator is None else allocator.zeros((count,), torch.float32))
             accumulation_buffers = buffers.scratch[key]
-        self.local_embedding = torch.zeros((source.shape[0], weights.embedding.shape[1]), dtype=source.dtype, device=source.device)
+        if ("local_embedding" not in buffers.scratch
+                or buffers.scratch["local_embedding"].shape[0] < source.shape[0]):
+            shape = (source.shape[0], weights.embedding.shape[1])
+            buffers.scratch["local_embedding"] = (torch.zeros(shape, dtype=source.dtype, device=source.device)
+                if allocator is None else allocator.zeros(shape, source.dtype))
+        self.local_embedding = buffers.scratch["local_embedding"][:source.shape[0]]
         self.embedding = PreparedShardedEmbedding(weights.embedding, metadata.token_ids, self.local_embedding, source,
             runtime=embedding_runtime, coordinator=coordinator,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")

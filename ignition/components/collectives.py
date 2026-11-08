@@ -113,6 +113,16 @@ class PreparedAllReduce:
             def prepare(state):
                 return PreparedCall(run=lambda: state.run(source, out=output), output=output,
                                     owners=(runtime, source, output))
+        elif isinstance(runtime, pcie.PCIeTwoShotBF16):
+            from b12x.comm.pcie import _twoshot_preparation
+
+            self.plan = _twoshot_preparation.plan(_twoshot_preparation.query_from_runtime(
+                runtime, surface="PCIeTwoShotBF16.all_reduce",
+                call=dict(inp=source, out=output, transport="pull")), runtime=runtime)
+            group = runtime.exchange_group
+
+            def prepare(state):
+                return _twoshot_preparation.prepared_call(state, payload=source, out=output)
         elif runtime.algorithm == "hierarchical":
             from b12x.comm.pcie._owner_preparation import prepared_call
 
@@ -228,10 +238,16 @@ class PreparedChunkedAllReduce:
         elif runtime is not None:
             from b12x.comm import pcie
 
-            # One-shot pools answer through their stream channel; hierarchical runtimes directly.
-            accepts = (runtime.for_stream().should_allreduce
-                       if not isinstance(runtime, pcie.DmaAllReduce) and runtime.algorithm == "oneshot"
-                       else runtime.should_allreduce)
+            # Two-shot owner order is defined by the complete tensor. The other
+            # runtimes retain their existing row-chunking contract.
+            if isinstance(runtime, pcie.PCIeTwoShotBF16):
+                accepts = runtime.accepts
+                if not accepts(source):
+                    raise ValueError("two-shot reduction capacity must cover the full input to preserve owner order")
+            elif not isinstance(runtime, pcie.DmaAllReduce) and runtime.algorithm == "oneshot":
+                accepts = runtime.for_stream().should_allreduce
+            else:
+                accepts = runtime.should_allreduce
             while step > 1 and not accepts(source[:step]):
                 step = (step + 1) // 2
         self.bounds = [(start, min(start + step, rows)) for start in range(0, rows, step)]

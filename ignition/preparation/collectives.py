@@ -88,6 +88,16 @@ def create_all_gather_runtime(group, device, *, max_rows, columns, ipc=None):
         max_batch_size=max_rows, total_heads=columns // 64, head_dim=64, stream_affine=False, ipc=ipc)
 
 
+def create_single_round_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None):
+    """Own a BF16 transport channel that accumulates complete owner sums in FP32."""
+    from b12x.comm.pcie import PCIeTwoShotBF16
+
+    if any(type(value) is not int or value <= 0 for value in (max_tokens, hidden_size)):
+        raise ValueError("all-reduce capacities must be positive integers")
+    return PCIeTwoShotBF16.from_exchange_group(exchange_group=group, device=device,
+        max_rows=max_tokens, row_elems=hidden_size, ipc=ipc)
+
+
 def create_result_broadcast_runtime(group, device, *, layouts, ipc=None):
     """Allocate one local PCIe channel covering every declared result payload.
 

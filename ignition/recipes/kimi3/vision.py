@@ -304,26 +304,19 @@ class _InplaceGELU(nn.Module):
         return torch.ops.aten.gelu.out(source, approximate="tanh", out=source)
 
 
-class _BoundedRMSNorm(nn.Module):
-    """Native row-wise RMSNorm into caller storage with bounded intermediates.
+class _RMSNorm(nn.Module):
+    """Prepared normalization with caller storage and native Torch rounding."""
 
-    Query/key/value storage is available before their projection consumes the
-    normalized input. A final feature normalization may overwrite its consumed
-    input instead. Both uses preserve the native normalization arithmetic.
-    """
-
-    def __init__(self, weight, output, eps=None):
+    def __init__(self, weight, source, output, eps=None, *, session, name):
         super().__init__()
+        from ignition.components.rms_norm import PreparedTorchRMSNorm
+
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.output, self.eps = output, eps
+        self.operation = PreparedTorchRMSNorm(source, self.weight, output, eps=eps, session=session, name=name)
 
     def forward(self, source):
-        if source.shape != self.output.shape:
-            raise ValueError("vision normalization must match its prepared output")
-        for first in range(0, source.shape[0], 1024):
-            self.output[first:first+1024].copy_(torch.nn.functional.rms_norm(
-                source[first:first+1024], (self.weight.numel(),), self.weight, self.eps))
-        return self.output
+        return self.operation(source)
 
 
 class _Attention(nn.Module):
@@ -514,8 +507,10 @@ class PreparedVision:
             w = {key.removeprefix(prefix): value for key, value in tensors.items() if key.startswith(prefix)}
             with torch.device('meta'):
                 block = Kimi_K25VisionEncoderLayer(config)
-            block.norm1 = _BoundedRMSNorm(w['norm0.weight'], s.normalized)
-            block.norm2 = _BoundedRMSNorm(w['norm1.weight'], s.normalized)
+            block.norm1 = _RMSNorm(w['norm0.weight'], s.hidden, s.normalized,
+                                  session=session, name=f'{name}.{layer}.norm1')
+            block.norm2 = _RMSNorm(w['norm1.weight'], s.hidden, s.normalized,
+                                  session=session, name=f'{name}.{layer}.norm2')
             block.attn = _Attention(w, s, self.cu, self.rotary_positions,
                 session=session, workspace=workspace, name=f'{name}.{layer}', shard=weights.shard,
                 gather_scratch=gather_scratch, gather_factory=gather_factory)
@@ -528,13 +523,15 @@ class PreparedVision:
                                               name=f'{name}.{layer}.down')
             block.eval()
             self.blocks.append(block)
-        self.norm = _BoundedRMSNorm(tensors['vision_tower.encoder.final_layernorm.weight'], s.normalized)
+        self.norm = _RMSNorm(tensors['vision_tower.encoder.final_layernorm.weight'], s.hidden, s.normalized,
+                             session=session, name=name + '.norm')
         self.up = _Projection(tensors['mm_projector.proj.0.weight'], s.merged, s.activated,
                              session=session, workspace=workspace, name=name + '.merge_up',
                              retain_packed_weights=packed_partition)
         self.down = output_projection(tensors['mm_projector.proj.2.weight'], s.activated, s.output,
                                       name=name + '.merge_down')
-        self.post_norm = _BoundedRMSNorm(tensors['mm_projector.post_norm.weight'], s.output, 1e-5)
+        self.post_norm = _RMSNorm(tensors['mm_projector.post_norm.weight'], s.output, s.output, 1e-5,
+                                  session=session, name=name + '.post_norm')
         self.reference_attention_name = None
         self.attention_schedule_ready = True
         if packed_partition:

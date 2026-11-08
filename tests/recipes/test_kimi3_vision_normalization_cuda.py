@@ -1,12 +1,13 @@
-"""Bounded native normalization preserves BF16 image features and scratch aliases."""
+"""Prepared vision normalization preserves BF16 image features and scratch aliases."""
 
 import os
 
 import pytest
 import torch
+from b12x.preparation import PreparationSession
 
 from ignition.components.parallel import TensorParallelShard
-from ignition.recipes.kimi3.vision import VisionScratch, _BoundedRMSNorm
+from ignition.recipes.kimi3.vision import VisionScratch, _RMSNorm
 
 
 def test_normalization_reuses_attention_storage_but_not_projection_inputs():
@@ -31,9 +32,7 @@ def test_normalization_reuses_attention_storage_but_not_projection_inputs():
 )
 @pytest.mark.parametrize("inplace", [False, True])
 @torch.no_grad()
-def test_native_rmsnorm_row_tiles_are_exact_under_compiled_replay(
-    rows, width, eps, inplace
-):
+def test_prepared_norm_is_exact_under_compiled_replay(rows, width, eps, inplace):
     from ignition.preparation.compilation import compile_forward
 
     generator = torch.Generator(device="cuda").manual_seed(315)
@@ -44,23 +43,27 @@ def test_native_rmsnorm_row_tiles_are_exact_under_compiled_replay(
         width, device="cuda", dtype=torch.bfloat16, generator=generator
     )
     output = source if inplace else torch.empty_like(source)
-    operation = _BoundedRMSNorm(weight, output, eps)
-    forward = compile_forward(lambda: operation(source))
-    forward()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        forward()
-    for scale in (0.0, 0.001, 1.0, 1000.0):
-        source.copy_(
-            torch.randn(source.shape, device="cuda", generator=generator) * scale
+    with PreparationSession(device=source.device, autotune=False) as session:
+        operation = _RMSNorm(
+            weight, source, output, eps, session=session, name="vision.norm"
         )
-        expected = torch.nn.functional.rms_norm(source, [width], weight, eps)
-        if not inplace:
-            output.fill_(float("nan"))
-        allocated = torch.cuda.memory_allocated()
-        graph.replay()
+        forward = compile_forward(lambda: operation(source))
+        forward()
         torch.cuda.synchronize()
-        assert torch.cuda.memory_allocated() == allocated
-        assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
-    graph.reset()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            forward()
+        session.freeze()
+        for scale in (0.0, 0.001, 1.0, 1000.0):
+            source.copy_(
+                torch.randn(source.shape, device="cuda", generator=generator) * scale
+            )
+            expected = torch.nn.functional.rms_norm(source, [width], weight, eps)
+            if not inplace:
+                output.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+        graph.reset()
