@@ -192,7 +192,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, online_mxfp8=config.online_mxfp8,
                                     draft_checkpoint=config.draft_checkpoint, peers=peers,
                                     vision=config.vision, draft_head_quantization=config.draft_head_quantization,
-                                    index_partitioning=config.context_parallel)
+                                    index_partitioning=config.context_parallel,
+                                    weight_storage=package_storage.packed_weights())
         if weights.config.model_type == "kimi_k31":
             from ignition.recipes.kimi31.recipe import RECIPE
         del manifest
@@ -236,7 +237,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
             max_tokens=reduction_rows, hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
         prefill_collective = (create_dma_all_reduce_runtime(group, device,
-            max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
+            max_tokens=min(config.prefill_chunk_size, REDUCE_ROWS), hidden_size=weights.config.hidden,
             element_bytes=4, wire_mode="0", ipc=package_storage.peer_storage)
             if shard.world_size in SUPPORTED_WORLD_SIZES else None)
         vocabulary_collective = create_all_gather_runtime(group, device,
@@ -338,6 +339,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         graph_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
         deferred_pool = package_storage.scratch_pool()
         with package_storage.scratch_pool() as scratch_pool:
+            # AttnRes blocks live through a text forward, not across graphs.
+            # Reserve their large slab first so serial vision graphs can reuse it.
+            residual_blocks = graph_buffers.cursor().zeros((max_tokens,
+                -(-len(weights.layers) // weights.config.text["attn_res_block_size"]),
+                weights.config.hidden), torch.bfloat16)
             # Vision and text graphs execute serially and share disposable workspace.
             text_shape = (max(config.prefill_chunk_size, config.decode_tokens), weights.config.hidden)
             # KDA and MLA layers execute serially and share their attention output.
@@ -348,14 +354,18 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 text_shapes += ((auxiliary_rows, len(weights.config.draft.auxiliary_layers) * text_shape[1]),)
             patches = PATCH_CAPACITIES if config.vision else ()
             cursor = graph_buffers.cursor()
+            cursor.zeros(residual_blocks.shape, torch.bfloat16)
             shared_scratch = cursor.zeros((max(0 if not patches else
                 VisionScratch.workspace_elements(max(patches), weights.vision.shard),
                 sum(rows * columns for rows, columns in text_shapes)),), torch.bfloat16)
             if patches:
                 # Reserve the largest vision slabs before smaller text allocations share their chunks.
+                vision_cursor = graph_buffers.cursor()
+                vision_work = vision_cursor.zeros(shared_scratch.shape, torch.bfloat16)
                 VisionScratch.allocate(max(patches), device, shard=weights.vision.shard,
-                                       work=shared_scratch, buffers=cursor)
+                                       work=vision_work, buffers=vision_cursor)
                 cursor = graph_buffers.cursor()
+                cursor.zeros(residual_blocks.shape, torch.bfloat16)
                 shared_scratch = cursor.zeros(shared_scratch.shape, torch.bfloat16)
             activation, total, kda_output, moe_output, *auxiliary = scratch_views(shared_scratch, text_shapes)
             mla_output = kda_output
@@ -397,12 +407,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
     forwards, signatures, metadata = {}, {}, {}
     vision_encoders = []
-    # Completed AttnRes blocks are only consumed by complete model forwards,
-    # never by the private inputs used for kernel tuning.
-    with deferred_pool:
-        residual_blocks = torch.zeros((max_tokens,
-            -(-len(weights.layers) // weights.config.text["attn_res_block_size"]),
-            weights.config.hidden), dtype=torch.bfloat16, device=device)
     residual = dict(blocks=residual_blocks,
                     prefix=cursor.zeros((max_tokens, weights.config.hidden), torch.bfloat16))
     decoder_buffers = DecoderStorage.allocate(weights.config, shard, device, allocator=cursor, scratch={

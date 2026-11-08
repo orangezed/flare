@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 import torch
 import triton
 
-from ignition.components.collectives import PreparedChunkedAllGather, PreparedChunkedAllReduce, PreparedPromotedAllReduce
+from ignition.components.collectives import PreparedChunkedAllGather, PreparedChunkedAllReduce
+from ignition.components.owner_packet_reduce import PreparedOwnerPacketAllReduce
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch
@@ -209,8 +210,8 @@ class PreparedLatentMoE:
                                       session=session, name=name + ".latent_up", workspace=workspace)
         # Each rank normalizes the full latent row and keeps the columns its up-projection shard reads.
         self.latent_norm, self.eps = weights["latent_norm"], c["rms_norm_eps"]
-        reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedPromotedAllReduce
-        reduction_args = {} if accumulation_buffers is None else dict(accumulation_buffers=accumulation_buffers)
+        reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedOwnerPacketAllReduce
+        reduction_args = {} if accumulation_buffers is None else dict(workspace=accumulation_buffers)
         self.expert_reduce = reduction(self.expert_output, self.latent_sum, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".expert_reduce", **reduction_args)
         local_logits = buffer("local_router", weights["router"].shape[0], torch.float32)
@@ -299,13 +300,12 @@ class PreparedDecoder:
         if isinstance(runtime, DmaAllReduce):
             if mode != "prefill":
                 raise ValueError("Kimi copy-engine reductions are prepared only for prefill")
-            views = []
-            for key in ("prefill_reduction_input", "prefill_reduction_output"):
-                if key not in buffers.scratch or buffers.scratch[key].numel() < source.numel():
-                    buffers.scratch[key] = (torch.zeros(source.shape, dtype=torch.float32, device=source.device)
-                        if allocator is None else allocator.zeros(source.shape, torch.float32))
-                views.append(buffers.scratch[key])
-            accumulation_buffers = tuple(views)
+            count = min(source.numel(), runtime.max_bytes // 4)
+            key = "prefill_reduction_workspace"
+            if key not in buffers.scratch or buffers.scratch[key].numel() < count:
+                buffers.scratch[key] = (torch.zeros(count, dtype=torch.float32, device=source.device)
+                    if allocator is None else allocator.zeros((count,), torch.float32))
+            accumulation_buffers = buffers.scratch[key]
         self.local_embedding = torch.zeros((source.shape[0], weights.embedding.shape[1]), dtype=source.dtype, device=source.device)
         self.embedding = PreparedShardedEmbedding(weights.embedding, metadata.token_ids, self.local_embedding, source,
             runtime=embedding_runtime, coordinator=coordinator,
@@ -378,8 +378,8 @@ class PreparedDecoder:
                     accumulation_buffers=accumulation_buffers)
             # The sum buffer is consumed before the next attention or MLP reduction.
             total = self.buffers["total"][:source.shape[0]]
-            reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedPromotedAllReduce
-            reduction_args = {} if accumulation_buffers is None else dict(accumulation_buffers=accumulation_buffers)
+            reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedOwnerPacketAllReduce
+            reduction_args = {} if accumulation_buffers is None else dict(workspace=accumulation_buffers)
             reduce = reduction(source, total, runtime=runtime, coordinator=coordinator,
                                session=session, name=prefix + ".reduce", **reduction_args)
             self.layers.append((w, attention, mlp, reduce))

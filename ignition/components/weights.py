@@ -686,7 +686,7 @@ def _checkpoint_read_mode(paths):
     return _read_mode()
 
 
-def quantize_bf16_linear_as_mxfp8(weight):
+def quantize_bf16_linear_as_mxfp8(weight, *, retain_scale_rows=True):
     """Convert a BF16 projection to b12x MXFP8 storage during loading."""
     import torch
     from b12x.gemm._shared.wo_mxfp8 import quantize_mxfp8_rows_torch
@@ -700,7 +700,8 @@ def quantize_bf16_linear_as_mxfp8(weight):
     rows, columns = weight.shape
     padded = (columns + 127) // 128 * 128
     source = weight if columns == padded else torch.nn.functional.pad(weight, (0, padded - columns))
-    return MXFP8LinearWeight(quantize_mxfp8_rows_torch(source), columns, padded, rows)
+    return MXFP8LinearWeight(quantize_mxfp8_rows_torch(source, retain_scale_rows=retain_scale_rows),
+                             columns, padded, rows)
 
 
 def _read_mode():

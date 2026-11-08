@@ -36,28 +36,38 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False,
-             peers=None, vision=True, draft_head_quantization=None, index_partitioning=False):
+             peers=None, vision=True, draft_head_quantization=None, index_partitioning=False, weight_storage=None):
         """``peers``, a host's Gloo group and peer storage, reads column-sharded projections once per host.
 
         ``draft_checkpoint`` loads the declared sliding-window or full-context MLA DSpark model.
         Without ``vision``, the vision encoder stays on disk.
         """
         before = torch.cuda.memory_allocated(device)
+        pack = (lambda value: value) if weight_storage is None else weight_storage.tree
         with KimiWeightLoader(manifest, device, shard=shard, progress=progress, online_mxfp8=online_mxfp8,
                               peers=peers, index_partitioning=index_partitioning) as loader:
             config = replace(loader.config, draft=None)
-            embedding = loader.linear(f"{PREFIX}.embed_tokens", columns=shard.partition(config.hidden, alignment=64))
+            embedding = pack(loader.linear(f"{PREFIX}.embed_tokens", columns=shard.partition(config.hidden, alignment=64)))
             norm, res_norm, res_proj = loader.load_tensors(tuple(f"{PREFIX}.{n}.weight" for n in
                 ("norm", "output_attn_res_norm", "output_attn_res_proj")))
-            head = loader.load_tensor("language_model.lm_head.weight",
-                extent=slice(*shard.partition(config.vocabulary, alignment=64)))
-            layers = tuple(loader.load_layer(i) for i in range(len(config.layers)))
+            norm, output_res_score = pack(norm), pack(score_weight(res_norm, res_proj))
+            del res_norm, res_proj
+            head = pack(loader.load_tensor("language_model.lm_head.weight",
+                extent=slice(*shard.partition(config.vocabulary, alignment=64))))
+            layers = []
+            for index in range(len(config.layers)):
+                layer = loader.load_layer(index)
+                # Expert owners contain prepared layouts and handles. Only the
+                # dense numeric weights are repacked, one layer at a time.
+                layers.append({key: value if key in ("experts", "expert_trellis") else pack(value)
+                               for key, value in layer.items()})
+                del layer
         if vision:
             from .vision import VisionWeights
             # Preserve the replicated BF16 checkpoint path. Sharded vision uses
             # packed MXFP8 projections and an unpartitioned attention schedule.
-            vision = VisionWeights.load(manifest, device, progress=progress,
-                                        shard=shard if online_mxfp8 else None, online_mxfp8=online_mxfp8)
+            vision = pack(VisionWeights.load(manifest, device, progress=progress,
+                                        shard=shard if online_mxfp8 else None, online_mxfp8=online_mxfp8))
         else:
             vision = None
         draft = None
@@ -77,9 +87,11 @@ class ModelWeights:
                 from .latent_dspark import DraftWeights
 
                 extra["target_embedding"] = embedding
-            draft = DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
-                                      online_mxfp8=online_mxfp8, **extra)
-        return cls(config, shard, embedding, norm, head, score_weight(res_norm, res_proj), layers,
+            draft = pack(DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
+                                      online_mxfp8=online_mxfp8, **extra))
+        if weight_storage is not None:
+            weight_storage.freeze()
+        return cls(config, shard, embedding, norm, head, output_res_score, tuple(layers),
                    loader.scale_scratch, torch.cuda.memory_allocated(device) - before, vision=vision, draft=draft)
 
 
@@ -146,7 +158,8 @@ class KimiWeightLoader(DirectWeightLoader):
         interval = self.shard.partition(intermediate, alignment=32)
         weights = dict(gate_up=self.fused([prefix + ".gate_proj", prefix + ".up_proj"], [interval] * 2),
                        down=self.linear(prefix + ".down_proj", columns=interval))
-        return {key: quantize_bf16_linear_as_mxfp8(weight) for key, weight in weights.items()} if online_mxfp8 else weights
+        return {key: quantize_bf16_linear_as_mxfp8(weight, retain_scale_rows=False)
+                for key, weight in weights.items()} if online_mxfp8 else weights
 
     def load_attention(self, index):
         c, shard = self.config.text, self.shard
@@ -209,7 +222,7 @@ class KimiWeightLoader(DirectWeightLoader):
         if self.online_mxfp8:
             for key in ("input", "forget", "latent_gate", "q_b", "output"):
                 if key in attention:
-                    attention[key] = quantize_bf16_linear_as_mxfp8(attention[key])
+                    attention[key] = quantize_bf16_linear_as_mxfp8(attention[key], retain_scale_rows=False)
         return attention
 
     def load_layer(self, index):
@@ -236,7 +249,7 @@ class KimiWeightLoader(DirectWeightLoader):
         result["latent_up"] = self.linear(m + ".routed_expert_up_proj", columns=shard.partition(c["routed_expert_hidden_size"]))
         if self.online_mxfp8:
             for key in ("latent_down", "latent_down_rows", "latent_up"):
-                result[key] = quantize_bf16_linear_as_mxfp8(result[key])
+                result[key] = quantize_bf16_linear_as_mxfp8(result[key], retain_scale_rows=False)
         # Each rank applies the latent norm's weights to the columns its up-projection shard reads.
         result["latent_norm"] = self.load_tensor(m + ".routed_expert_norm.weight",
                                                  extent=slice(*shard.partition(c["routed_expert_hidden_size"])))

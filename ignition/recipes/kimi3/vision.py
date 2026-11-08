@@ -91,7 +91,7 @@ class VisionWeights:
                 weight = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
                 del pieces
                 if online_mxfp8:
-                    weight = quantize_bf16_linear_as_mxfp8(weight)
+                    weight = quantize_bf16_linear_as_mxfp8(weight, retain_scale_rows=False)
                 tensors[name] = weight
         return cls(tensors, shard)
 
@@ -138,6 +138,7 @@ class VisionScratch:
     merged: torch.Tensor
     activated: torch.Tensor
     output: torch.Tensor
+    normalized: torch.Tensor
 
     @staticmethod
     def workspace_elements(patches, shard=None):
@@ -165,7 +166,9 @@ class VisionScratch:
             raise ValueError("vision workspace requires contiguous BF16 storage for its projection and merge capacities")
         projected = zeros(patches, 1024)
         # Reserve identical pool offsets on all ranks, including the smaller and empty head shards.
-        attention = zeros(3, patches * -(-VISION_HEADS // shard.world_size) * HEAD_SIZE)
+        attention_width = patches * -(-VISION_HEADS // shard.world_size) * HEAD_SIZE
+        attention_storage = zeros(max(3 * attention_width, patches * 1024))
+        attention = attention_storage[:3 * attention_width].view(3, attention_width)
         q, k, v = (plane[:patches * heads * HEAD_SIZE].view(patches, heads, HEAD_SIZE) for plane in attention)
         def view(rows, width):
             return work[:rows * width].view(rows, width)
@@ -173,7 +176,7 @@ class VisionScratch:
         return cls(view(patches, 588), projected, view(patches, 3 * heads * HEAD_SIZE), q, k, v,
             view(patches, heads * HEAD_SIZE), projected, view(patches, intermediate), projected,
             view(patches // 4, INTERMEDIATE), projected.view(-1)[:patches // 4 * intermediate].view(patches // 4, intermediate),
-            view(patches // 4, HIDDEN))
+            view(patches // 4, HIDDEN), attention_storage[:patches * 1024].view(patches, 1024))
 
     def rows(self, patches):
         return type(self)(*(getattr(self, name)[:patches // 4 if name in ('merged', 'activated', 'output') else patches]
@@ -301,11 +304,26 @@ class _InplaceGELU(nn.Module):
         return torch.ops.aten.gelu.out(source, approximate="tanh", out=source)
 
 
-def _norm(weight, eps=None):
-    with torch.device('meta'):
-        module = nn.RMSNorm(weight.numel(), eps=eps)
-    module.weight = nn.Parameter(weight, requires_grad=False)
-    return module
+class _BoundedRMSNorm(nn.Module):
+    """Native row-wise RMSNorm into caller storage with bounded intermediates.
+
+    Query/key/value storage is available before their projection consumes the
+    normalized input. A final feature normalization may overwrite its consumed
+    input instead. Both uses preserve the native normalization arithmetic.
+    """
+
+    def __init__(self, weight, output, eps=None):
+        super().__init__()
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.output, self.eps = output, eps
+
+    def forward(self, source):
+        if source.shape != self.output.shape:
+            raise ValueError("vision normalization must match its prepared output")
+        for first in range(0, source.shape[0], 1024):
+            self.output[first:first+1024].copy_(torch.nn.functional.rms_norm(
+                source[first:first+1024], (self.weight.numel(),), self.weight, self.eps))
+        return self.output
 
 
 class _Attention(nn.Module):
@@ -496,7 +514,8 @@ class PreparedVision:
             w = {key.removeprefix(prefix): value for key, value in tensors.items() if key.startswith(prefix)}
             with torch.device('meta'):
                 block = Kimi_K25VisionEncoderLayer(config)
-            block.norm1, block.norm2 = _norm(w['norm0.weight']), _norm(w['norm1.weight'])
+            block.norm1 = _BoundedRMSNorm(w['norm0.weight'], s.normalized)
+            block.norm2 = _BoundedRMSNorm(w['norm1.weight'], s.normalized)
             block.attn = _Attention(w, s, self.cu, self.rotary_positions,
                 session=session, workspace=workspace, name=f'{name}.{layer}', shard=weights.shard,
                 gather_scratch=gather_scratch, gather_factory=gather_factory)
@@ -509,13 +528,13 @@ class PreparedVision:
                                               name=f'{name}.{layer}.down')
             block.eval()
             self.blocks.append(block)
-        self.norm = _norm(tensors['vision_tower.encoder.final_layernorm.weight'])
+        self.norm = _BoundedRMSNorm(tensors['vision_tower.encoder.final_layernorm.weight'], s.normalized)
         self.up = _Projection(tensors['mm_projector.proj.0.weight'], s.merged, s.activated,
                              session=session, workspace=workspace, name=name + '.merge_up',
                              retain_packed_weights=packed_partition)
         self.down = output_projection(tensors['mm_projector.proj.2.weight'], s.activated, s.output,
                                       name=name + '.merge_down')
-        self.post_norm = _norm(tensors['mm_projector.post_norm.weight'], 1e-5)
+        self.post_norm = _BoundedRMSNorm(tensors['mm_projector.post_norm.weight'], s.output, 1e-5)
         self.reference_attention_name = None
         self.attention_schedule_ready = True
         if packed_partition:

@@ -3,6 +3,7 @@
 """Tensor-parallel MLA DFlash2 weights with explicit online MXFP8 conversion."""
 
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 
@@ -41,7 +42,8 @@ class DraftWeights:
         q_range, kv_range = shard.partition(1536), shard.partition(576)
         intermediate = shard.partition(d.text["intermediate_size"], alignment=32)
         conv_range = shard.partition(4 * h // 16, alignment=8)
-        pack = quantize_bf16_linear_as_mxfp8 if online_mxfp8 else lambda weight: weight
+        pack = (partial(quantize_bf16_linear_as_mxfp8, retain_scale_rows=False)
+                if online_mxfp8 else lambda weight: weight)
         with DirectWeightLoader(manifest, device, progress=progress, progress_label="Load draft weights") as loader:
             def matrix(name, rows=None, columns=None):
                 return loader.load_tensor(name + ".weight", extent=(slice(*(rows or (None, None))),

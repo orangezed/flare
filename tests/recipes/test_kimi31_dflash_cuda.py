@@ -17,8 +17,9 @@ pytestmark = pytest.mark.skipif(os.getenv("FLARE_RUN_CUDA_TESTS") != "1", reason
 def bf16_weight(weight):
     if isinstance(weight, torch.Tensor):
         return weight
-    from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch
-    return dequantize_mxfp8_rows_torch(weight.weight.values, weight.weight.scale_rows)[:, :weight.in_features].bfloat16()
+    from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch, materialize_mxfp8_scale_rows
+    return dequantize_mxfp8_rows_torch(weight.weight.values,
+        materialize_mxfp8_scale_rows(weight.weight))[:, :weight.in_features].bfloat16()
 
 
 @pytest.mark.parametrize("quantized", [False, True])

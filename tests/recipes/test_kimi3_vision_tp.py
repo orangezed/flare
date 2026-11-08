@@ -304,8 +304,9 @@ def test_loader_shards_before_quantizing_and_retains_unquantized_parameters(monk
               for name, shape in shapes.items()}
     converted = []
 
-    def quantize(weight):
+    def quantize(weight, *, retain_scale_rows=True):
         assert weight.ndim == 2 and weight.shape[1] % 128 == 0 and weight.numel() > 0
+        assert retain_scale_rows is False
         converted.append(tuple(weight.shape))
         return _Packed(tuple(weight.shape))
 

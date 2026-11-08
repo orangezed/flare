@@ -25,12 +25,12 @@ pytestmark = pytest.mark.skipif(os.getenv("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 def expanded(weight):
-    from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch
+    from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch, materialize_mxfp8_scale_rows
 
     if isinstance(weight, torch.Tensor):
         return weight
     packed = weight.weight
-    return dequantize_mxfp8_rows_torch(packed.values, packed.scale_rows)[:, :weight.in_features].bfloat16()
+    return dequantize_mxfp8_rows_torch(packed.values, materialize_mxfp8_scale_rows(packed))[:, :weight.in_features].bfloat16()
 
 
 def relative_error(actual, expected):
