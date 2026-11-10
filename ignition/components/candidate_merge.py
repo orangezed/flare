@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Prepared top-k over valid, interleaved FP32 scores and integer token IDs."""
+import os
 from dataclasses import dataclass
 
 import torch
@@ -98,12 +99,41 @@ def _select(Values, Ids, Lengths, Cutoffs, Greater, Ties, Output,
         tl.store(Output+row*K+destination,ids,mask=selected)
 
 
+@triton.jit
+def _threshold_counts(TopValues, Values, Lengths, Cutoffs, Greater, Ties, Output, WIDTH: tl.constexpr,
+                      K: tl.constexpr, TILES: tl.constexpr, BLOCK: tl.constexpr, K_BLOCK: tl.constexpr):
+    """``_threshold`` folded into ``_counts``: every program takes the cutoff (the minimum of the
+    K largest scores) itself; tile 0 publishes it and writes the -1 fill for ``_select``."""
+    row, tile = tl.program_id(0), tl.program_id(1)
+    length = tl.load(Lengths+row)
+    if length > K:
+        kcol = tl.arange(0, K_BLOCK)
+        top = tl.load(TopValues+row*K+kcol, mask=kcol < K, other=float('inf'))
+        cutoff = tl.min(top, 0)
+        if tile == 0:
+            tl.store(Cutoffs+row, cutoff)
+            tl.store(Output+row*K+kcol, -1, mask=kcol < K)
+        col = tile*BLOCK+tl.arange(0, BLOCK)
+        live = (col < length) & (col < WIDTH)
+        value = tl.load(Values+row*WIDTH+col, mask=live, other=-float('inf'))
+        tl.store(Greater+row*TILES+tile, tl.sum((live & (value > cutoff)).to(tl.int32), 0))
+        tl.store(Ties+row*TILES+tile, tl.sum((live & (value == cutoff)).to(tl.int32), 0))
+
+
+def fused_finalize_enabled():
+    """``FLARE_CANDIDATE_MERGE_FUSED=1``: the threshold launch is folded into the cutoff counts (6 -> 5 launches).
+
+    Read when a merge is prepared; set it identically for export and serving. Integer-identical output.
+    """
+    return os.environ.get("FLARE_CANDIDATE_MERGE_FUSED", "") not in ("", "0")
+
 
 @dataclass(frozen=True)
 class Query:
     rows: int
     width: int
     topk: int
+    fused = False  # class constant: the three-launch query keeps its original fields and cache keys
 
     @property
     def tiles(self):
@@ -120,6 +150,15 @@ class Query:
 
 CONTRACT = native_contract(component_id="flare.candidate_merge", query_type=Query,
                            tactics=lambda q: (0,), semantic_version=2)
+
+
+@dataclass(frozen=True)
+class FusedQuery(Query):
+    fused: bool = True
+
+
+CONTRACT_FUSED = native_contract(component_id="flare.candidate_merge_fused", query_type=FusedQuery,
+                                 tactics=lambda q: (0,), semantic_version=1)
 
 
 def _buffers(scratch, query):
@@ -141,7 +180,8 @@ def _buffers(scratch, query):
 
 @program_cache(scope="preparation")
 def compile_merge(payload, ordinal):
-    q = Query(**dict(payload))
+    payload = dict(payload)
+    q = FusedQuery(**payload) if payload.get("fused") else Query(**payload)
     packed = torch.empty((q.rows, q.width, 2), dtype=torch.float32, device="meta")
     output = torch.empty((q.rows, q.topk), dtype=torch.int32, device="meta")
     scratch = torch.empty(q.scratch_bytes, dtype=torch.uint8, device="meta")
@@ -155,6 +195,13 @@ def compile_merge(payload, ordinal):
         run_row_topk(row_logits=values, lengths=lengths, topk=q.topk,
                      output_values=top_values, output_indices=output,
                      output_gather_table=ids, write_values=True, launcher_sink=topk)
+        if q.fused:
+            fused_counts = launch_triton(_threshold_counts, grid, top_values, values, lengths, cutoffs, counts, ties,
+                                   output, q.width, q.topk, q.tiles, 512, triton.next_power_of_2(q.topk),
+                                   num_warps=4)
+            select = launch_triton(_select, grid, values, ids, lengths, cutoffs, counts, ties, output,
+                                   q.width, q.topk, q.tiles, 512, triton.next_power_of_2(q.tiles), num_warps=4)
+            return dict(count=count, compact=compact, topk=topk, threshold_counts=fused_counts, select=select)
         threshold = launch_triton(_threshold, (q.rows, 1, 1), top_values, lengths, cutoffs, output,
                                    q.topk, triton.next_power_of_2(q.topk), num_warps=4)
         count_cutoff = launch_triton(_counts, grid, values, lengths, cutoffs, counts, ties,
@@ -180,6 +227,12 @@ class State:
         run_row_topk(row_logits=values, lengths=lengths, topk=q.topk,
                      output_values=top_values, output_indices=output,
                      output_gather_table=ids, write_values=True, launcher=p["topk"])
+        if q.fused:
+            p["threshold_counts"][grid](top_values, values, lengths, cutoffs, counts, ties, output,
+                                        q.width, q.topk, q.tiles, 512, triton.next_power_of_2(q.topk))
+            p["select"][grid](values, ids, lengths, cutoffs, counts, ties, output,
+                              q.width, q.topk, q.tiles, 512, triton.next_power_of_2(q.tiles))
+            return
         p["threshold"][(q.rows, 1, 1)](top_values, lengths, cutoffs, output,
                                       q.topk, triton.next_power_of_2(q.topk))
         p["count_cutoff"][grid](values, lengths, cutoffs, counts, ties,
@@ -217,17 +270,20 @@ class PreparedCandidateMerge:
                 or output.device != packed.device or output.shape[1] not in (512, 1024, 2048)):
             raise ValueError("candidate merge requires contiguous FP32 score/ID pairs and int32 top-k output")
         self.packed, self.output = packed, output
-        q = Query(packed.shape[0], packed.shape[1], output.shape[1])
-        payload = CONTRACT.encode_query(q)
+        fused = fused_finalize_enabled()
+        contract = CONTRACT_FUSED if fused else CONTRACT
+        q = (FusedQuery if fused else Query)(packed.shape[0], packed.shape[1], output.shape[1])
+        payload = contract.encode_query(q)
 
         def materialize(tactic):
             programs = compile_merge(payload, packed.device.index)
             load_programs(programs)
+            tail = ((programs["threshold_counts"], programs["select"]) if q.fused else
+                    (programs["threshold"], programs["count_cutoff"], programs["select"]))
             return attach_programs(State(q, programs), programs["count"], programs["compact"],
-                                   *programs["topk"].values(), programs["threshold"],
-                                   programs["count_cutoff"], programs["select"])
+                                   *programs["topk"].values(), *tail)
 
-        self.plan = native_plan(contract=CONTRACT, query=q, device=packed.device,
+        self.plan = native_plan(contract=contract, query=q, device=packed.device,
             scratch_bytes=lambda tactic: q.scratch_bytes, materialize=materialize,
             compile_jobs=lambda tactic, device: (CompileJob.create(
                 "ignition.components.candidate_merge:compile_merge", payload, device.ordinal),))
