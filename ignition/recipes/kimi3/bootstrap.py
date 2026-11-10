@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -28,7 +29,7 @@ from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
                                               create_all_reduce_runtime, create_single_round_all_reduce_runtime,
-                                              create_head_exchange)
+                                              create_dma_all_reduce_runtime, create_head_exchange)
 from .routing import create_route_runtime
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.capture import capture_forwards
@@ -59,6 +60,29 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 
 # Most rows of one all-reduce; larger prefill reductions run in chunks of this many rows.
 REDUCE_ROWS = 1024
+
+
+def prefill_reduction_rows(world_size, chunk_size, dma_ring_rows):
+    """Split prefill graph capacities between the exact channel and the copy-engine ring.
+
+    Returns (dma_rows, small_rows): prefill graphs of at least dma_rows rows reduce over the
+    copy-engine ring; the exact two-shot channel is sized to small_rows, the largest prefill
+    capacity below dma_rows (every capacity when the ring is off). dma_rows is 0 (ring off)
+    unless the switch is set, the world is eight ranks, and the threshold fits the chunk.
+    Ported from tunamitom/flare-local-inference@bc818b1 (inline there).
+    """
+    dma_rows = dma_ring_rows if world_size == 8 and 0 < dma_ring_rows <= chunk_size else 0
+    small_rows = max((c for c in prefill_capacities(chunk_size) if not dma_rows or c < dma_rows), default=0)
+    return dma_rows, small_rows
+
+
+def reduction_runtime(mode, capacity, *, collective, prefill_collective, prefill_dma, dma_rows):
+    """Decode, verification and draft graphs always keep `collective`; only prefill graphs move."""
+    if mode != "prefill":
+        return collective
+    if prefill_dma is not None and capacity >= dma_rows:
+        return prefill_dma
+    return prefill_collective if prefill_collective is not None else collective
 
 
 @dataclass(frozen=True)
@@ -97,8 +121,17 @@ class PreparationConfig:
     context_parallel: bool = True
     # The MoonViT encoder and its graphs prepare beside the text model unless the plan serves text only.
     vision: bool = True
+    # Copy-engine ring (b12x DmaAllReduce) for prefill graphs of at least this many rows at world 8
+    # (IGNITION_KIMI_PREFILL_DMA_ROWS); 0 keeps every prefill graph on the exact two-shot channel.
+    # Ported from tunamitom/flare-local-inference@bc818b1.
+    prefill_dma_ring_rows: int = 0
+    # True: BF16 hop sums on the ring (one rounding per hop, 7 at TP8; IGNITION_KIMI_PREFILL_DMA_BF16=1);
+    # False: the exact FP32 owner-packet reduction over the ring (+graph storage). From @2f0acab.
+    prefill_dma_ring_bf16: bool = False
 
     def __post_init__(self):
+        if type(self.prefill_dma_ring_rows) is not int or self.prefill_dma_ring_rows < 0:
+            raise ValueError("prefill DMA ring rows must be a nonnegative integer")
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
             raise ValueError("Kimi draft head conversion must be mxfp8 or nvfp4")
         if self.draft_head_quantization is not None and not self.drafting:
@@ -236,10 +269,20 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         reduction_rows = config.decode_tokens if shard.world_size in SUPPORTED_WORLD_SIZES else channel_rows
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
             max_tokens=reduction_rows, hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
+        dma_rows, small_rows = prefill_reduction_rows(shard.world_size, config.prefill_chunk_size,
+                                                      config.prefill_dma_ring_rows)
         prefill_collective = (create_single_round_all_reduce_runtime(group, device,
-            max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
+            max_tokens=small_rows, hidden_size=weights.config.hidden,
             ipc=package_storage.peer_storage)
-            if shard.world_size in SUPPORTED_WORLD_SIZES else None)
+            if shard.world_size in SUPPORTED_WORLD_SIZES and small_rows else None)
+        prefill_dma = None
+        if dma_rows:
+            if os.environ.get("B12X_PCIE_DMA_PIECES", "0") not in ("", "0"):
+                raise ValueError("B12X_PCIE_DMA_PIECES overrides every ring shape; unset it for Kimi prefill rings")
+            # Lossless wire regardless of B12X_PCIE_DMA_FP8 (that env would make the ring lossy).
+            prefill_dma = create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
+                hidden_size=weights.config.hidden, ipc=package_storage.peer_storage, wire_mode="off")
+            prefill_dma.kimi_bf16_ring = config.prefill_dma_ring_bf16
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
             columns=weights.config.vocabulary, ipc=package_storage.peer_storage)
@@ -460,8 +503,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,
                         session=session, name=name, workspace=arena, buffers=decoder_buffers,
-                        **dict(collectives, runtime=(prefill_collective if mode == "prefill"
-                                                   and prefill_collective is not None else collective)))
+                        **dict(collectives, runtime=reduction_runtime(mode, capacity, collective=collective,
+                            prefill_collective=prefill_collective, prefill_dma=prefill_dma, dma_rows=dma_rows)))
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
                         page_tokens=config.page_tokens)
@@ -558,8 +601,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     capture_order = (*vision_names, *(name for name in forwards if name not in vision_names))
     capture_catalog = {name: forwards[name] for name in capture_order}
     try:
-        communication = contextlib.nullcontext() if prefill_collective is None else prefill_collective.capture()
-        with communication:
+        with contextlib.ExitStack() as communication:
+            for channel in (prefill_collective, prefill_dma):
+                if channel is not None:
+                    communication.enter_context(channel.capture())
             graphs, compiled = capture_forwards(capture_catalog, signatures, session=session, device=device,
                 stream=stream, pool=graph_pool, collective=collective, coordinator=coordinator,
                 compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
@@ -614,6 +659,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         close_resources=(*(() if scoring is None else (scoring,)),
                          *(() if prefill_collective is None else (prefill_collective,)),
+                         *(() if prefill_dma is None else (prefill_dma,)),
                          *(() if context is None or context.index_exchange is None else
                            (context.index_exchange, context.paired_queries))),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
@@ -626,7 +672,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                            decoder_buffers.scratch_tensors(), *draft_disposable]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, collective,
-                   vocabulary_collective, embedding_collective, router_collective, route_collective, prefill_collective,
+                   vocabulary_collective, embedding_collective, router_collective, route_collective, prefill_collective, prefill_dma,
                    vision_inputs, vision_prefill, vision_state, vision_storage, deferred_pool, scratch_pool, shared_scratch, graph_buffers,
                    speculation, context_collective, markov_collective, latent_runtimes,
                    draft_context_collective, convolution_collective, vision_collectives))
