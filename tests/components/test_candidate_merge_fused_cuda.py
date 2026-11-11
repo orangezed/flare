@@ -16,6 +16,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("rows,width", [(1, 16384), (5, 16384), (8, 8192)])
 def test_fused_threshold_matches_three_launch_tail(rows, width, monkeypatch):
     device, topk = torch.device("cuda:0"), 2048
+    monkeypatch.delenv("FLARE_CANDIDATE_MERGE_RADIX", raising=False)  # takes precedence over FUSED
     packed = torch.zeros((rows, width, 2), dtype=torch.float32, device=device)
     packed.view(torch.int32)[:, :, 1].fill_(-1)
     with RecordedPreparationSession(device=device, checkpoint="candidate-merge-fused-fixture",
