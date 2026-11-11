@@ -30,6 +30,7 @@ from ignition.preparation.collectives import (CollectivePreparation, create_all_
                                               create_all_reduce_runtime, create_single_round_all_reduce_runtime,
                                               create_head_exchange)
 from .routing import create_route_runtime
+from .decoder import latent_gather_enabled, latent_gather_rows
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.rebuild_manifest import declare_weights
@@ -265,6 +266,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         router_collective = create_all_gather_runtime(group, device, max_rows=channel_rows,
             columns=router_columns,
             ipc=package_storage.peer_storage)
+        # FLARE_KIMI3_PREFILL_LATENT_GATHER=1 (default off): prefill rows project their own latent columns
+        # from the full hidden row and all-gather them instead of reducing column-sharded partials.
+        latent_gather_collective = None
+        if latent_gather_enabled(shard.world_size, weights.config.text["routed_expert_hidden_size"]):
+            latent_gather_collective = create_all_gather_runtime(group, device,
+                max_rows=latent_gather_rows(channel_rows, config.prefill_chunk_size),
+                columns=weights.config.text["routed_expert_hidden_size"], ipc=package_storage.peer_storage)
         vision_collectives = {}
         if config.vision and weights.vision.shard.world_size > 1:
             from .vision import HEAD_SIZE, INTERMEDIATE, VISION_HEADS
@@ -461,7 +469,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                         scoring=scoring if kind == "scored_prefill" else None,
                         session=session, name=name, workspace=arena, buffers=decoder_buffers,
                         **dict(collectives, runtime=(prefill_collective if mode == "prefill"
-                                                   and prefill_collective is not None else collective)))
+                                                   and prefill_collective is not None else collective),
+                            # Speculation's decoders never see the prefill latent gather channel.
+                            latent_gather_runtime=latent_gather_collective if mode == "prefill" else None))
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
                         page_tokens=config.page_tokens)
